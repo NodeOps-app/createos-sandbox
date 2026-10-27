@@ -1,0 +1,82 @@
+{
+  "cpuid_modifiers": [
+    {
+      "leaf": "0x7",
+      "subleaf": "0x0",
+      "flags": 1,
+      "modifiers": [
+        {
+          "register": "ebx",
+          "bitmap": "000000xxxx0xxx00xxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "xxx00x0xx0xxxxx0x0x00xxxx0xxxx0x"
+        },
+        {
+          "register": "edx",
+          "bitmap": "xxxxxx0x0x0xxxxxxxxxxxxx0xxxx00x"
+        }
+      ]
+    },
+    {
+      "leaf": "0xd",
+      "subleaf": "0x0",
+      "flags": 1,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "xxxxxxxxxxxxx00xxxxxxxxx000xxxxx"
+        }
+      ]
+    },
+    {
+      "leaf": "0xd",
+      "subleaf": "0x1",
+      "flags": 1,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "edx",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ]
+    },
+    {
+      "leaf": "0xd",
+      "subleaf": "0x2",
+      "flags": 1,
+      "modifiers": [
+        {
+          "register": "eax",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "ebx",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "ecx",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "register": "edx",
+          "bitmap": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ]
+    }
+  ],
+  "kvm_capabilities": [],
+  "msr_modifiers": []
+}

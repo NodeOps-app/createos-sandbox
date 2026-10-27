@@ -1,0 +1,3144 @@
+openapi: 3.0.3
+info:
+  title: createos control plane
+  version: 0.1.0
+  description: |
+    Every request authenticates via one of three headers:
+    `X-Api-Key`, `X-Auth-Token`, or `X-Access-Token`.
+
+    Responses normally follow the JSend envelope:
+
+    - `{"status": "success", "data": …}` — 2xx, payload in `data`
+    - `{"status": "fail",    "data": …}` — 4xx, validation/not-found
+    - `{"status": "error",   "message": …, "code": …}` — 5xx, server fault
+
+    Managed-process endpoints return their resource JSON directly, and
+    `/processes/{process_id}/connect` returns NDJSON, so process handles can be
+    proxied without rewriting or buffering lifecycle data.
+
+  contact:
+    name: createos
+    url: https://github.com/computesdk/createos
+
+servers:
+  - url: https://api.sb.example.com
+    description: Production control plane (matches createos-cli DefaultSandboxBaseURL and fc-sdk DEFAULT_BASE_URL)
+
+# ────────────────────────────────────────────────────────────────────────
+# Security
+# ────────────────────────────────────────────────────────────────────────
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: |
+        Per-user API key, sent as `X-Api-Key: <token>`. Sandbox
+        ownership is scoped by the authenticated user: `GET
+        /v1/sandboxes` returns only the caller's VMs.
+
+        A sandbox-scoped token (`skp_sb_…`) is also sent in this header. It
+        authorizes runtime operations only on the single sandbox to which it
+        is bound: get, exec/streaming exec, managed processes and PTYs, file
+        upload/download, shell/tunnel, metrics/bandwidth reads, pause, resume,
+        and self-delete. It cannot create or list sandboxes; create/list/
+        attach/detach networks; manage disks, templates or devices; change
+        egress, ingress, SSH keys, size or bandwidth; fork; or manage access
+        tokens. Cross-sandbox requests are hidden with HTTP 404. Sandbox
+        tokens are never accepted in the other auth headers or query strings.
+    authTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Auth-Token
+      description: |
+        Opaque session/auth token validated against the upstream
+        users service. Tagged `auth_token` server-side.
+    accessTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Access-Token
+      description: |
+        Opaque access token validated against the upstream users
+        service. Tagged `access_token` server-side.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Schemas
+  # ──────────────────────────────────────────────────────────────────
+  schemas:
+
+    # ── envelope ────────────────────────────────────────────────────
+    SuccessEnvelope:
+      type: object
+      required: [status, data]
+      properties:
+        status: { type: string, enum: [success] }
+        data:
+          description: Operation-specific payload (see each response)
+    Pagination:
+      type: object
+      required: [total, limit, offset, count]
+      properties:
+        total:  { type: integer, description: total rows ignoring limit/offset }
+        limit:  { type: integer, description: limit applied by the server }
+        offset: { type: integer, description: offset applied by the server }
+        count:  { type: integer, description: items in this response (≤ limit) }
+    # Every list endpoint wraps its items + a Pagination block under
+    # `data`. Concrete responses use `PagedEnvelope[ItemType]` style by
+    # composing this with an inline `items` shape.
+    PagedEnvelope:
+      type: object
+      required: [status, data]
+      properties:
+        status: { type: string, enum: [success] }
+        data:
+          type: object
+          required: [data, pagination]
+          properties:
+            data:
+              type: array
+              items: {}
+            pagination: { $ref: '#/components/schemas/Pagination' }
+    FailEnvelope:
+      type: object
+      required: [status, data]
+      properties:
+        status: { type: string, enum: [fail] }
+        data:
+          description: |
+            A key→value map describing which field(s) failed validation.
+            Examples: `{"body": "invalid JSON"}`, `{"id": "sandbox not found"}`,
+            `{"shape": "required", "choices": ["s-1vcpu-256mb", …]}`.
+          type: object
+          additionalProperties: true
+    ErrorEnvelope:
+      type: object
+      required: [status, message, code]
+      properties:
+        status:  { type: string, enum: [error] }
+        message: { type: string }
+        code:    { type: integer }
+
+    # ── shapes / rootfs catalog ────────────────────────────────────
+    Shape:
+      type: object
+      properties:
+        id:               { type: string, example: s-1vcpu-256mb }
+        vcpu:             { type: integer, example: 1 }
+        mem_mib:          { type: integer, example: 256 }
+        default_disk_mib: { type: integer, example: 10240 }
+    ShapesData:
+      type: object
+      properties:
+        shapes:
+          type: array
+          items: { $ref: '#/components/schemas/Shape' }
+    RootfsData:
+      type: object
+      properties:
+        rootfs:
+          type: array
+          items: { type: string }
+          example: ['devbox:1', node]
+          description: |
+            Rootfs catalog names available cluster-wide. Disabled rootfses
+            (per `rootfs_catalog.disabled`) are filtered out.
+        default:
+          type: string
+          example: 'devbox:1'
+          description: |
+            Recommended default rootfs for new sandboxes. Falls back to the
+            first non-disabled name if the host's configured default has
+            been disabled.
+        entries:
+          type: array
+          description: |
+            Rich per-rootfs metadata joined from `rootfs_catalog`. Empty
+            for rootfses with no catalog row (treated as enabled, no
+            warning). Use `entries[].deprecated` to surface upgrade hints.
+          items: { $ref: '#/components/schemas/RootfsEntry' }
+
+    RootfsEntry:
+      type: object
+      required: [name]
+      properties:
+        name:        { type: string, example: 'devbox:1' }
+        description: { type: string, example: 'Multi-runtime workspace + sshd' }
+        deprecated:  { type: boolean, default: false }
+        successor:
+          type: string
+          example: 'devbox:2'
+          description: Recommended replacement rootfs catalog name.
+
+    # ── sandbox: request ───────────────────────────────────────────
+    CreateReq:
+      type: object
+      required: [shape]
+      properties:
+        shape:
+          type: string
+          description: Required; see `GET /v1/shapes`.
+          example: s-1vcpu-256mb
+        rootfs:
+          type: string
+          description: |
+            Rootfs catalog name. Empty = host default (see `GET /v1/rootfs`).
+            Names marked `disabled=true` in `rootfs_catalog` are rejected
+            with HTTP 400 and a `rootfs` field error pointing at the
+            recommended successor when one is set.
+          example: 'devbox:1'
+        name:
+          type: string
+          description: |
+            User-facing VM name, unique per user among non-terminal
+            sandboxes. Empty/omitted → control auto-generates a
+            Docker-style `<adjective>-<animal>` name. The sandbox id stays
+            the only addressing handle; name is purely a label / hostname /
+            in-network DNS name.
+          example: brave-otter
+        labels:
+          type: object
+          maxProperties: 100
+          additionalProperties:
+            type: string
+            maxLength: 1024
+          description: |
+            User-defined metadata for organizing and filtering sandboxes.
+            Up to 100 key/value pairs; keys are at most 128 bytes.
+          example:
+            team: backend
+            environment: production
+        networks:
+          type: array
+          description: |
+            Private networks to join at create time. Each entry is
+            `{id: "<name|net-ulid>"}`. Inside the network, peers reach
+            this sandbox by its name.
+          items: { $ref: '#/components/schemas/NetworkEntry' }
+        disk_mib:
+          type: integer
+          format: int64
+          description: Disk size in MiB. 0 = shape default (10 GiB).
+          example: 10240
+        egress:
+          type: array
+          items: { type: string }
+          description: |
+            Allowlist entries. Each is `host[:port]`, `ip[:port]`,
+            `cidr[:port]`, a named preset such as `@pypi`, or `*`.
+            Missing / empty / `["*"]` = allow all. Presets expand to
+            concrete rules before the sandbox is created.
+            Domain entries (`pypi.org`) require the proxy to be running
+            on the host; IP/CIDR entries are kernel-enforced.
+          example: ["@pypi", github.com, "1.1.1.1:53"]
+        envs:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Environment variables exported into every `exec` invocation
+            inside the sandbox. Keys must match POSIX env-name regex
+            ^[A-Za-z_][A-Za-z0-9_]*$. Up to 64 entries; each value up to
+            4 KiB; total payload up to 64 KiB.
+          example:
+            ANTHROPIC_API_KEY: sk-ant-...
+        ssh_pubkeys:
+          type: array
+          items: { type: string }
+          description: |
+            OpenSSH-formatted public keys authorized to connect via the
+            SSH gateway for port-forwarding. Without at least one key
+            here, `createos-cli tunnel` / `createos-cli shell` will be rejected.
+        bandwidth_quota_bytes:
+          type: integer
+          format: int64
+          description: |
+            **Not settable at create.** Every sandbox starts with the
+            cluster default (50 GiB by default; configurable per cluster
+            via the control plane). Any non-zero value sent here is
+            rejected with 400. To grow the budget after create, call
+            `POST /v1/sandboxes/{id}/bandwidth/recharge`.
+        host_id:
+          type: string
+          description: |
+            Internal API keys only. Pins the sandbox to a specific host by
+            id. Empty = scheduler picks. Returns 503 if the named host cannot
+            fit the VM; never silently falls back.
+        node_selector:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Internal API keys only. Restricts placement to hosts whose labels
+            match every supplied key/value pair.
+        region:
+          type: string
+          description: |
+            Optional — placement region. When omitted, the server defaults
+            to its own configured region. When set, must equal this control
+            plane's region; mismatched values get rejected with HTTP 400
+            (no cross-region routing).
+          example: eu
+        ingress_enabled:
+          type: boolean
+          description: |
+            When true, the sandbox is reachable at
+            `<ulid>-<port>.<domain>`. Off by default — opt-in.
+            Flippable via PATCH later. Requires no SSH key.
+        auto_pause_after_seconds:
+          type: integer
+          description: |
+            Automatically pause the sandbox after this many seconds with
+            no activity (no exec, file transfer, or tunnel). Null / omitted
+            means the sandbox runs until you stop it manually.
+            Valid range: 60–86400 (1 minute to 24 hours).
+          minimum: 60
+          maximum: 86400
+          example: 600
+          nullable: true
+        disks:
+          type: array
+          description: |
+            S3 disks to mount at create time. Each entry references a
+            disk the caller has previously registered via `POST /v1/disks`
+            and assigns it an absolute mount path inside the guest. The
+            disk's credentials are decrypted server-side and pushed into
+            MMDS so the guest agent's reconciler runs `s3fs` for each
+            entry. Live attach + detach is available post-create via
+            `POST /v1/sandboxes/{id}/disks` and the matching DELETE.
+          items: { $ref: '#/components/schemas/DiskAttachment' }
+          example:
+            - disk_id: my-data
+              mount_path: /mnt/data
+
+    # ── sandbox: create response ───────────────────────────────────
+    CreateResp:
+      type: object
+      properties:
+        id:                    { type: string, example: sb_01K… }
+        status:                { type: string, enum: [running] }
+        name:                  { type: string, example: brave-otter }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        ip:                    { type: string, example: 192.168.0.12 }
+        shape:                 { type: string }
+        rootfs:                { type: string }
+        vcpu:                  { type: integer }
+        mem_mib:               { type: integer }
+        disk_mib:              { type: integer, format: int64 }
+        spawn_ms:              { type: number, format: double }
+        egress:
+          type: array
+          items: { type: string }
+        bandwidth_quota_bytes: { type: integer, format: int64 }
+
+    # ── sandbox-scoped delegated credential ───────────────────────
+    SandboxAccessTokenCreateResp:
+      type: object
+      required: [token, enabled, created_at]
+      description: |
+        Returned only when a token is created or rotated. `token` is
+        plaintext-once: store it securely because subsequent inspection
+        returns only a redacted hint. Exactly one access token may be enabled
+        per sandbox.
+      properties:
+        token:
+          type: string
+          pattern: '^skp_sb_'
+          writeOnly: true
+          example: skp_sb_example-plaintext-returned-once
+        enabled: { type: boolean, enum: [true] }
+        created_at: { type: string, format: date-time }
+        rotated_at: { type: string, format: date-time, nullable: true }
+    SandboxAccessTokenMetadataResp:
+      type: object
+      required: [enabled]
+      description: Token state without plaintext credential material.
+      properties:
+        enabled: { type: boolean }
+        token_hint:
+          type: string
+          description: Redacted non-secret identifier suitable for audit correlation.
+          example: skp_sb_Ab12...Xy9Z
+        created_at: { type: string, format: date-time, nullable: true }
+        rotated_at: { type: string, format: date-time, nullable: true }
+
+    # ── sandbox: view (list / get) ─────────────────────────────────
+    SandboxView:
+      type: object
+      description: |
+        Public view of a sandbox. Operator-only fields are not returned.
+      properties:
+        id:            { type: string }
+        name:          { type: string, example: brave-otter }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        status:
+          type: string
+          enum: [creating, running, pausing, paused, resuming, forking, error, destroying, destroyed, failed]
+        ip:            { type: string }
+        vcpu:          { type: integer }
+        mem_mib:       { type: integer }
+        disk_mib:      { type: integer, format: int64 }
+        created_at:    { type: string, format: date-time }
+        running_at:    { type: string, format: date-time, nullable: true }
+        destroyed_at:  { type: string, format: date-time, nullable: true }
+        spawn_ms:      { type: number, format: double }
+        shape:         { type: string }
+        rootfs:        { type: string }
+        region:        { type: string, description: "Always present — the region the sandbox was placed in." }
+        egress:
+          type: array
+          items: { type: string }
+        envs:
+          type: array
+          items: { type: string }
+          description: |
+            Names of environment variables stored on this sandbox. Values
+            are never returned — only the keys, for visibility.
+          example: ["ANTHROPIC_API_KEY", "PI_TOKEN"]
+        ssh_pubkeys:
+          type: array
+          items: { type: string }
+        created_by:    { type: string, description: "user_id of the API key that created this sandbox" }
+        ingress_enabled:
+          type: boolean
+          description: |
+            When true, the sandbox is reachable on
+            `<ulid>-<port>.<domain>`. Toggle via PATCH.
+        bandwidth_ingress_bytes: { type: integer, format: int64 }
+
+        auto_pause_after_seconds:
+          type: integer
+          nullable: true
+          description: |
+            Seconds of inactivity before the sandbox is automatically
+            paused. Null means auto-pause is off.
+          example: 600
+
+        # ── pause / resume / fork lifecycle ────────────────────────
+        paused_at:        { type: string, format: date-time, nullable: true }
+        last_resumed_at:  { type: string, format: date-time, nullable: true }
+        forked_from:      { type: string, description: "Source sandbox id when this row was created via /fork" }
+
+    # ── pause / resume / fork ─────────────────────────────────────
+    PauseAck:
+      type: object
+      properties:
+        id:     { type: string }
+        status:
+          type: string
+          enum: [pausing, paused]
+    ResumeAck:
+      type: object
+      properties:
+        id:     { type: string }
+        status:
+          type: string
+          enum: [resuming, running]
+    ForkReq:
+      type: object
+      properties:
+        start_paused:
+          type: boolean
+          description: |
+            If true, the new sandbox stays in `paused` after the bundle
+            copy completes. Default false (auto-resumes to running).
+        ssh_pubkeys:
+          type: array
+          items: { type: string }
+        egress:
+          type: array
+          items: { type: string }
+        ingress_enabled: { type: boolean }
+        envs:
+          type: object
+          additionalProperties: { type: string }
+        bandwidth_quota_bytes: { type: integer, format: int64 }
+    PatchSandboxReq:
+      type: object
+      description: |
+        Partial update. Only fields you include are changed. Omit a field
+        to leave it unchanged.
+      properties:
+        labels:
+          type: object
+          additionalProperties: { type: string }
+          description: Labels to merge into the sandbox's existing labels.
+        ingress_enabled: { type: boolean }
+        auto_pause_after_seconds:
+          type: integer
+          nullable: true
+          description: |
+            Set a new idle-pause timeout (60–86400 seconds). Omit to leave
+            unchanged.
+          minimum: 60
+          maximum: 86400
+        disable_auto_pause:
+          type: boolean
+          description: |
+            Set to true to turn off auto-pause entirely (clears the
+            timeout). Takes precedence over auto_pause_after_seconds when
+            both are sent.
+
+    # ── exec ───────────────────────────────────────────────────────
+    ExecReq:
+      type: object
+      required: [cmd]
+      properties:
+        cmd:
+          type: string
+          description: Program to execute inside the VM (absolute or PATH-resolved).
+        args:
+          type: array
+          items: { type: string }
+        stdin:
+          type: string
+          description: Optional stdin passed to the process.
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Per-process overrides. Keys must have been declared in the
+            sandbox's `envs` at creation time. Omitted declared keys inherit
+            their sandbox-level values; undeclared keys return `400`.
+          description: |
+            Per-exec environment variable overrides. Every key MUST have
+            been declared in the sandbox's `envs` at create time — this
+            call may override the *value* of a declared key, but cannot
+            introduce a new one. Supplying an undeclared key returns
+            `400`. The create-time `envs` map is the allowlist, so a
+            caller can never inject env (`PATH`, `LD_PRELOAD`, ...) the
+            sandbox owner did not sanction. Omitted keys keep their
+            create-time values.
+          example: { ANTHROPIC_API_KEY: "sk-ant-..." }
+        stream:
+          type: boolean
+          description: |
+            When `true`, response is an NDJSON stream of `ExecStreamEvent`
+            objects (one per line). Equivalent to passing `?stream=true`
+            on the URL.
+    ExecResp:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            stdout:    { type: string }
+            stderr:    { type: string }
+            exit_code: { type: integer }
+        exec_ms: { type: number, format: double }
+
+    # ── computer / desktop ────────────────────────────────────────
+    ComputerPoint:
+      type: object
+      required: [x, y]
+      properties:
+        x: { type: integer, minimum: 0, maximum: 65535 }
+        y: { type: integer, minimum: 0, maximum: 65535 }
+    ComputerScreenGeometry:
+      type: object
+      required: [width, height]
+      properties:
+        width: { type: integer, minimum: 1 }
+        height: { type: integer, minimum: 1 }
+    ComputerClickRequest:
+      type: object
+      properties:
+        button: { type: string, enum: [left, middle, right], default: left }
+        x: { type: integer, minimum: 0, maximum: 65535 }
+        y: { type: integer, minimum: 0, maximum: 65535 }
+        count: { type: integer, minimum: 1, maximum: 10, default: 1 }
+      description: "`x` and `y` must either both be supplied or both be omitted."
+    ComputerScrollRequest:
+      type: object
+      properties:
+        direction: { type: string, enum: [up, down], default: down }
+        amount: { type: integer, minimum: 1, maximum: 100, default: 1 }
+    ComputerDragRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { $ref: '#/components/schemas/ComputerPoint' }
+        to: { $ref: '#/components/schemas/ComputerPoint' }
+    ComputerButtonRequest:
+      type: object
+      properties:
+        button: { type: string, enum: [left, middle, right], default: left }
+    ComputerTypeRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, maxLength: 65536 }
+        delay_in_ms: { type: integer, minimum: 0, maximum: 1000, default: 25 }
+    ComputerPressRequest:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items: { type: string, minLength: 1, maxLength: 64 }
+          example: [Control_L, C]
+    ComputerClipboard:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, maxLength: 1048576 }
+    ComputerOpenRequest:
+      type: object
+      required: [target]
+      properties:
+        target: { type: string, maxLength: 4096, example: 'https://example.com' }
+    ComputerLaunchRequest:
+      type: object
+      required: [application]
+      properties:
+        application: { type: string, maxLength: 256, example: firefox-esr }
+        uri: { type: string, maxLength: 4096, example: 'https://example.com' }
+    ComputerWindow:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, pattern: '^[0-9]+$' }
+        title: { type: string }
+    ComputerWindowGeometry:
+      type: object
+      required: [id, x, y, width, height, screen]
+      properties:
+        id: { type: string, pattern: '^[0-9]+$' }
+        x: { type: integer }
+        y: { type: integer }
+        width: { type: integer, minimum: 1 }
+        height: { type: integer, minimum: 1 }
+        screen: { type: integer, minimum: 0 }
+    ComputerWindowMoveRequest:
+      type: object
+      required: [x, y]
+      properties:
+        x: { type: integer, minimum: 0, maximum: 65535 }
+        y: { type: integer, minimum: 0, maximum: 65535 }
+    ComputerWindowResizeRequest:
+      type: object
+      required: [width, height]
+      properties:
+        width: { type: integer, minimum: 1, maximum: 3840 }
+        height: { type: integer, minimum: 1, maximum: 2160 }
+    ComputerScreen:
+      type: object
+      required: [screen_id, display, width, height, vnc_port, novnc_port]
+      properties:
+        screen_id: { type: string, pattern: '^screen-[0-7]$', example: screen-0 }
+        display: { type: string, pattern: '^:[0-7]$', example: ':0' }
+        width: { type: integer, minimum: 320, maximum: 3840 }
+        height: { type: integer, minimum: 240, maximum: 2160 }
+        vnc_port: { type: integer, minimum: 5900, maximum: 5907 }
+        novnc_port: { type: integer, minimum: 6080, maximum: 6087 }
+    ComputerCreateScreenRequest:
+      type: object
+      properties:
+        width: { type: integer, minimum: 320, maximum: 3840, default: 1280 }
+        height: { type: integer, minimum: 240, maximum: 2160, default: 800 }
+    ComputerScreenConnection:
+      type: object
+      required: [screen_id, port, path, token, expires_at]
+      properties:
+        screen_id: { type: string, pattern: '^screen-[0-7]$' }
+        port: { type: integer, minimum: 6080, maximum: 6087 }
+        path: { type: string }
+        token:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Single-screen noVNC bearer token. It expires after one hour, and a new connect call invalidates it immediately.
+        expires_at:
+          type: string
+          format: date-time
+          description: Time after which this token cannot establish a new websocket session.
+        url:
+          type: string
+          format: uri
+          description: Public noVNC URL; present when sandbox ingress is enabled.
+
+    ExecStreamEvent:
+      type: object
+      description: |
+        One frame of a streaming exec, encoded as a single line of NDJSON.
+        Field names match `ExecResp.result` so a single client struct can
+        parse both buffered and streaming responses. In any one event
+        exactly one field is meaningful; the rest are zero and elided.
+
+        Frame types:
+          - `{"stdout": "..."}` — stdout chunk
+          - `{"stderr": "..."}` — stderr chunk
+          - `{"hb": true}`      — heartbeat (every 5s; clients ignore)
+          - `{"exit_code": N}`  — terminal frame
+          - `{"error": "..."}`  — agent-level failure
+      properties:
+        stdout:    { type: string }
+        stderr:    { type: string }
+        exit_code: { type: integer, description: "Terminal frame; only set on the last event." }
+        error:     { type: string, description: "Agent-level failure (couldn't start cmd)." }
+        hb:        { type: boolean, description: "Heartbeat marker; clients ignore." }
+
+    # ── managed processes / PTYs ───────────────────────────────────
+    ProcessPTYOptions:
+      type: object
+      properties:
+        rows: { type: integer, minimum: 1, maximum: 65535, default: 24 }
+        cols: { type: integer, minimum: 1, maximum: 65535, default: 80 }
+    ProcessCreateRequest:
+      type: object
+      properties:
+        cmd:
+          type: string
+          description: Required executable name or path for pipe processes; omit to use the default interactive shell for PTYs.
+        args:
+          type: array
+          items: { type: string }
+          description: Arguments passed directly to the executable without shell parsing.
+        cwd: { type: string }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        pty:
+          allOf: [{ $ref: '#/components/schemas/ProcessPTYOptions' }]
+          nullable: true
+          description: Omit for separate stdin/stdout/stderr pipes; include for a persistent PTY.
+    ProcessDetails:
+      type: object
+      required: [process_id, pid, kind, state, leader_exited, tree_exited, created_at, output]
+      properties:
+        process_id: { type: string, example: proc_dGVzdF9wcm9jZXNzX2lkMQ }
+        pid: { type: integer }
+        kind: { type: string, enum: [process, pty] }
+        state: { type: string, enum: [starting, running, terminating, exited, failed] }
+        leader_exited: { type: boolean }
+        tree_exited: { type: boolean }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+        exit_code: { type: integer, nullable: true }
+        signal: { type: string }
+        output:
+          type: object
+          required: [oldest_seq, newest_seq, bytes]
+          properties:
+            oldest_seq: { type: integer, format: int64 }
+            newest_seq: { type: integer, format: int64 }
+            bytes: { type: integer }
+    ProcessListResponse:
+      type: object
+      required: [processes]
+      properties:
+        processes:
+          type: array
+          items: { $ref: '#/components/schemas/ProcessDetails' }
+    ProcessInputRequest:
+      type: object
+      required: [data_base64]
+      properties:
+        data_base64: { type: string, format: byte }
+    ProcessInputResponse:
+      type: object
+      required: [input_seq]
+      properties:
+        input_seq: { type: integer, format: int64 }
+    ProcessResizeRequest:
+      type: object
+      required: [rows, cols]
+      properties:
+        rows: { type: integer, minimum: 1, maximum: 65535 }
+        cols: { type: integer, minimum: 1, maximum: 65535 }
+    ProcessSignalRequest:
+      type: object
+      required: [signal]
+      properties:
+        signal:
+          type: string
+          enum: [SIGHUP, SIGINT, SIGQUIT, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH]
+    ProcessOutputEvent:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [data, heartbeat, exit, error] }
+        seq: { type: integer, format: int64 }
+        stream: { type: string, enum: [stdout, stderr, pty] }
+        data_base64: { type: string, format: byte }
+        exit_code: { type: integer, nullable: true }
+        signal: { type: string, nullable: true }
+        error: { type: string }
+
+    # ── egress ─────────────────────────────────────────────────────
+    SetEgressReq:
+      type: object
+      properties:
+        egress:
+          type: array
+          nullable: true
+          items: { type: string }
+          description: |
+            Full replacement allowlist. `null` / missing / empty / `["*"]`
+            all mean allow-all. Applied atomically — the new rules
+            replace the old ones in a single update. Named presets such as
+            `@pypi` are accepted and stored as their expanded concrete rules.
+    EgressView:
+      type: object
+      properties:
+        id: { type: string }
+        egress:
+          type: array
+          items: { type: string }
+          description: Concrete expanded rules currently enforced by the host.
+    EgressPresetsView:
+      type: object
+      required: [version, presets]
+      properties:
+        version:
+          type: string
+          description: Catalog version; changes whenever preset contents change.
+        presets:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+          description: Preset token to concrete egress-rule mapping.
+
+    # ── bandwidth ──────────────────────────────────────────────────
+    BandwidthView:
+      type: object
+      properties:
+        id:              { type: string }
+        quota_bytes:     { type: integer, format: int64 }
+        used_bytes:      { type: integer, format: int64 }
+        remaining_bytes: { type: integer, format: int64 }
+        capped:          { type: boolean }
+    SandboxMetricsView:
+      type: object
+      description: |
+        Per-sandbox resource usage snapshot, scraped from the owning
+        host's cgroup files on demand. Read-only.
+      properties:
+        sandbox_id:          { type: string }
+        memory_bytes:
+          type: integer
+          format: int64
+          description: Resident RAM in bytes (cgroup memory.current).
+        memory_limit_bytes:
+          type: integer
+          format: int64
+          description: |
+            Memory cap in bytes (cgroup memory.max). 0 means unlimited
+            (the cgroup file reads "max").
+        memory_pct:
+          type: number
+          format: double
+          description: |
+            memory_bytes / memory_limit_bytes * 100. 0 when there is no
+            limit (memory_limit_bytes == 0).
+        cpu_cores_used:
+          type: number
+          format: double
+          description: |
+            Instantaneous CPU consumption in fractional cores, averaged
+            over the most recent scraper window (~15-30 s). 1.0 means
+            one full core.
+        cpu_cores_allocated:
+          type: number
+          format: double
+          description: |
+            Allocated CPU budget in fractional cores, derived from cgroup
+            cpu.max (quota / period). 0 means unlimited (cpu.max reads
+            "max").
+        cpu_pct:
+          type: number
+          format: double
+          description: |
+            cpu_cores_used / cpu_cores_allocated * 100. 0 when there is
+            no quota (cpu_cores_allocated == 0).
+        as_of:
+          type: string
+          format: date-time
+          description: UTC timestamp the snapshot was taken.
+
+    RechargeReq:
+      type: object
+      required: [add_bytes]
+      properties:
+        add_bytes:
+          type: integer
+          format: int64
+          description: |
+            Bytes to add to the quota (additive — top-up, not reset).
+            If the VM was capped and the new quota exceeds usage, the
+            in-kernel DROP rule is removed on the next meter tick (≤5 s).
+
+    # ── destroy ack ────────────────────────────────────────────────
+    DestroyedResp:
+      type: object
+      description: |
+        Delete acknowledgement. Idempotent — deleting a sandbox that's
+        already gone returns the same shape with status="destroyed". A
+        fresh delete returns status="destroying" and completes within a
+        few seconds.
+      properties:
+        id:     { type: string, description: "the sandbox id" }
+        status:
+          type: string
+          enum: [destroying, destroyed]
+
+    # ── whoami / identity introspection ────────────────────────────
+    WhoAmIView:
+      type: object
+      description: |
+        Identity + per-user fleet summary. Counts are observational —
+        no atomicity guarantee vs creates/destroys in flight.
+      properties:
+        user_id: { type: string }
+        stats:   { $ref: '#/components/schemas/WhoAmIStatsView' }
+    WhoAmIStatsView:
+      type: object
+      properties:
+        running: { type: integer, description: "currently-running sandboxes (counts toward the per-user concurrent cap)" }
+        paused:  { type: integer, description: "currently-paused sandboxes" }
+        other:   { type: integer, description: "any other non-terminal status (creating, pausing, resuming, etc.)" }
+        total:   { type: integer, description: "every sandbox the user has ever owned, including destroyed/failed" }
+
+    # ── templates ──────────────────────────────────────────────────
+    TemplateCreateReq:
+      type: object
+      required: [name, dockerfile]
+      properties:
+        name:
+          type: string
+          description: |
+            Friendly alias used to spawn (`rootfs=<name>` resolves to the
+            latest ready template with this name). 1–63 chars, lowercase
+            alphanumeric + dash.
+        dockerfile:
+          type: string
+          description: |
+            Raw Dockerfile contents. Validated at submit time: must be
+            single-stage, FROM in the operator allowlist (e.g.
+            `nodeops/sandbox:debian`), no COPY/ADD, no
+            ARG-substituted FROM. Max 64 KiB.
+    TemplateView:
+      type: object
+      description: |
+        User-facing projection of a `templates` row. Internal fields
+        (sha256 / compressed size / built-in cluster / attempts) are
+        deliberately omitted.
+      properties:
+        id:              { type: string, description: "tpl_<ulid>" }
+        name:            { type: string }
+        base:            { type: string, description: "resolved FROM image" }
+        status:
+          type: string
+          enum: [pending, building, ready, failed]
+        ext4_size_bytes:
+          type: integer
+          format: int64
+          description: "uncompressed ext4 size; 0 until status=ready"
+        created_at:      { type: string, format: date-time }
+        built_at:
+          type: string
+          format: date-time
+          nullable: true
+        dockerfile:
+          type: string
+          description: "only present on detail GET with ?include=dockerfile"
+    TemplateLogLine:
+      type: object
+      description: |
+        One decoded line from a template's build log stream. Emitted
+        one-per-line inside the `application/x-ndjson` response of
+        `GET /v1/templates/{id}/logs?follow=true`. Ordered by `ts`
+        ascending; consumers should keep the latest seen `ts` to
+        de-dupe on reconnect.
+      required: [ts, level, line, attempt]
+      properties:
+        ts:
+          type: string
+          format: date-time
+          description: "log timestamp, RFC 3339 with nanosecond precision"
+        level:
+          type: string
+          description: "log level as reported by the builder (info/warn/error/debug)"
+        line:
+          type: string
+          description: "raw log text; not a JSON escape, may contain arbitrary bytes"
+        attempt:
+          type: integer
+          minimum: 0
+          description: "build attempt number this line belongs to (1-based); 0 = unknown"
+    TemplatesListResp:
+      type: object
+      properties:
+        templates:
+          type: array
+          items: { $ref: '#/components/schemas/TemplateView' }
+
+    # ── disks ──────────────────────────────────────────────────────
+    DiskConfig:
+      type: object
+      required: [bucket, endpoint]
+      description: |
+        Non-secret configuration of an S3-compatible disk. Kind-agnostic
+        at the schema level; today only `kind:"s3"` is supported.
+      properties:
+        bucket:
+          type: string
+          example: my-data-bucket
+        endpoint:
+          type: string
+          description: Full HTTP(S) base URL of the S3 endpoint.
+          example: https://s3.amazonaws.com
+        region:
+          type: string
+          description: Optional. S3 region. Defaults to "auto" for R2/MinIO.
+          example: us-east-1
+        use_path_style:
+          type: boolean
+          description: |
+            Use path-style URLs (`<endpoint>/<bucket>/`). Required for
+            MinIO and most self-hosted S3-compatibles; AWS S3 supports
+            either.
+    DiskCredentials:
+      type: object
+      required: [access_key, secret_key]
+      description: |
+        S3 access pair. Encrypted at rest via the control plane's
+        AES-256-GCM key (see DESIGN/s3-disks.md). NEVER returned in any
+        response.
+      properties:
+        access_key:
+          type: string
+          example: AKIA...
+        secret_key:
+          type: string
+          format: password
+    DiskCreateReq:
+      type: object
+      required: [name, kind, config, credentials]
+      properties:
+        name:
+          type: string
+          description: |
+            User-scoped disk name. Lowercase alphanumeric + dash, 1–63
+            chars, must start with a letter or digit.
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+          example: my-data
+        kind:
+          type: string
+          enum: [s3]
+        config:    { $ref: '#/components/schemas/DiskConfig' }
+        credentials: { $ref: '#/components/schemas/DiskCredentials' }
+    DiskView:
+      type: object
+      description: |
+        User-facing projection of a disks row. Credentials are NEVER
+        included.
+      properties:
+        id:         { type: string, example: disk_01KSHT... }
+        name:       { type: string, example: my-data }
+        kind:       { type: string, example: s3 }
+        config:     { $ref: '#/components/schemas/DiskConfig' }
+        created_at: { type: string, format: date-time }
+    DisksListResp:
+      type: object
+      properties:
+        disks:
+          type: array
+          items: { $ref: '#/components/schemas/DiskView' }
+    DiskAttachment:
+      type: object
+      required: [disk_id, mount_path]
+      description: |
+        One disk-to-sandbox attachment request — used in
+        `CreateReq.disks` and as the body of
+        `POST /v1/sandboxes/{id}/disks` (live attach).
+
+        One disk can mount at multiple paths in the same sandbox: each
+        `(disk_id, mount_path)` pair is a separate attachment row, and
+        each is detached independently via `DELETE …/disks/{disk_id}
+        ?mount_path=…`. Re-attaching the same `(disk_id, mount_path)`
+        is idempotent (200).
+      properties:
+        disk_id:
+          type: string
+          description: Either a `disk_<ulid>` id or a user-scoped name.
+          example: my-data
+        mount_path:
+          type: string
+          description: |
+            Absolute path inside the guest. Must start with `/`, must
+            not contain `..`, must not target a reserved system path
+            (`/`, `/etc`, `/proc`, `/sys`, `/dev`, ...). At most one
+            attachment per sandbox may claim a given `mount_path` —
+            collisions with a *different* disk return 409 on live
+            attach, 400 on create-time. Re-attaching the *same* disk
+            at the same path is idempotent.
+          example: /mnt/data
+        sub_path:
+          type: string
+          description: |
+            Optional prefix inside the bucket. When non-empty, the guest
+            mounts `<bucket>:/<sub_path>` (s3fs `compat_dir` is enabled
+            so the synthetic directory works without a placeholder
+            object). Leading / trailing slashes are normalised; `..` is
+            rejected. Default empty = mount the bucket root.
+          example: team-a/
+    SandboxDiskView:
+      type: object
+      description: |
+        Per-attachment projection surfaced by
+        `GET /v1/sandboxes/{id}/disks`. Mount status is reported by the
+        guest agent and polled by the host every 30 s.
+      properties:
+        disk_id:      { type: string }
+        name:         { type: string }
+        kind:         { type: string, example: s3 }
+        config:       { $ref: '#/components/schemas/DiskConfig' }
+        mount_path:   { type: string, example: /mnt/data }
+        sub_path:     { type: string, example: team-a/, description: "Optional bucket prefix; empty = bucket root." }
+        mount_status:
+          type: string
+          enum: [pending, mounted, failed]
+          description: |
+            `pending` immediately after attach (and after pause). Flips
+            to `mounted` once the agent's `applyDisks` loop has run
+            `s3fs` successfully; `failed` if the mount errored — see
+            `mount_error`.
+        mount_error:
+          type: string
+          description: |
+            Truncated to ~1 KiB by the agent. Present only when
+            `mount_status == "failed"`.
+    SandboxDisksListResp:
+      type: object
+      properties:
+        disks:
+          type: array
+          items: { $ref: '#/components/schemas/SandboxDiskView' }
+    DiskDeletedResp:
+      type: object
+      properties:
+        deleted: { type: boolean }
+    DiskDetachedResp:
+      type: object
+      properties:
+        detached: { type: boolean }
+
+    # ── networks ───────────────────────────────────────────────────
+    NetworkEntry:
+      type: object
+      required: [id]
+      description: |
+        One network reference, used both in `CreateReq.networks` and as
+        the body of `POST /v1/sandboxes/{id}/networks`.
+      properties:
+        id:
+          type: string
+          description: Network name or `net-<ulid>` id.
+          example: net-01k2x…
+    NetworkCreateReq:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: User-facing network name, owned per-user.
+          example: backend
+    NetworkMember:
+      type: object
+      description: |
+        User-facing projection of a sandbox→network membership.
+      properties:
+        sandbox_id: { type: string }
+        status:     { type: string }
+        ip:         { type: string }
+        name:
+          type: string
+          description: The member sandbox's user-facing name.
+    Network:
+      type: object
+      description: |
+        A private network for sandbox-to-sandbox traffic. `member_count`
+        and `members` are populated only on the detail response
+        (`GET /v1/networks/{id}`).
+      properties:
+        id:           { type: string, example: net-01k2x… }
+        name:         { type: string, example: backend }
+        created_at:   { type: string, format: date-time }
+        member_count: { type: integer }
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/NetworkMember' }
+    OKResp:
+      type: object
+      properties:
+        ok: { type: boolean }
+
+    # ── health ─────────────────────────────────────────────────────
+    HealthzResp:
+      type: object
+      properties: { up: { type: boolean } }
+    ReadyzResp:
+      type: object
+      properties: { ready: { type: boolean } }
+
+  # common responses
+  responses:
+    Unauthorized:
+      description: Authentication missing or invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/FailEnvelope' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/FailEnvelope' }
+    BadRequest:
+      description: Validation failure
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/FailEnvelope' }
+    ServerError:
+      description: Server-side error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    ServiceUnavailable:
+      description: |
+        No host with capacity (scheduler exhausted, or the hinted
+        `host_id` can't fit the VM)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+security:
+  - apiKeyAuth: []
+  - authTokenAuth: []
+  - accessTokenAuth: []
+
+# ────────────────────────────────────────────────────────────────────────
+# Paths
+# ────────────────────────────────────────────────────────────────────────
+paths:
+
+  # ── health ──────────────────────────────────────────────────────
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Always 200 when the process is up
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/HealthzResp' }
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe (DB reachable)
+      security: []
+      responses:
+        '200':
+          description: Control can query its Postgres
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ReadyzResp' }
+        '503': { $ref: '#/components/responses/ServerError' }
+
+  # ── catalog ─────────────────────────────────────────────────────
+  /v1/whoami:
+    get:
+      operationId: whoami
+      summary: Identity introspection + per-user sandbox counts
+      description: |
+        Returns the user_id resolved from the bearer token plus a
+        snapshot of how many sandboxes the user has (running / paused /
+        other / total). Equivalent in spirit to `aws sts get-caller-identity`
+        — useful for SDK callers to confirm credentials before doing real
+        work. Counts are observational; no consistency guarantees vs
+        creates/destroys mid-call.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/WhoAmIView' }
+
+  /v1/shapes:
+    get:
+      operationId: listShapes
+      summary: List the shape catalog
+      description: Lists the static shape catalog (`s-1vcpu-256mb`, `s-1vcpu-1gb`, etc.).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/Shape' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+
+  /v1/rootfs:
+    get:
+      operationId: listRootfs
+      summary: List the rootfs catalog of the default host
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/RootfsData' }
+
+  # ── sandbox lifecycle ───────────────────────────────────────────
+  /v1/sandboxes:
+    get:
+      operationId: listSandboxes
+      summary: List sandboxes owned by the caller
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0, minimum: 0 }
+        - name: status
+          in: query
+          description: |
+            Filter by status (server-side, applied BEFORE the limit).
+            Empty = any status.
+          schema:
+            type: string
+            enum: [running, creating, destroyed, failed]
+        - name: labels
+          in: query
+          description: |
+            JSON object matched with AND semantics. A sandbox must contain
+            every supplied key/value pair. Example:
+            `?labels={"team":"backend","environment":"production"}`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/SandboxView' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createSandbox
+      summary: Create a sandbox
+      description: |
+        Creates a new sandbox. Typical startup is ~30–100 ms.
+        `ssh_pubkeys` is required if you plan to use `createos-cli tunnel`
+        or `createos-cli shell`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateReq' }
+      responses:
+        '200':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CreateResp' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/sandboxes/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getSandbox
+      summary: Get one sandbox's details
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: destroySandbox
+      summary: Destroy a sandbox
+      responses:
+        '200':
+          description: Destroyed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DestroyedResp' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: patchSandbox
+      summary: Partial update (labels, ingress, auto-pause)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchSandboxReq' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/access-token:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createSandboxAccessToken
+      summary: Create a delegated token bound to one sandbox
+      description: |
+        Requires the sandbox owner's normal user credential. The plaintext
+        token is returned exactly once and must be sent as `X-Api-Key`.
+        Creating another token while one is enabled returns HTTP 409; use the
+        rotate endpoint when replacement is intended. A sandbox token cannot
+        call this endpoint, including for its own sandbox.
+      responses:
+        '200':
+          description: Token created; plaintext is present only in this response
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxAccessTokenCreateResp' }
+        '403': { description: A sandbox-scoped token attempted token management }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Token already exists or sandbox lifecycle blocks creation }
+    get:
+      operationId: getSandboxAccessToken
+      summary: Inspect delegated-token metadata
+      description: |
+        Requires the sandbox owner's normal user credential. Never returns the
+        plaintext token. A sandbox token cannot inspect itself.
+      responses:
+        '200':
+          description: Current enabled state and redacted hint
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxAccessTokenMetadataResp' }
+        '403': { description: A sandbox-scoped token attempted token management }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: disableSandboxAccessToken
+      summary: Disable the sandbox's delegated token
+      description: |
+        Requires the sandbox owner's normal user credential. Revocation takes
+        effect immediately in the home region and propagates asynchronously to
+        peer regions. The token is also removed when the sandbox is destroyed.
+      responses:
+        '200':
+          description: Token disabled; idempotent when no token exists
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxAccessTokenMetadataResp' }
+        '403': { description: A sandbox-scoped token attempted token management }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/access-token/rotate:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: rotateSandboxAccessToken
+      summary: Replace the sandbox's delegated token
+      description: |
+        Requires the sandbox owner's normal user credential. The old token is
+        invalidated and new plaintext is returned exactly once. Returns HTTP
+        404 when no token exists; create one first in that case.
+      responses:
+        '200':
+          description: Token rotated; new plaintext is present only here
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxAccessTokenCreateResp' }
+        '403': { description: A sandbox-scoped token attempted token management }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Sandbox lifecycle blocks rotation }
+
+  /v1/sandboxes/{id}/pause:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: pauseSandbox
+      summary: Pause a running sandbox, preserving disk + memory state
+      description: |
+        Snapshots the sandbox to storage and frees its host. Disk +
+        memory + processes are all preserved exactly. Returns 202 with
+        the row in `pausing`; poll `GET /v1/sandboxes/{id}` until status
+        flips to `paused`. Typical pause completes in ~3s for a 1 GiB
+        sandbox.
+      responses:
+        '200': { description: Already paused; idempotent }
+        '202':
+          description: Accepted
+          headers:
+            X-Poll-After: { schema: { type: integer }, description: "Suggested seconds before next poll" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PauseAck' }
+        '409': { description: Sandbox is not in a pausable status }
+        '501': { description: Pause not enabled on this cluster }
+
+  /v1/sandboxes/{id}/resume:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: resumeSandbox
+      summary: Restore a paused sandbox
+      description: |
+        Brings a paused sandbox back to `running`. Disk + memory are
+        restored exactly; the sandbox gets a fresh IP. Returns 202 with
+        the row in `resuming`; poll until status flips to `running`.
+        Typical resume completes in <1s if the original host is still
+        available, ~10–13s when fetched from storage.
+
+        Retries on a different host if the first attempt fails. If all
+        attempts are exhausted the row goes to `error` — POST `/resume`
+        against that row to try again with a fresh budget.
+      responses:
+        '200': { description: Already running; idempotent }
+        '202':
+          description: Accepted
+          headers:
+            X-Poll-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ResumeAck' }
+        '409': { description: Sandbox is not paused or in error }
+        '503': { description: No host with capacity (or bundle not yet uploaded and no cached host) }
+
+  /v1/sandboxes/{id}/fork:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "Source sandbox id (must be paused)" }
+    post:
+      operationId: forkSandbox
+      summary: Clone a paused bundle into a new sandbox identity
+      description: |
+        Server-side `CopyObject` clones the four bundle artifacts
+        from `snapshots/<src>/` to `snapshots/<new>/` byte-identically.
+        The new id is independent — separate placement, separate IP,
+        separate bandwidth ledger. By default the new sandbox
+        auto-resumes to `running`; pass `start_paused: true` to keep
+        it in `paused`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ForkReq' }
+      responses:
+        '200':
+          description: Accepted (response carries the new sandbox id)
+          headers:
+            X-Poll-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '409': { description: Source sandbox is not paused }
+        '501': { description: Fork not configured (no storage bucket) }
+
+  /v1/sandboxes/by-ip/{ip}:
+    parameters:
+      - { name: ip, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getSandboxByIP
+      summary: Look up a sandbox by its VM IP
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── exec / file transfer ────────────────────────────────────────
+  /v1/sandboxes/{id}/exec:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: execSandbox
+      summary: Run a command inside the sandbox (buffered or streaming)
+      description: |
+        Two response modes selected by the `stream` query parameter
+        (or the `stream` field in the request body):
+
+        **Buffered (default).** Agent runs the cmd to completion and returns
+        a JSend envelope with `stdout`, `stderr`, and `exit_code`. Suitable
+        for short, well-behaved commands.
+
+        **Streaming (`?stream=true`).** Agent emits one JSON object per
+        line over `Content-Type: application/x-ndjson` (HTTP/1.1 chunked).
+        Each line is an `ExecStreamEvent` with the same field names as
+        the buffered shape — so a single struct parses both worlds. The
+        terminal frame carries `exit_code`. Heartbeat lines (`{"hb":true}`)
+        are emitted every 5 seconds so a dead client is detected and the
+        in-VM command killed within ~5s of disconnect.
+
+        Background processes must detach (redirect stdio + `&`) or
+        the exec blocks until they exit.
+      parameters:
+        - name: stream
+          in: query
+          required: false
+          description: When `true`, response is NDJSON stream of ExecStreamEvent lines.
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecReq' }
+      responses:
+        '200':
+          description: |
+            Buffered response (when `stream` is unset/false) or live
+            NDJSON stream (when `stream=true`).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ExecResp' }
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/ExecStreamEvent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── computer / desktop ──────────────────────────────────────────
+  /v1/sandboxes/{id}/computer/screenshot:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+      - { name: window_id, in: query, required: false, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: x, in: query, required: false, schema: { type: integer, minimum: 0 } }
+      - { name: y, in: query, required: false, schema: { type: integer, minimum: 0 } }
+      - { name: width, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 3840 } }
+      - { name: height, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 2160 } }
+    get:
+      operationId: captureSandboxScreenshot
+      summary: Capture a screen, window, or rectangular region as PNG
+      description: window_id is mutually exclusive with x/y/width/height. Region coordinates must be supplied together.
+      responses:
+        '200':
+          description: Current screen image, including the pointer
+          content: { image/png: { schema: { type: string, format: binary } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Desktop session is unavailable }
+
+  /v1/sandboxes/{id}/computer/screen:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: getSandboxScreenGeometry
+      summary: Get screen dimensions
+      responses:
+        '200':
+          description: Screen geometry
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerScreenGeometry' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Desktop session is unavailable }
+
+  /v1/sandboxes/{id}/computer/cursor:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: getSandboxCursor
+      summary: Get cursor coordinates
+      responses:
+        '200':
+          description: Cursor coordinates
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerPoint' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Desktop session is unavailable }
+
+  /v1/sandboxes/{id}/computer/mouse/move:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: moveSandboxMouse
+      summary: Move the cursor
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerPoint' } } } }
+      responses:
+        '200': { description: Cursor moved, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/mouse/click:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: clickSandboxMouse
+      summary: Click a mouse button, optionally at coordinates
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerClickRequest' } } } }
+      responses:
+        '200': { description: Click delivered, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/mouse/scroll:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: scrollSandboxMouse
+      summary: Scroll vertically
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerScrollRequest' } } } }
+      responses:
+        '200': { description: Scroll delivered, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/mouse/drag:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: dragSandboxMouse
+      summary: Drag from one coordinate to another
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerDragRequest' } } } }
+      responses:
+        '200': { description: Drag completed, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/mouse/down:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: pressSandboxMouseButton
+      summary: Hold a mouse button down
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerButtonRequest' } } } }
+      responses:
+        '200': { description: Button held, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/mouse/up:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: releaseSandboxMouseButton
+      summary: Release a mouse button
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerButtonRequest' } } } }
+      responses:
+        '200': { description: Button released, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/keyboard/type:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: typeOnSandboxKeyboard
+      summary: Type text into the focused window
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerTypeRequest' } } } }
+      responses:
+        '200': { description: Text delivered, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/keyboard/press:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: pressSandboxKeys
+      summary: Press a key or key combination
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerPressRequest' } } } }
+      responses:
+        '200': { description: Keys delivered, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/keyboard/down:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: holdSandboxKeys
+      summary: Hold one or more keyboard keys down
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerPressRequest' } } } }
+      responses:
+        '200': { description: Keys held, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/keyboard/up:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: releaseSandboxKeys
+      summary: Release one or more held keyboard keys
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerPressRequest' } } } }
+      responses:
+        '200': { description: Keys released, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/clipboard:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: getSandboxClipboard
+      summary: Read the desktop clipboard
+      responses:
+        '200':
+          description: Clipboard text
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerClipboard' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Desktop clipboard is unavailable }
+    put:
+      operationId: setSandboxClipboard
+      summary: Replace the desktop clipboard text
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerClipboard' } } } }
+      responses:
+        '200': { description: Clipboard updated, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/open:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: openSandboxDesktopTarget
+      summary: Open a URL or desktop target
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerOpenRequest' } } } }
+      responses:
+        '200': { description: Target opened, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/launch:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: launchSandboxDesktopApplication
+      summary: Launch an installed desktop application
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerLaunchRequest' } } } }
+      responses:
+        '200': { description: Launch accepted, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: listSandboxDesktopWindows
+      summary: List visible desktop windows
+      parameters:
+        - { name: application, in: query, required: false, schema: { type: string, maxLength: 256 } }
+      responses:
+        '200':
+          description: Visible windows
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/ComputerWindow' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/current:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: getCurrentSandboxDesktopWindow
+      summary: Get the focused desktop window
+      responses:
+        '200':
+          description: Focused window
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerWindow' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: getSandboxDesktopWindow
+      summary: Get a desktop window title
+      responses:
+        '200':
+          description: Window details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerWindow' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: closeSandboxDesktopWindow
+      summary: Request that a desktop window close
+      responses:
+        '200': { description: Close requested, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/focus:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: focusSandboxDesktopWindow
+      summary: Focus a desktop window
+      responses:
+        '200': { description: Window focused, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/geometry:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    get:
+      operationId: getSandboxDesktopWindowGeometry
+      summary: Get window position and dimensions
+      responses:
+        '200':
+          description: Window geometry
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerWindowGeometry' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/move:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: moveSandboxDesktopWindow
+      summary: Move a desktop window
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerWindowMoveRequest' } } } }
+      responses:
+        '200': { description: Window moved, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/resize:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: resizeSandboxDesktopWindow
+      summary: Resize a desktop window
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerWindowResizeRequest' } } } }
+      responses:
+        '200': { description: Window resized, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/maximize:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: maximizeSandboxDesktopWindow
+      summary: Maximize a desktop window
+      responses:
+        '200': { description: Window maximized, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/minimize:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: minimizeSandboxDesktopWindow
+      summary: Minimize a desktop window
+      responses:
+        '200': { description: Window minimized, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/windows/{window_id}/restore:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: window_id, in: path, required: true, schema: { type: string, pattern: '^[0-9]+$' } }
+      - { name: screen_id, in: query, required: false, schema: { type: string, pattern: '^screen-[0-7]$', default: screen-0 } }
+    post:
+      operationId: restoreSandboxDesktopWindow
+      summary: Restore a maximized desktop window
+      responses:
+        '200': { description: Window restored, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/screens:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: listSandboxComputerScreens
+      summary: List configured desktop screens
+      responses:
+        '200':
+          description: Configured screens; VNC bearer tokens are never returned here
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/ComputerScreen' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      operationId: createSandboxComputerScreen
+      summary: Create an additional desktop screen
+      description: Creates the lowest available screen id. A sandbox supports at most eight screens including screen-0.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ComputerCreateScreenRequest' } } } }
+      responses:
+        '200':
+          description: Screen created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerScreen' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Screen limit reached or desktop session unavailable }
+
+  /v1/sandboxes/{id}/computer/screens/{screen_id}/connect:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: path, required: true, schema: { type: string, pattern: '^screen-[0-7]$' } }
+    get:
+      operationId: connectSandboxComputerScreen
+      summary: Create a live noVNC connection URL
+      description: Rotates the screen bearer token. Previously issued URLs cannot establish new websocket sessions, and the new token expires after one hour.
+      responses:
+        '200':
+          description: Fresh noVNC connection details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerScreenConnection' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Sandbox ingress is disabled or desktop session is unavailable }
+
+  /v1/sandboxes/{id}/computer/screens/{screen_id}/resize:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: path, required: true, schema: { type: string, pattern: '^screen-[0-7]$' } }
+    post:
+      operationId: resizeSandboxComputerScreen
+      summary: Resize an existing desktop screen
+      description: Restarts the selected display at the new resolution, disconnecting existing noVNC sessions and invalidating previously issued connection tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ComputerCreateScreenRequest'
+                - type: object
+                  required: [width, height]
+      responses:
+        '200':
+          description: Resized screen
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerScreen' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/computer/screens/{screen_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: screen_id, in: path, required: true, schema: { type: string, pattern: '^screen-[0-7]$' } }
+    get:
+      operationId: getSandboxComputerScreen
+      summary: Get one configured desktop screen
+      responses:
+        '200':
+          description: Screen details without its VNC bearer token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/ComputerScreen' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteSandboxComputerScreen
+      summary: Delete an additional desktop screen
+      description: "`screen-0` is the primary screen and cannot be deleted."
+      responses:
+        '200': { description: Screen deleted, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Primary screen cannot be deleted or desktop session is unavailable }
+
+  # ── managed processes / PTYs ────────────────────────────────────
+  /v1/sandboxes/{id}/processes:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createSandboxProcess
+      summary: Create a managed pipe or PTY process
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProcessCreateRequest' }
+      responses:
+        '200':
+          description: Process created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ProcessDetails' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Sandbox is not running }
+        '429': { description: Managed-process limit reached }
+    get:
+      operationId: listSandboxProcesses
+      summary: List managed processes and PTYs
+      responses:
+        '200':
+          description: Process list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ProcessListResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/processes/{process_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getSandboxProcess
+      summary: Inspect a managed process or PTY
+      responses:
+        '200':
+          description: Process details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ProcessDetails' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: terminateSandboxProcess
+      summary: Terminate the complete managed process tree
+      parameters:
+        - name: grace_ms
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 60000, default: 1000 }
+      responses:
+        '200':
+          description: Final process details after the complete tree exits
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ProcessDetails' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/processes/{process_id}/connect:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: connectSandboxProcess
+      summary: Replay and follow ordered process output
+      parameters:
+        - name: after
+          in: query
+          description: Resume after this output sequence number.
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: NDJSON output stream; remains open until the process exits or the client disconnects.
+          content: { application/x-ndjson: { schema: { $ref: '#/components/schemas/ProcessOutputEvent' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { description: Requested output offset has expired from the bounded replay journal }
+
+  /v1/sandboxes/{id}/processes/{process_id}/input:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: writeSandboxProcessInput
+      summary: Write ordered bytes to process stdin or the PTY
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProcessInputRequest' } } }
+      responses:
+        '200':
+          description: Input accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ProcessInputResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Process exited or stdin is closed }
+
+  /v1/sandboxes/{id}/processes/{process_id}/stdin/close:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: closeSandboxProcessStdin
+      summary: Close a pipe process stdin
+      responses:
+        '200':
+          description: Stdin closed
+          content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Wrong process kind, process exited, or stdin already closed }
+
+  /v1/sandboxes/{id}/processes/{process_id}/resize:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: resizeSandboxProcessPTY
+      summary: Resize a managed PTY
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProcessResizeRequest' } } }
+      responses:
+        '200':
+          description: PTY resized
+          content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Process is not PTY-backed or has exited }
+
+  /v1/sandboxes/{id}/processes/{process_id}/signal:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: signalSandboxProcess
+      summary: Signal the process group or PTY foreground group
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProcessSignalRequest' } } }
+      responses:
+        '200':
+          description: Signal delivered
+          content: { application/json: { schema: { $ref: '#/components/schemas/SuccessEnvelope' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Process has exited }
+
+  /v1/sandboxes/{id}/processes/{process_id}/wait:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: process_id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: waitForSandboxProcess
+      summary: Wait for the leader or complete process tree to exit
+      parameters:
+        - name: scope
+          in: query
+          schema: { type: string, enum: [leader, tree], default: leader }
+        - name: timeout_ms
+          in: query
+          description: Maximum long-poll duration. Zero or omitted uses 30000 ms.
+          schema: { type: integer, format: int64, minimum: 0, maximum: 30000, default: 30000 }
+      responses:
+        '200':
+          description: Final process details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ProcessDetails' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '408': { description: Wait timeout expired }
+
+  /v1/sandboxes/{id}/files:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - name: path
+        in: query
+        required: true
+        description: Absolute path inside the VM. `..` rejected.
+        schema: { type: string }
+    put:
+      operationId: uploadFile
+      summary: Upload a file into the sandbox
+      description: |
+        Body is streamed directly into the sandbox without being buffered by
+        the control plane. Maximum 10 GiB. Parent directories are auto-created.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      operationId: downloadFile
+      summary: Download a file from the sandbox
+      responses:
+        '200':
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── egress ──────────────────────────────────────────────────────
+  /v1/egress/presets:
+    get:
+      operationId: listEgressPresets
+      summary: List named egress-rule presets
+      description: |
+        Returns the preset tokens accepted in sandbox create and live egress
+        update requests. Presets are expanded by control before persistence
+        and enforcement; sandbox responses therefore contain concrete rules.
+      responses:
+        '200':
+          description: Preset catalog
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/EgressPresetsView' }
+
+  /v1/sandboxes/{id}/egress:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getEgress
+      summary: Read the current egress allowlist
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/EgressView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: setEgress
+      summary: Replace the egress allowlist (live, no restart)
+      description: |
+        Replaces the sandbox's allowlist atomically. Domain-based rule
+        changes take effect within ~30 s; IP/port rules apply instantly.
+        Named tokens such as `@pypi` and `@npm` are expanded by control;
+        the response contains the concrete rules that were stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetEgressReq' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/EgressView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── bandwidth ───────────────────────────────────────────────────
+  /v1/sandboxes/{id}/bandwidth:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getBandwidth
+      summary: Read the sandbox's bandwidth quota / usage
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/BandwidthView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/bandwidth/recharge:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: rechargeBandwidth
+      summary: Top up the sandbox's bandwidth quota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RechargeReq' }
+      responses:
+        '200':
+          description: Recharged
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/BandwidthView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── metrics ─────────────────────────────────────────────────────
+  /v1/sandboxes/{id}/metrics:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getSandboxMetrics
+      summary: Per-sandbox CPU + memory usage snapshot
+      description: |
+        Reads the owning host's cgroup files on demand and returns
+        live memory + CPU figures for one sandbox. Owner-gated.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxMetricsView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── templates (user-defined rootfses) ────────────────────────────
+  /v1/templates:
+    get:
+      operationId: listTemplates
+      summary: List the caller's templates (most-recent first)
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0, minimum: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/TemplateView' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+    post:
+      operationId: submitTemplate
+      summary: Submit a Dockerfile to build a custom sandbox image
+      description: |
+        Returns immediately with a `pending` template; build runs
+        asynchronously and the row flips to `ready` (or `failed`) when
+        done. Poll `GET /v1/templates/{id}` or tail `…/logs` to follow.
+        Per-user concurrent build cap defaults to 2 (429 if exceeded).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateCreateReq' }
+      responses:
+        '200':
+          description: Queued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TemplateView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/templates/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "tpl_<ulid> or friendly name" }
+    get:
+      operationId: getTemplate
+      summary: Get template details (resolves friendly name to latest ready)
+      parameters:
+        - name: include
+          in: query
+          required: false
+          schema: { type: string, enum: [dockerfile] }
+          description: "set to `dockerfile` to include the source in the response"
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TemplateView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteTemplate
+      summary: Delete a template
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DestroyedResp' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/templates/{id}/logs:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getTemplateLogs
+      summary: Fetch or stream build logs for a template
+      description: |
+        Default (`follow=false`, or omitted) returns the full log so far
+        as `text/plain`, one raw line per row. Set `?follow=true` to
+        stream `application/x-ndjson`; each newline-delimited line is a
+        `TemplateLogLine` JSON object. The stream stays open, tailing new
+        rows every 500 ms, until the template reaches a terminal status
+        or the client disconnects. Empty for pending templates, partial
+        while building.
+      parameters:
+        - name: follow
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: "when true, response is application/x-ndjson stream of TemplateLogLine objects"
+        - name: attempt
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+          description: "filter to a specific build attempt; default = all attempts oldest-first"
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+          description: "cap the number of lines returned (non-follow only)"
+      responses:
+        '200':
+          description: |
+            Content-type depends on ?follow. Non-follow returns the raw
+            text log; follow returns an NDJSON stream where every line
+            is a TemplateLogLine.
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: "raw log lines separated by \\n; non-follow default"
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/TemplateLogLine'
+              example: |
+                {"ts":"2026-07-02T11:37:41.963700123Z","level":"info","line":"Step 1/5: FROM nodeops/sandbox:debian","attempt":1}
+                {"ts":"2026-07-02T11:37:42.114512345Z","level":"info","line":"Downloading base image ...","attempt":1}
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── networks ────────────────────────────────────────────────────
+  /v1/networks:
+    get:
+      operationId: listNetworks
+      summary: List the caller's networks
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0, minimum: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/Network' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createNetwork
+      summary: Create a network
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkCreateReq' }
+      responses:
+        '200':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Network' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/networks/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "Network name or net-<ulid>" }
+    get:
+      operationId: getNetwork
+      summary: Get one network's details (includes members)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Network' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteNetwork
+      summary: Delete a network (must have no members)
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OKResp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Network still has active members; detach all sandboxes first }
+
+  /v1/sandboxes/{id}/networks:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "Sandbox id" }
+    post:
+      operationId: attachNetwork
+      summary: Attach a sandbox to a network
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkEntry' }
+      responses:
+        '200':
+          description: Attached
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OKResp' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandboxes/{id}/networks/{net}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "Sandbox id" }
+      - { name: net, in: path, required: true, schema: { type: string }, description: "Network name or net-<ulid>" }
+    delete:
+      operationId: detachNetwork
+      summary: Detach a sandbox from a network
+      responses:
+        '200':
+          description: Detached
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OKResp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── disks ──────────────────────────────────────────────────────────
+  /v1/disks:
+    get:
+      operationId: listDisks
+      summary: List the caller's S3 disks
+      description: |
+        Credentials are never returned — only the disk metadata + config.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0, minimum: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/DiskView' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: |
+            Disks API not configured — control was started without a
+            `--disk-credential-key`.
+    post:
+      operationId: createDisk
+      summary: Register an S3 bucket as a disk
+      description: |
+        Server validates the request, runs a 3-second HEAD probe against
+        `<endpoint>/<bucket>` to catch typos, then AES-256-GCM encrypts
+        the credentials and inserts a `disks` row. Credentials are
+        NEVER returned in any response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiskCreateReq' }
+      responses:
+        '200':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DiskView' }
+        '400':
+          description: |
+            Validation rejection. Common causes: malformed name,
+            unsupported `kind`, missing bucket / endpoint / credentials,
+            unreachable endpoint (HEAD probe failed), or bucket missing
+            (404 from the probe).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: A disk with this name already exists.
+        '503':
+          description: Disks API not configured.
+
+  /v1/disks/{idOrName}:
+    parameters:
+      - { name: idOrName, in: path, required: true, schema: { type: string }, description: "disk_<ulid> id or user-scoped name" }
+    get:
+      operationId: getDisk
+      summary: Get a disk by id or name
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DiskView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            Disk not found, or owned by another user (identical body —
+            no existence leak across tenants).
+        '503':
+          description: Disks API not configured.
+    delete:
+      operationId: deleteDisk
+      summary: Soft-delete a disk
+      description: |
+        Refuses with 409 if the disk is attached to a non-destroyed
+        sandbox. Soft-delete only; the bucket contents are never touched.
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DiskDeletedResp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Disk is attached to a running, paused, creating, resuming,
+            or other non-terminal sandbox. Destroy the sandboxes (or
+            detach the disk live) before deleting.
+        '503':
+          description: Disks API not configured.
+
+  /v1/sandboxes/{id}/disks:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "Sandbox id" }
+    get:
+      operationId: listSandboxDisks
+      summary: List a sandbox's attached disks
+      description: |
+        Per-attachment view including the live `mount_status` reported
+        by the guest agent.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/SandboxDiskView' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      operationId: attachDiskLive
+      summary: Live-attach a disk to a running sandbox
+      description: |
+        Adds the disk to the sandbox's MMDS-fed desired set; the agent's
+        reconciler mounts it on its next tick (~2 ms detection,
+        ~1 second to spin up `s3fs`). Live attach only works on
+        sandboxes whose `status` is `running` — other states return 409
+        with a hint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiskAttachment' }
+      responses:
+        '200':
+          description: Attach accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OKResp' }
+        '400':
+          description: |
+            Validation rejection — empty disk_id, mount_path missing /
+            not absolute / contains `..`, or targets a reserved
+            filesystem path.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            Either the sandbox or the disk isn't owned by the caller
+            (identical body — no existence leak).
+        '409':
+          description: |
+            Either (a) the sandbox is not in `running` state — live
+            attach requires a running VM; paused/creating/destroying
+            sandboxes pick up disk changes via the resume / cold-boot
+            flow — or (b) another attachment on the same sandbox
+            already claims the requested `mount_path` (unique
+            constraint on `(sandbox_id, mount_path)`).
+        '503':
+          description: Disks API not configured.
+
+  /v1/sandboxes/{id}/disks/{disk_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: "Sandbox id" }
+      - { name: disk_id, in: path, required: true, schema: { type: string }, description: "Disk id (always `disk_<ulid>`, not a name)" }
+    delete:
+      operationId: detachDiskLive
+      summary: Live-detach a disk at a specific mount path (unmount only; bucket untouched)
+      description: |
+        Removes one attachment (keyed by `(disk_id, mount_path)`) from the
+        sandbox's desired set. The agent reconciler unmounts the FUSE
+        backing on the next tick. **The bucket contents are never touched**
+        — this only drops the in-VM mount. A disk mounted at multiple
+        paths in one sandbox can be detached one path at a time.
+      parameters:
+        - name: mount_path
+          in: query
+          required: true
+          schema: { type: string }
+          description: |
+            Absolute path of the attachment to detach. Required because
+            a disk may be mounted at multiple paths in the same sandbox.
+      responses:
+        '200':
+          description: Detached
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DiskDetachedResp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            The disk isn't attached to this sandbox (or the sandbox /
+            disk isn't owned by the caller). Idempotency boundary —
+            the first DELETE wins; the second sees nothing to remove.

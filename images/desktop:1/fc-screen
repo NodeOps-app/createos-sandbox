@@ -1,0 +1,113 @@
+#!/bin/sh
+set -eu
+
+state_dir=/var/lib/createos/computer-screens
+run_dir=/run/createos/computer-screens
+
+valid_index() {
+  case "$1" in ''|*[!0-7]*) return 1 ;; esac
+}
+
+stop_screen() {
+  index=$1
+  for name in websockify x11vnc xfce xvfb; do
+    pid_file="$run_dir/screen-$index.$name.pid"
+    if [ -s "$pid_file" ]; then
+      pid=$(cat "$pid_file")
+      /bin/kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      mv "$pid_file" "$run_dir/screen-$index.$name.stopping"
+    fi
+  done
+  # Process-group termination is asynchronous. A resize immediately reuses
+  # the same display and ports, so wait for the old groups instead of racing
+  # Xvfb's lock/socket cleanup. Escalate only groups that outlive the grace
+  # period; all PIDs came from our root-owned runtime directory.
+  for name in websockify x11vnc xfce xvfb; do
+    pid_file="$run_dir/screen-$index.$name.stopping"
+    [ -s "$pid_file" ] || continue
+    pid=$(cat "$pid_file")
+    tries=0
+    while /bin/kill -0 -- -"$pid" 2>/dev/null; do
+      tries=$((tries + 1))
+      if [ "$tries" -ge 40 ]; then
+        /bin/kill -KILL -- -"$pid" 2>/dev/null || true
+        break
+      fi
+      sleep 0.05
+    done
+    rm -f "$pid_file"
+  done
+  rm -f "/tmp/.X${index}-lock" "/tmp/.X11-unix/X${index}"
+  rm -f "$run_dir/screen-$index.tokens"
+}
+
+start_screen() {
+  index=$1 width=$2 height=$3 token=$4 expires_at=${5:-0}
+  display=:$index
+  vnc_port=$((5900 + index))
+  novnc_port=$((6080 + index))
+  config="$state_dir/screen-$index.conf"
+  tokens="$run_dir/screen-$index.tokens"
+
+  case "$width:$height:$token" in *[!0-9a-f:]*) exit 2 ;; esac
+  [ "$width" -ge 320 ] && [ "$width" -le 3840 ] || exit 2
+  [ "$height" -ge 240 ] && [ "$height" -le 2160 ] || exit 2
+  [ "${#token}" -eq 64 ] || exit 2
+  case "$expires_at" in ''|*[!0-9]*) exit 2 ;; esac
+  # Restoring a snapshot must not revive a connection URL that expired while
+  # the VM was paused. Future expiries remain owned by the agent's timer.
+  if [ "$expires_at" -ne 0 ] && [ "$expires_at" -le "$(date +%s)" ]; then
+    token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    expires_at=0
+  fi
+
+  install -d -m 0700 "$state_dir" "$run_dir"
+  stop_screen "$index"
+  committed=0
+  trap 'if [ "$committed" -ne 1 ]; then stop_screen "$index"; rm -f "$config"; fi' EXIT
+  umask 077
+  printf '%s %s %s %s\n' "$width" "$height" "$token" "$expires_at" >"$config.tmp"
+  mv "$config.tmp" "$config"
+  printf '%s: 127.0.0.1:%s\n' "$token" "$vnc_port" >"$tokens"
+
+  setsid runuser -u desktop -- env HOME=/home/desktop DISPLAY="$display" \
+    Xvfb "$display" -ac -screen 0 "${width}x${height}x24" -nolisten tcp \
+    >>"$run_dir/screen-$index.xvfb.log" 2>&1 &
+  echo $! >"$run_dir/screen-$index.xvfb.pid"
+
+  tries=0
+  until xdpyinfo -display "$display" >/dev/null 2>&1; do
+    tries=$((tries + 1)); [ "$tries" -lt 100 ] || exit 1; sleep 0.05
+  done
+
+  setsid runuser -u desktop -- env HOME=/home/desktop USER=desktop LOGNAME=desktop \
+    LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 DISPLAY="$display" \
+    dbus-run-session -- startxfce4 >>"$run_dir/screen-$index.xfce.log" 2>&1 &
+  echo $! >"$run_dir/screen-$index.xfce.pid"
+
+  setsid x11vnc -display "$display" -localhost -forever -shared -nopw -noshm -rfbport "$vnc_port" \
+    >>"$run_dir/screen-$index.x11vnc.log" 2>&1 &
+  echo $! >"$run_dir/screen-$index.x11vnc.pid"
+
+  setsid websockify --web=/usr/share/novnc \
+    --token-plugin=TokenFile --token-source="$tokens" \
+    "0.0.0.0:$novnc_port" >>"$run_dir/screen-$index.websockify.log" 2>&1 &
+  echo $! >"$run_dir/screen-$index.websockify.pid"
+
+  tries=0
+  until nc -z 127.0.0.1 "$vnc_port" >/dev/null 2>&1 && \
+        nc -z 127.0.0.1 "$novnc_port" >/dev/null 2>&1; do
+    tries=$((tries + 1)); [ "$tries" -lt 100 ] || exit 1; sleep 0.05
+  done
+  committed=1
+  trap - EXIT
+}
+
+action=${1:-}
+index=${2:-}
+valid_index "$index" || exit 2
+case "$action" in
+  start) { [ "$#" -eq 5 ] || [ "$#" -eq 6 ]; } || exit 2; start_screen "$2" "$3" "$4" "$5" "${6:-0}" ;;
+  stop)  [ "$#" -eq 2 ] || exit 2; stop_screen "$index"; rm -f "$state_dir/screen-$index.conf" ;;
+  *) exit 2 ;;
+esac

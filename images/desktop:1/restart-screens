@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+state_dir=/var/lib/createos/computer-screens
+
+if [ ! -s "$state_dir/screen-0.conf" ]; then
+  token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  exec /usr/local/bin/fc-screen start 0 1280 800 "$token"
+fi
+
+pids=""
+for config in "$state_dir"/screen-*.conf; do
+  [ -f "$config" ] || continue
+  name=${config##*/}; index=${name#screen-}; index=${index%.conf}
+  read -r width height token expires_at <"$config"
+  /usr/local/bin/fc-screen start "$index" "$width" "$height" "$token" "${expires_at:-0}" &
+  pids="$pids $!"
+done
+
+status=0
+for pid in $pids; do
+  wait "$pid" || status=1
+done
+exit "$status"

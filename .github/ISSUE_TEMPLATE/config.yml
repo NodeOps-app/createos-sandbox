@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/NodeOps-app/createos-sandbox/security/advisories/new
+    about: Report privately. Never open a public issue for security problems.
+  - name: Enterprise, customization, or private deployment
+    url: mailto:business@nodeops.xyz
+    about: Custom features or changes to createos.sh for your organization.

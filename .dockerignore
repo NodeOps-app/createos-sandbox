@@ -1,0 +1,19 @@
+# Keep the build context small and reproducible.
+bin/
+logs/
+snapshots/
+images/*.ext4
+images/*.ext4.new
+images/vmlinux
+images/initrd.gz
+images/python-sshd/
+images/node-*/
+.git/
+.github/
+*.md
+bench/
+examples/
+docker-compose.yml
+Dockerfile
+.dockerignore
+vsock

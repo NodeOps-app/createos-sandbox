@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an improvement for everyone who uses the project.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Need something specific to your organization on createos.sh? Email [business@nodeops.xyz](mailto:business@nodeops.xyz) instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in your way today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How you'd like it to work. Code snippets are welcome.

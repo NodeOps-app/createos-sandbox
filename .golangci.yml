@@ -1,0 +1,58 @@
+# golangci-lint v2 config. The tree is clean against this set, so
+# `make lint` is a real gate — keep it that way.
+#
+# Linter set is deliberately small: correctness + dead code only. Style
+# linters (mnd, gochecknoglobals, exhaustruct, ifshort) are omitted — they
+# fire in the thousands here and none of them catch a bug.
+version: "2"
+
+run:
+  timeout: 15m
+  build-tags:
+    - agent
+
+# Never truncate. The defaults (3 per linter, 3 per message) hid 50+
+# findings behind "same issue" collapsing during adoption.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+  # gosec is not in the default set (290+ legacy findings). The pre-commit
+  # hook enables it with --new-from-rev so new code is gated; `make sec`
+  # and CI's report job cover the whole tree.
+  settings:
+    gosec:
+      excludes:
+        - G104 # unchecked errors: errcheck's job
+
+  exclusions:
+    presets:
+      # EXC0001 & friends: Close/Flush/Setenv/Remove/print return values.
+      - std-error-handling
+    rules:
+      # fc-agent is a stdlib-only PID 1 running before anything can log.
+      # Its syscall best-effort calls (Sethostname, Mount, Chdir) have no
+      # recovery path — a checked error would only be discarded louder.
+      - path: internal/agent/
+        linters:
+          - errcheck
+      # Table-driven test helpers get flagged as unused between edits.
+      - path: _test\.go
+        linters:
+          - unused
+
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true

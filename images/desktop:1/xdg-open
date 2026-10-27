@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+  http://*|https://*)
+    # The computer API's open operation is an acknowledgement, not the
+    # browser's lifetime. Fully detach and redirect all inherited descriptors
+    # so Go's CombinedOutput can return as soon as launch is accepted.
+    nohup /usr/local/bin/desktop-browser "$1" \
+      >>/run/createos/browser.log 2>&1 </dev/null &
+    exit 0
+    ;;
+esac
+
+# Preserve normal xdg-open behavior for local files while running the opener
+# as the desktop user that owns the graphical session.
+exec runuser -u desktop -- env \
+  HOME=/home/desktop USER=desktop LOGNAME=desktop DISPLAY=:0 \
+  /usr/bin/xdg-open "$@"

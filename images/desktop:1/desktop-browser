@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# Computer API calls enter as root, while the browser must remain unprivileged
+# so Chromium's namespace/setuid sandbox stays enabled.
+exec runuser -u desktop -- env \
+  HOME=/home/desktop \
+  USER=desktop \
+  LOGNAME=desktop \
+  LANG=en_US.UTF-8 \
+  LC_ALL=en_US.UTF-8 \
+  DISPLAY=:0 \
+  google-chrome \
+  --no-first-run \
+  --disable-default-apps \
+  --disable-dev-shm-usage \
+  --start-maximized \
+  "$@"
