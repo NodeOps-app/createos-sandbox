@@ -37,7 +37,7 @@ licensed under Apache-2.0.
 ## Use it
 
 The quickest way to use CreateOS Sandbox is the hosted service. Get an API key
-at [createos.sh](https://createos.sh), then use an SDK or the CLI:
+at [createos.sh/app/profile](https://createos.sh/app/profile), then use an SDK or the CLI:
 
 ```ts
 import { CreateosSandboxClient } from "@nodeops-createos/sandbox";
