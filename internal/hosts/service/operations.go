@@ -13,14 +13,14 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/cryptobox"
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/trace"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/cryptobox"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/trace"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func (s *Service) Create(ctx context.Context, caller string, req api.CreateReq) (*api.CreateResp, error) {
@@ -36,9 +36,8 @@ func (s *Service) Create(ctx context.Context, caller string, req api.CreateReq) 
 	}
 	// If the request names a template (tpl_<ulid>), make sure the ext4
 	// is on local disk and registered in Manager.Rootfses BEFORE
-	// Manager.Create looks it up. Cache hit is sub-ms; cold miss takes
-	// the R2 fetch + decompress + sha256 verify hit (~10s for a 1 GiB
-	// template).
+	// Manager.Create looks it up. A cold miss downloads, decompresses,
+	// and verifies the artifact before creation can continue.
 	reqRootfs := ""
 	if req.Rootfs != nil {
 		reqRootfs = *req.Rootfs
@@ -51,6 +50,11 @@ func (s *Service) Create(ctx context.Context, caller string, req api.CreateReq) 
 		if s.Storage == nil {
 			return nil, fmt.Errorf("%w: templates feature not configured on this host", api.ErrInfrastructure)
 		}
+		release, err := s.useTemplate(ctx, reqRootfs)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 		if _, err := s.EnsureTemplate(ctx, reqRootfs, api.SuppliedSandboxIDFromContext(ctx)); err != nil {
 			return nil, fmt.Errorf("%w: ensure template: %v", api.ErrInfrastructure, err)
 		}
@@ -122,6 +126,10 @@ func (s *Service) Create(ctx context.Context, caller string, req api.CreateReq) 
 	var res *vm.CreateResult
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
+		if req.SnapshotID != nil {
+			res, err = s.createFromUserSnapshot(ctx, caller, req, vmReq)
+			break // Never fall back to an empty boot after a restore failure.
+		}
 		res, err = s.Mgr.Create(ctx, vmReq)
 		if err == nil || !strings.Contains(err.Error(), "agent not ready") {
 			break
@@ -221,6 +229,11 @@ func (s *Service) Create(ctx context.Context, caller string, req api.CreateReq) 
 	stopDB := t.Phase("db.insert")
 	if err := s.Repo.Insert(ctx, rec); err != nil {
 		log.WithContext(ctx).Warnf("[store] insert %s failed: %v", res.Sandbox.ID, err)
+		if req.SnapshotID != nil {
+			_ = s.Mgr.Destroy(res.Sandbox.ID)
+			stopDB()
+			return nil, fmt.Errorf("%w: snapshot restore could not be completed", api.ErrInfrastructure)
+		}
 	}
 	stopDB()
 	t.Attr("id", res.Sandbox.ID)
@@ -236,6 +249,7 @@ func (s *Service) Create(ctx context.Context, caller string, req api.CreateReq) 
 	s.StartSelfSignal(res.Sandbox)
 
 	return &api.CreateResp{
+		SnapshotID:          req.SnapshotID,
 		ID:                  res.Sandbox.ID,
 		Status:              string(models.StatusRunning),
 		Name:                req.Name,
@@ -444,7 +458,7 @@ func (s *Service) MergeProcessEnv(ctx context.Context, id, caller string, overri
 }
 
 func (s *Service) Destroy(ctx context.Context, id, caller string) error {
-	_, err := s.loadOwned(ctx, id, caller)
+	rec, err := s.loadOwned(ctx, id, caller)
 	if err != nil {
 		return err
 	}
@@ -454,6 +468,18 @@ func (s *Service) Destroy(ctx context.Context, id, caller string) error {
 	// returns NotFound — never destroys someone else's VM.
 	if _, ok := s.Mgr.Lookup(id); !ok {
 		return api.ErrNotFound
+	}
+	// Guest self-delete reaches the host without control first setting
+	// destroying. Use the same guarded CAS so it cannot bypass capture
+	// reservations. Ordinary control-driven deletes already made this change.
+	if rec.Status != models.StatusDestroying {
+		status, err := s.Repo.MarkDestroying(ctx, id)
+		if err != nil {
+			return err
+		}
+		if status == "" {
+			return fmt.Errorf("%w: sandbox state changed or snapshot capture in progress", api.ErrInvalidRequest)
+		}
 	}
 	s.StopSelfSignal(id)
 	if err := s.Mgr.Destroy(id); err != nil {

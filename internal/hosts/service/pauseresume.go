@@ -17,16 +17,15 @@ import (
 	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm/sparse"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm/sparse"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // PauseConfig is the per-host configuration for the pause/resume
-// machinery. Constructed once at serve startup and stored on
-// PauseOrchestrator.
+// machinery. Constructed once at host startup and stored on Service.PauseCfg.
 type PauseConfig struct {
 	HostID            string        // this host's id (matches DB host_id)
 	PausedDir         string        // /var/lib/createos/paused
@@ -34,22 +33,20 @@ type PauseConfig struct {
 	LocalDiskBudget   int64         // bytes
 	RetryBudget       int           // PAUSE_RETRY_BUDGET, default 5
 	ResumeMaxHosts    int           // RESUME_MAX_HOSTS, default 3
-	ZstdLevel         int           // 1..19; default 3
+	ZstdLevel         int           // 1..19; default 1
 	ReconcileInterval time.Duration // 1m
 }
 
-// PauseOrchestrator owns the host-side pause/resume/fork goroutines.
-// (Pause/Resume/Fork workflows now live as methods on Service.)
-
-// Pause runs the pause flow for a live sandbox. Idempotent: re-running
-// after a serve restart picks up where the previous attempt left off.
+// runPauseAsync starts the pause flow for a live sandbox. runPause guards
+// concurrent attempts with the local transition lock. After a host-service
+// restart, RecoverStuckPauses validates durable artifacts separately.
 //
 // On success: storage has the bundle; row.status='paused';
 // firecracker/network are torn down; local cache files remain in
 // PausedDir/<id>/ for the locality cache window.
 //
-// On retry exhaustion (RetryBudget): firecracker.ResumeVM is called
-// to roll back to 'running'; row reflects last_pause_error.
+// Upload retry exhaustion attempts to resume the guest and restore running
+// state. A failed rollback is handled separately; it is not reported as success.
 func (s *Service) runPauseAsync(ctx context.Context, id string) {
 	go s.runPause(ctx, id)
 }
@@ -77,6 +74,32 @@ func (s *Service) runPause(ctx context.Context, id string) {
 	}
 
 	dir := filepath.Join(s.PauseCfg.PausedDir, id)
+	lease, err := s.reserveDiskWork(ctx, "pause", diskNeed{dir, snapshotWorkBytes(int64(sb.MemMib), sb.DiskMib)})
+	if err != nil {
+		// No hooks or Firecracker pause have run. Restore the durable running
+		// state directly; never mark a healthy VM failed for disk pressure.
+		retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		msg := "pause temporarily unavailable; please retry"
+		if _, e := s.Repo.MarkPauseRolledBack(retryCtx, sb.ID, &msg, time.Now().UTC()); e != nil {
+			log.WithContext(ctx).WithError(e).Warn("[disk-budget] could not defer pause")
+		}
+		return
+	}
+	defer lease.release()
+	build, err := s.Mgr.SnapshotFirecrackerBuild(sb)
+	if err != nil {
+		// Nothing is frozen yet. Keep the guest running if its binary/policy
+		// was not retained; never create a bundle we cannot restore.
+		log.WithContext(ctx).WithError(err).Warn("[pause] producer runtime unavailable")
+		retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		msg := "pause temporarily unavailable; please retry"
+		if _, e := s.Repo.MarkPauseRolledBack(retryCtx, sb.ID, &msg, time.Now().UTC()); e != nil {
+			log.WithContext(ctx).WithError(e).Warn("[pause] could not defer pause")
+		}
+		return
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		s.markPauseFailed(ctx, sb, fmt.Sprintf("mkdir paused dir: %v", err))
 		return
@@ -152,9 +175,8 @@ func (s *Service) runPause(ctx context.Context, id string) {
 	//     handle is gone but the firecracker process and its API socket
 	//     are still live, so we drive it via raw HTTP over the socket.
 	// Mute the per-VM liveness watcher BEFORE freezing the guest. Without
-	// this, agent probes start failing within seconds of PauseVM, and
-	// after 3 misses (~15s) the watcher tears the VM down mid-pause and
-	// the row ends up `destroyed` instead of `paused`.
+	// this, a long snapshot operation can exhaust the liveness recovery
+	// window and tear the VM down mid-pause instead of leaving it paused.
 	sb.Freezing.Store(true)
 	// Note: we used to UpdateGuestDrive(overlayfs) to a stable paused-dir
 	// path here so vmstate's captured path would survive serve restarts
@@ -262,6 +284,13 @@ func (s *Service) runPause(ctx context.Context, id string) {
 		s.rollbackAndFail(ctx, sb, fmt.Sprintf("manifest build: %v", err))
 		return
 	}
+	log.WithContext(ctx).WithField("sandbox_id", id).WithField("firecracker_build", build).Info("[pause] recorded producer runtime")
+	manifest.FirecrackerBuild = build
+	manifestBody, err = json.Marshal(manifest)
+	if err != nil {
+		s.rollbackAndFail(ctx, sb, fmt.Sprintf("manifest encode: %v", err))
+		return
+	}
 	if err := publishPauseManifest(manifestPath, manifestBody); err != nil {
 		s.rollbackAndFail(ctx, sb, fmt.Sprintf("write manifest: %v", err))
 		return
@@ -283,7 +312,7 @@ func (s *Service) runPause(ctx context.Context, id string) {
 	now := time.Now().UTC()
 	cachedUntil := now.Add(s.PauseCfg.LocalRetain)
 	cachedHostID := s.PauseCfg.HostID
-	// Sync path: the bundle is already in R2 by the time we get here.
+	// Sync path: the bundle is already in object storage by the time we get here.
 	// Stamp bundle_uploaded_at atomically with status='paused' so a
 	// client that polls status and then immediately calls fork can't
 	// land in a window where the row says paused but bundle_uploaded_at
@@ -308,20 +337,29 @@ func (s *Service) uploadBundleWithRetry(
 	memZst, vmstate, overlayZst string, manifestBody []byte,
 	memDesc, vmstateDesc, overlayDesc storage.ArtifactDescriptor,
 ) bool {
+	// Bound all SDK and bundle retries together; individual stalled uploads
+	// are also cancelled by the storage client's progress watchdog.
+	uploadBytes := memDesc.Size + vmstateDesc.Size + overlayDesc.Size + int64(len(manifestBody))
+	uploadTimeout := pauseUploadTimeout(uploadBytes)
+	uploadCtx, cancel := context.WithTimeout(ctx, uploadTimeout)
+	defer cancel()
 	backoff := 2 * time.Second
 	var lastErr error
 	for attempt := 1; attempt <= s.PauseCfg.RetryBudget; attempt++ {
-		if err := s.uploadBundle(ctx, keyPrefix, memZst, vmstate, overlayZst, manifestBody, memDesc, vmstateDesc, overlayDesc); err != nil {
+		if err := s.uploadBundle(uploadCtx, keyPrefix, memZst, vmstate, overlayZst, manifestBody, memDesc, vmstateDesc, overlayDesc); err != nil {
 			lastErr = err
 			log.WithContext(ctx).Warnf("[pause] %s upload attempt %d/%d failed: %v", sb.ID, attempt, s.PauseCfg.RetryBudget, err)
-			if ctx.Err() != nil {
-				s.rollbackAndFail(ctx, sb, "context cancelled mid-upload")
+			if uploadCtx.Err() != nil {
+				s.rollbackAndFail(ctx, sb, fmt.Sprintf("upload stopped: %v", uploadCtx.Err()))
 				return false
+			}
+			if attempt == s.PauseCfg.RetryBudget {
+				break
 			}
 			select {
 			case <-time.After(backoff):
-			case <-ctx.Done():
-				s.rollbackAndFail(ctx, sb, "context cancelled mid-upload")
+			case <-uploadCtx.Done():
+				s.rollbackAndFail(ctx, sb, fmt.Sprintf("upload stopped: %v", uploadCtx.Err()))
 				return false
 			}
 			backoff *= 2
@@ -391,6 +429,9 @@ func securePausedDir(dir string) error {
 // rollbackAndFail flips the row back to 'running' and resumes the VM.
 // Used when the VM is still alive but pause hit a non-retriable error.
 func (s *Service) rollbackAndFail(ctx context.Context, sb *vm.Sandbox, msg string) {
+	// An expired upload/request context must not prevent recovery of the VM.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
 	if err := s.tryRollback(ctx, sb); err != nil {
 		s.markPauseFailed(ctx, sb, fmt.Sprintf("%s; resume rollback failed: %v", msg, err))
 		return
@@ -523,7 +564,13 @@ func (s *Service) compressAndHash(srcPath, dstPath string) (storage.ArtifactDesc
 	hasher := sha256.New()
 	tee := io.MultiWriter(dst, hasher)
 
-	enc, err := zstd.NewWriter(tee, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(s.PauseCfg.ZstdLevel)))
+	// Parallelize stream sections with a bounded worker count per pause.
+	// Encoder concurrency alone does not enable parallel block compression.
+	enc, err := zstd.NewWriter(tee,
+		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(s.PauseCfg.ZstdLevel)),
+		zstd.WithEncoderConcurrency(2),
+		zstd.WithConcurrentBlocks(true),
+	)
 	if err != nil {
 		dst.Close()
 		return storage.ArtifactDescriptor{}, err
@@ -561,7 +608,18 @@ func hashFile(path string) (storage.ArtifactDescriptor, error) {
 	return storage.ArtifactDescriptor{SHA256: sum, Size: n}, nil
 }
 
+func pauseUploadTimeout(size int64) time.Duration {
+	// Allow slower transfers and snapshot read-back verification. R2.Put
+	// separately bounds inactivity, so a stalled upload need not use this entire
+	// budget. Keep a hard cap for pause rollback; captures also have a durable
+	// one-hour deadline which a host restart cannot renew.
+	return min(30*time.Minute, 2*time.Minute+time.Duration(max(size, 0)/(1024*1024))*time.Second)
+}
+
 func (s *Service) uploadBundle(ctx context.Context, keyPrefix, memZst, vmstate, overlayZst string, manifestBody []byte, memDesc, vmstateDesc, overlayDesc storage.ArtifactDescriptor) error {
+	// Recovery calls this directly, without the outer retry loop's deadline.
+	ctx, cancel := context.WithTimeout(ctx, pauseUploadTimeout(memDesc.Size+vmstateDesc.Size+overlayDesc.Size+int64(len(manifestBody))))
+	defer cancel()
 	if err := s.uploadFile(ctx, keyPrefix+storage.ArtifactMemfile, memZst, memDesc); err != nil {
 		return err
 	}
@@ -621,6 +679,18 @@ func (s *Service) runResume(ctx context.Context, row models.Sandbox) {
 	}
 
 	dir := filepath.Join(s.PauseCfg.PausedDir, id)
+	var compressed int64
+	for _, a := range manifest.Artifacts {
+		compressed += a.Size
+	}
+	lease, err := s.reserveDiskWork(ctx, "resume",
+		diskNeed{dir, compressed + int64(row.MemMib)*1024*1024 + 64*1024*1024},
+		diskNeed{vm.SlotRuntimeDir(id), row.DiskMib * 1024 * 1024})
+	if err != nil {
+		s.markResumeFailed(ctx, id, "insufficient disk working space")
+		return
+	}
+	defer lease.release()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		s.markResumeFailed(ctx, id, "mkdir: "+err.Error())
 		return
@@ -719,7 +789,12 @@ func (s *Service) runResume(ctx context.Context, row models.Sandbox) {
 		localRootfs := ""
 		ok := false
 		if strings.HasPrefix(rootfsName, models.TemplateIDPrefix) {
-			var err error
+			release, err := s.useTemplate(ctx, rootfsName)
+			if err != nil {
+				s.markResumeFailed(ctx, id, "ensure template: "+err.Error())
+				return
+			}
+			defer release()
 			localRootfs, err = s.EnsureTemplate(ctx, rootfsName, id)
 			if err != nil {
 				s.markResumeFailed(ctx, id, "ensure template: "+err.Error())
@@ -771,6 +846,7 @@ func (s *Service) runResume(ctx context.Context, row models.Sandbox) {
 		log.WithContext(ctx).Warnf("[resume] %s resolve disks: %v", id, derr)
 	}
 	sb, err := s.Mgr.ResumeFromSnapshot(ctx, vm.ResumeSpec{
+		FirecrackerBuild:         manifest.FirecrackerBuild,
 		ID:                       id,
 		Name:                     resumeName,
 		MemPath:                  memPath,
@@ -924,7 +1000,8 @@ func (s *Service) fetchOneAttempt(ctx context.Context, key, localPath string, ex
 		return fmt.Errorf("secure partial: %w", err)
 	}
 
-	hr := storage.NewHashingReader(rc)
+	// Bound actual bytes as well as Content-Length, including cache reservations.
+	hr := storage.NewHashingReader(io.LimitReader(rc, expectedSize+1))
 	written, copyErr := io.Copy(part, hr)
 	readCloseErr := rc.Close()
 	writeCloseErr := part.Close()
@@ -968,6 +1045,9 @@ func (s *Service) CacheReaperLoop(ctx context.Context) {
 }
 
 func (s *Service) runCacheReaper(ctx context.Context) {
+	if s.snapshotCache != nil {
+		s.snapshotCache.reap()
+	}
 	candidates, err := s.Repo.LocalCacheCandidates(ctx, s.PauseCfg.HostID)
 	if err != nil {
 		log.WithContext(ctx).Warnf("[cache-reaper] list candidates: %v", err)
@@ -985,20 +1065,8 @@ func (s *Service) runCacheReaper(ctx context.Context) {
 	if expired > 0 {
 		log.WithContext(ctx).Infof("[cache-reaper] evicted %d expired cache entries", expired)
 	}
-	// Best-effort disk-budget enforcement: if PausedDir is over budget,
-	// evict oldest by LRU. We rely on the repo's ORDER BY in
-	// LocalCacheCandidates (already COALESCE(last_resumed_at, paused_at) ASC).
-	if s.PauseCfg.LocalDiskBudget > 0 {
-		used := dirSize(s.PauseCfg.PausedDir)
-		for used > s.PauseCfg.LocalDiskBudget && len(candidates) > 0 {
-			oldest := candidates[0]
-			if oldest.CachedUntil != nil && oldest.CachedUntil.After(now) {
-				s.evictLocalCache(ctx, oldest.ID, false)
-			}
-			candidates = candidates[1:]
-			used = dirSize(s.PauseCfg.PausedDir)
-		}
-	}
+	// One retention budget covers pause bundles, capture checkpoints and downloads.
+	s.reapDiskBudget(ctx)
 
 	// On-disk sweep: any sb-* dir under PausedDir whose row says it's
 	// cached elsewhere (or has been destroyed) is stale and must be

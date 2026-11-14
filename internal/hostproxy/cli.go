@@ -10,8 +10,8 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
 )
 
 // Cli is the urfave/cli Action for `machine proxy`.

@@ -1,4 +1,4 @@
-// Package trace is a zero-dependency, log-line based tracer for the
+// Package trace is a logrus-backed, log-line based tracer for the
 // control api-server plane's hot paths. Not a replacement for OpenTelemetry
 // — intentionally simpler: just time named phases inside a single
 // request and dump a one-liner summary at the end.
@@ -14,7 +14,7 @@
 //
 // Output:
 //
-//	[trace] create id=sb_01K… total=263.12ms reserve=92.40ms forward=44.70ms set_host=93.00ms
+//	[trace] create total=263.12ms id=sb-01K… reserve=92.40ms forward=44.70ms set_host=93.00ms
 //
 // grep + awk is a perfectly good analysis layer for this scale.
 package trace

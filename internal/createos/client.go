@@ -1,12 +1,12 @@
 // Package createos talks to the external createos credit/plan API. It
-// is the outbound counterpart of internal/billing/webhook — both sign
+// shares its signing format with the billing webhook client — both sign
 // HTTP bodies with the same HMAC-SHA256 over "<unix-ts>.<raw-body>"
 // and use the X-CreateOS-Timestamp / X-CreateOS-Signature header pair.
 //
 // Today the two endpoints we call:
 //
 //	POST /v1/sandboxes/current-plan              {user_id}        → plan + credit amount
-//	POST /v1/sandboxes/egress-bandwidth-recharge {user_id, gib}   → deduct credits, return debited amount
+//	POST /v1/sandboxes/egress-bandwidth-recharge {user_id, sandbox_id, gib} → deduct credits, return debited amount
 package createos
 
 import (
@@ -19,7 +19,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/hmacsign"
+	"github.com/NodeOps-app/createos-sandbox/internal/hmacsign"
 )
 
 // Client is the createos HTTP client. One per process; safe for
@@ -114,9 +114,16 @@ type Plan struct {
 // Amount is the remaining credit balance — the key field the
 // auto-top-up trigger gates on (> 0 means we can deduct).
 type CurrentPlanResponse struct {
+	User         *PlanUser   `json:"user,omitempty"`
 	Amount       float64     `json:"amount"`
 	Plan         Plan        `json:"plan"`
 	Subscription interface{} `json:"subscription"`
+}
+
+// PlanUser is the profile returned by the signed user-ID plan lookup.
+type PlanUser struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
 }
 
 // RechargeRequest is the body of POST /v1/sandboxes/egress-bandwidth-recharge.

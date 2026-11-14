@@ -10,10 +10,10 @@ import (
 	miniocreds "github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/buildqueue/pgqueue"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/buildqueue/pgqueue"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Cli is the urfave/cli Action for `control builder`.
@@ -39,7 +39,7 @@ func Cli(c *cli.Context) error {
 	fmt.Fprintf(os.Stderr, "[builder] signing-key kid=%s pub=%x\n",
 		signer.KID(), signer.PublicKey())
 
-	// R2 client for pre-signing PUT URLs.
+	// S3-compatible client for pre-signing PUT URLs.
 	r2cli, err := newMinioClient(cfg)
 	if err != nil {
 		return fmt.Errorf("init R2 client: %w", err)

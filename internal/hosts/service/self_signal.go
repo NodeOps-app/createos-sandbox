@@ -19,8 +19,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 const selfSignalPortSuffix = "_1029"

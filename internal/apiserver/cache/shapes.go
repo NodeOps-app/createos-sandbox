@@ -8,8 +8,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Shapes is a TTL cache over the shapes DB table. Operators manage the

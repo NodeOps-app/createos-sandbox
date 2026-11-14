@@ -19,15 +19,15 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/builder"
-	"github.com/NodeOps-app/sandbox/internal/clickhouse"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/builder"
+	"github.com/NodeOps-app/createos-sandbox/internal/clickhouse"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type templateCreateReq struct {
@@ -256,7 +256,7 @@ func (h *Handler) HandleTemplateGet(c *fiber.Ctx) error {
 }
 
 // handleTemplateDelete soft-deletes the template (deleted_at = now()).
-// R2 bytes are kept so paused VMs that referenced this tpl can still
+// Stored template objects are kept so paused VMs that referenced this tpl can still
 // resume.
 func (h *Handler) HandleTemplateDelete(c *fiber.Ctx) error {
 	if isSandboxPrincipal(c) {
@@ -321,12 +321,15 @@ func (h *Handler) HandleTemplateLogs(c *fiber.Ctx) error {
 	// the janitor and the user wants to compare attempts.
 	attempt := uint8(parseUintQuery(c, "attempt", 0))
 
-	if c.QueryBool("follow") {
-		return h.streamTemplateLogs(c, tplID, attempt)
-	}
 	rows, err := h.buildlogs.GetAll(c.UserContext(), tplID, attempt, 100000)
+	if errors.Is(err, clickhouse.ErrResponseTooLarge) {
+		return httpx.Fail(c, fiber.StatusRequestEntityTooLarge, "build logs exceed the response size limit")
+	}
 	if err != nil {
 		return httpx.Error(c, fiber.StatusInternalServerError, "fetch logs")
+	}
+	if c.QueryBool("follow") {
+		return h.streamTemplateLogs(c, tplID, attempt, rows)
 	}
 	c.Set("Content-Type", "text/plain; charset=utf-8")
 	w := c.Response().BodyWriter()
@@ -353,7 +356,7 @@ func parseUintQuery(c *fiber.Ctx, key string, def uint64) uint64 {
 // streamTemplateLogs implements the ?follow=true case. Polls ClickHouse
 // every 500 ms for new lines and emits NDJSON. Closes when the
 // templates row hits a terminal status.
-func (h *Handler) streamTemplateLogs(c *fiber.Ctx, tplID string, attempt uint8) error {
+func (h *Handler) streamTemplateLogs(c *fiber.Ctx, tplID string, attempt uint8, first []clickhouse.Line) error {
 	c.Set("Content-Type", "application/x-ndjson")
 	c.Set("X-Accel-Buffering", "no")
 
@@ -380,20 +383,20 @@ func (h *Handler) streamTemplateLogs(c *fiber.Ctx, tplID string, attempt uint8) 
 			return true
 		}
 
-		// First pass: dump history.
-		first, err := bl.GetAll(ctx, tplID, attempt, 100000)
-		if err == nil {
-			for _, l := range first {
-				_ = enc.Encode(map[string]any{
-					"ts": l.TS.Format(time.RFC3339Nano), "level": l.Level, "line": l.Line, "attempt": l.Attempt,
-				})
-				if l.TS.After(since) {
-					since = l.TS
-				}
-			}
-			if !flush() {
+		// History was bounded and fetched before committing streaming headers.
+		for _, l := range first {
+			if err := enc.Encode(map[string]any{
+				"ts": l.TS.Format(time.RFC3339Nano), "level": l.Level, "line": l.Line, "attempt": l.Attempt,
+			}); err != nil {
 				return
 			}
+			if l.TS.After(since) {
+				since = l.TS
+			}
+		}
+		first = nil
+		if !flush() {
+			return
 		}
 
 		// Tail loop.
@@ -402,6 +405,11 @@ func (h *Handler) streamTemplateLogs(c *fiber.Ctx, tplID string, attempt uint8) 
 		for {
 			// Pick up new lines.
 			rows, err := bl.GetAll(ctx, tplID, attempt, 100000)
+			if errors.Is(err, clickhouse.ErrResponseTooLarge) {
+				_ = enc.Encode(map[string]any{"error": "build logs exceed the response size limit"})
+				_ = flush()
+				return
+			}
 			if err == nil {
 				for _, l := range rows {
 					if !l.TS.After(since) {
@@ -490,8 +498,8 @@ func (h *Handler) HandleInternalTemplateLogIngest(c *fiber.Ctx) error {
 // enforces claims.Sub == :id so a leaked JWT can only modify its own row.
 func (h *Handler) HandleInternalTemplatePatch(c *fiber.Ctx) error {
 	id := c.Params(middlewares.ParamSandboxID)
-	// jwt.SubFromContext is set by InternalJWTMiddleware; reject if the
-	// JWT's subject doesn't match the URL's :id.
+	// MustBeIssuedBy stores verified claims in request locals; reject if
+	// the builder JWT's subject does not match the URL's :id.
 	if sub := middlewares.JWTSub(c); sub == "" || sub != id {
 		return httpx.Fail(c, fiber.StatusForbidden,
 			"jwt sub does not match template id")
@@ -630,9 +638,6 @@ func validTemplateName(s string) bool {
 	return true
 }
 
-// httpDialerForBuilderJWT is a tiny helper that lets the builder
-// service-side fall back to PATCHing on its own when the runner couldn't
-// reach control. Not used today; placeholder for follow-up.
 var _ = errors.New
 var _ = http.MethodPatch
 

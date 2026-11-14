@@ -12,7 +12,7 @@ INSERT INTO sandboxes (
     envs, labels,
     name,
     cpu_vendor, cpu_family,
-    auto_pause_after_seconds
+    auto_pause_after_seconds, snapshot_id, snapshot_uri, snapshot_manifest
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11, $12,
@@ -26,7 +26,7 @@ INSERT INTO sandboxes (
     $32::jsonb, $33::jsonb,
     $34,
     $35, $36,
-    $37
+    $37, $38, $39, $40::jsonb
 )
 ON CONFLICT (id) DO UPDATE SET
     host_id = EXCLUDED.host_id,
@@ -72,7 +72,7 @@ ON CONFLICT (id) DO UPDATE SET
     cpu_vendor = COALESCE(EXCLUDED.cpu_vendor, sandboxes.cpu_vendor),
     cpu_family = COALESCE(EXCLUDED.cpu_family, sandboxes.cpu_family);
     -- region / ingress_enabled / bandwidth_ingress_bytes / envs / labels /
-    -- auto_pause_after_seconds are NOT
+    -- auto_pause_after_seconds / snapshot_id / snapshot_uri / snapshot_manifest are NOT
     -- in the ON CONFLICT update list: control stamps region+ingress_enabled
     -- +envs on INSERT and the meter loop owns bandwidth_ingress_bytes via
     -- updateBandwidthIngress. The host's upsert (when it transitions
@@ -105,6 +105,15 @@ UPDATE sandboxes
    AND host_id = $2
    AND status = 'creating';
 
+-- name: lockDeadHostEviction
+-- The sandbox is already locked by beginCaptureOperation. Hold the host lock
+-- through destruction so a heartbeat cannot recover it between check and commit.
+SELECT h.id FROM hosts h JOIN sandboxes s ON s.host_id = h.id
+ WHERE s.id = $1 AND h.id = $2 AND h.region = $3 AND s.region = $3
+   AND h.status = 'dead' AND h.last_seen < $4
+   AND s.status IN ('running', 'creating', 'destroying')
+ FOR UPDATE OF h;
+
 -- name: markSandboxDestroyed
 -- Marks the sandbox destroyed AND drops its network memberships AND
 -- flips every sandbox_disks row's mount_status to 'detached'. The
@@ -119,12 +128,15 @@ UPDATE sandboxes
 -- are user-invisible. We do however flip mount_status to 'detached' so
 -- GET /v1/sandboxes/:id/disks doesn't keep advertising 'mounted' for a
 -- VM that's gone.
+-- The update guard makes repeated completion callbacks no-ops. Billing is
+-- emitted only when the final SELECT returns the winning transition.
 WITH _victim AS (
     UPDATE sandboxes
        SET status = 'destroyed',
            destroyed_at = $2,
            note = COALESCE(NULLIF($3, ''), note)
      WHERE id = $1
+       AND status <> 'destroyed'
     RETURNING id
 ),
 _net AS (
@@ -197,11 +209,12 @@ _token AS (
 SELECT status FROM _victim;
 
 -- name: markSandboxFailed
+-- Late failure callbacks must not undo deletion or repeat terminal billing.
 UPDATE sandboxes
    SET status = 'failed',
        error_text = $2,
        destroyed_at = $3
- WHERE id = $1;
+ WHERE id = $1 AND status NOT IN ('destroying', 'destroyed', 'failed');
 
 -- name: markSandboxFailedFromCreatingCAS
 -- Host-side reconcile uses this to instantly fail any 'creating' row
@@ -245,7 +258,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE id = $1;
 
@@ -287,7 +300,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE ip = $1
  ORDER BY created_at DESC
@@ -315,7 +328,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE ip = $1
    AND created_by = $2
@@ -355,7 +368,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE (host_id = $1 AND status IN
           ('creating', 'running', 'pausing', 'resuming', 'destroying'))
@@ -384,7 +397,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE ($1 = '' OR host_id = $1)
    AND ($2 = '' OR created_by = $2)
@@ -392,6 +405,38 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
    AND ($4::jsonb = '{}'::jsonb OR labels @> $4::jsonb)
  ORDER BY created_at DESC
  LIMIT $5 OFFSET $6;
+
+-- name: listHostTransitionSandboxes
+-- Keep the state set explicit so generic plans can use the transient-state
+-- partial index instead of scanning historical rows during host reconciliation.
+SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,''),
+       vcpu, mem_mib, disk_mib, shape, rootfs, created_by,
+       created_at, running_at, destroyed_at,
+       COALESCE(spawn_ms,0), COALESCE(error_text,''), COALESCE(note,''),
+       egress, ssh_pubkeys,
+       bandwidth_quota_bytes, bandwidth_used_bytes, bandwidth_capped,
+       COALESCE(api_sock,''), COALESCE(container_id,''), COALESCE(fc_pid,0), COALESCE(overlay_path,''),
+       ingress_enabled, bandwidth_ingress_bytes, COALESCE(region, ''),
+       COALESCE(secret_token, ''),
+       COALESCE(envs, '{}'::jsonb),
+       COALESCE(labels, '{}'::jsonb),
+       paused_at, COALESCE(snapshot_uri, ''), snapshot_manifest,
+       COALESCE(cached_host_id, ''), cached_until, last_resumed_at,
+       resume_failed_hosts,
+       last_resume_error, last_resume_attempt_at,
+       last_pause_error, last_pause_attempt_at,
+       COALESCE(forked_from, ''),
+       bundle_uploaded_at,
+       COALESCE(name, ''),
+       cpu_vendor, cpu_family,
+       drain_pause_attempts,
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
+  FROM sandboxes
+ WHERE host_id = $1
+   AND status = $2
+   AND status IN ('pausing', 'resuming', 'destroying')
+ ORDER BY created_at DESC
+ LIMIT $3 OFFSET $4;
 
 -- name: countSandboxesForList
 -- Total rows matching the same filters listSandboxes uses, ignoring
@@ -434,6 +479,9 @@ SELECT id FROM sandboxes
 -- on lifetime — a sandbox kept productively in the running→pause→resume
 -- loop can live forever.
 --
+-- The optional JSON owner-to-cutoff map overrides the default cutoff using
+-- created_by, never caller-supplied labels. Pause/resume semantics are unchanged.
+--
 -- Pool sandboxes (created_by='pool') are excluded — the predictive
 -- pre-warm pool manages its own lifecycle via a shrink loop with its
 -- own max_age (typically 6h), so the TTL evictor must not touch them.
@@ -441,14 +489,25 @@ SELECT id, host_id, created_at
   FROM sandboxes
  WHERE status = 'running'
    AND region = $2
-   AND COALESCE(running_at, created_at) < $1
+   AND COALESCE(running_at, created_at) < COALESCE(($3::jsonb ->> created_by)::timestamptz, $1::timestamptz)
    AND created_by != 'pool'
+   AND NOT EXISTS (SELECT 1 FROM snapshots p WHERE p.sandbox_id = sandboxes.id
+       AND p.status = 'creating' AND p.captured_at IS NULL AND p.deleted_at IS NULL)
  ORDER BY created_at ASC;
+
+-- name: lockAgedRunningCandidates
+-- Same source-row lock as capture reservation. The following UPDATE runs as a
+-- separate READ COMMITTED statement so it sees captures committed before locking.
+SELECT id FROM sandboxes
+ WHERE status = 'running' AND region = $2
+   AND COALESCE(running_at, created_at) < COALESCE(($3::jsonb ->> created_by)::timestamptz, $1::timestamptz) AND created_by != 'pool'
+ ORDER BY id FOR UPDATE SKIP LOCKED;
 
 -- name: markAgedRunningDestroyed
 -- Flip every row that's still 'running' and older than $1 to 'destroyed',
 -- stamping destroyed_at = $2 and note = $3. Returns the flipped rows.
--- Used by the TTL-evictor CronJob. Also detaches any sandbox_disks rows
+-- Used by the TTL-evictor CronJob. Removes network memberships here because
+-- later host cleanup of an already-destroyed row is a no-op. Also detaches sandbox_disks rows
 -- attached to those sandboxes (mount_status='detached') so the user-
 -- visible GET /v1/sandboxes/:id/disks doesn't lie about a VM that's gone.
 --
@@ -459,13 +518,20 @@ WITH _victims AS (
        SET status = 'destroyed',
            destroyed_at = $2,
            note = $3
-     WHERE status = 'running'
+     WHERE id = ANY($5)
+       AND status = 'running'
        AND region = $4
-       AND COALESCE(running_at, created_at) < $1
+       AND COALESCE(running_at, created_at) < COALESCE(($6::jsonb ->> created_by)::timestamptz, $1::timestamptz)
        -- Pool sandboxes are managed by the pre-warm pool's own shrink
        -- loop (its own max_age); the TTL evictor must not touch them.
        AND created_by != 'pool'
+       AND NOT EXISTS (SELECT 1 FROM snapshots p WHERE p.sandbox_id = sandboxes.id
+           AND p.status = 'creating' AND p.captured_at IS NULL AND p.deleted_at IS NULL)
     RETURNING id, host_id, created_at
+),
+_net AS (
+    DELETE FROM sandbox_networks
+     WHERE sandbox_id IN (SELECT id FROM _victims)
 ),
 _disks AS (
     UPDATE sandbox_disks
@@ -533,7 +599,7 @@ RETURNING s.id, COALESCE(s.host_id,''), s.status, s.mode, COALESCE(s.ip,''), COA
           COALESCE(s.name,''),
           s.cpu_vendor, s.cpu_family,
           s.drain_pause_attempts,
-          s.auto_pause_after_seconds, s.last_activity_at, s.last_metered_bytes;
+          s.auto_pause_after_seconds, s.last_activity_at, s.last_metered_bytes, s.snapshot_id;
 
 -- name: claimPoolSandboxBatch
 -- Batched claimPoolSandbox: claims up to K rows in one transaction,
@@ -595,7 +661,7 @@ RETURNING s.id, COALESCE(s.host_id,''), s.status, s.mode, COALESCE(s.ip,''), COA
           COALESCE(s.name,''),
           s.cpu_vendor, s.cpu_family,
           s.drain_pause_attempts,
-          s.auto_pause_after_seconds, s.last_activity_at, s.last_metered_bytes;
+          s.auto_pause_after_seconds, s.last_activity_at, s.last_metered_bytes, s.snapshot_id;
 
 -- name: countPoolDepth
 -- Count of live pool rows for this region, matching-spec only. Drives the
@@ -940,17 +1006,26 @@ SELECT COALESCE(
 UPDATE hosts SET wg_public_key = $2 WHERE id = $1;
 
 -- name: heartbeatHost
--- Heartbeat updates liveness fields and resurrects from 'dead', but
--- NEVER overwrites operator-set 'draining' (cordon). The cordon
--- semantic is "this host is intentionally out of rotation"; heartbeats
--- shouldn't undo that just because the host is alive.
-UPDATE hosts
-   SET in_use_mib = $2,
-       vm_count = $3,
-       status = CASE WHEN status = 'draining' THEN 'draining' ELSE $4 END,
-       disk_used_mib = $5,
-       last_seen = $6
- WHERE id = $1;
+-- Lock before observing the previous status. Concurrent heartbeats then emit
+-- exactly one recovery; a heartbeat racing the sweeper sees its committed state.
+-- Mutation and event insertion share one statement and roll back together.
+WITH previous AS MATERIALIZED (
+    SELECT id, region, status, last_seen FROM hosts WHERE id = $1 FOR UPDATE
+), changed AS (
+    UPDATE hosts h
+       SET in_use_mib = $2, vm_count = $3,
+           status = CASE WHEN p.status = 'draining' THEN 'draining' ELSE $4 END,
+           disk_used_mib = $5, last_seen = $6, cached_snapshots = $7::jsonb
+      FROM previous p WHERE h.id = p.id
+    RETURNING h.id, h.region, h.status, p.status AS previous_status, p.last_seen
+)
+INSERT INTO events (id, region, resource_type, resource_id, severity, reason,
+                    message, component, metadata)
+SELECT 'ope_' || gen_random_uuid()::text, region, 'host', id, 'normal', $8,
+       'Host heartbeat recovered', 'control',
+       jsonb_build_object('previous_status', previous_status, 'status', status,
+                          'previous_last_seen', last_seen, 'heartbeat_at', $6::timestamptz)
+  FROM changed WHERE previous_status = 'dead' AND status = 'active';
 
 -- name: listHosts
 SELECT id, addr, status, mem_capacity_mib, in_use_mib, vm_count,
@@ -1002,12 +1077,26 @@ SELECT id FROM sandboxes
    AND status IN ('creating','running');
 
 -- name: markStaleHosts
-UPDATE hosts
-   SET status = 'dead'
- WHERE last_seen < $1
-   AND region = $2
-   AND status <> 'dead'
-RETURNING id;
+-- Recheck freshness while taking the row lock; a concurrent heartbeat must not
+-- be overwritten using a stale candidate list. Only changed rows produce events.
+WITH previous AS MATERIALIZED (
+    SELECT id, region, status, last_seen FROM hosts
+     WHERE last_seen < $1 AND region = $2 AND status <> 'dead'
+     ORDER BY id FOR UPDATE
+), changed AS (
+    UPDATE hosts h SET status = 'dead' FROM previous p WHERE h.id = p.id
+    RETURNING h.id, h.region, p.status AS previous_status, p.last_seen
+), recorded AS (
+    INSERT INTO events (id, region, resource_type, resource_id, severity, reason,
+                        message, component, metadata)
+    SELECT 'ope_' || gen_random_uuid()::text, region, 'host', id, 'warning', $3,
+           'Host marked dead after missing heartbeats', 'sweeper',
+           jsonb_build_object('previous_status', previous_status, 'status', 'dead',
+                             'last_seen', last_seen, 'stale_cutoff', $1::timestamptz)
+      FROM changed
+    RETURNING resource_id
+)
+SELECT resource_id FROM recorded;
 
 -- name: sumUsageByHost
 SELECT host_id, COALESCE(SUM(mem_mib), 0)::bigint AS used_mib, COUNT(*)::int AS vm_count
@@ -1128,7 +1217,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE status = 'running'
    AND region = $2
@@ -1149,12 +1238,19 @@ UPDATE sandboxes
 
 -- name: markIdlePausing
 -- CAS flip to 'pausing' for idle sandboxes. Returns the ids actually flipped
--- (status='running' guard prevents racing with user-initiated pause/destroy).
+-- Caller holds the candidate row locks. The fresh statement observes captures
+-- committed before those locks and rechecks idle settings after PATCH updates.
 UPDATE sandboxes
    SET status    = 'pausing',
        last_pause_attempt_at = now()
  WHERE id = ANY($1)
    AND status = 'running'
+   AND auto_pause_after_seconds IS NOT NULL
+   AND now() - last_activity_at > auto_pause_after_seconds * interval '1 second'
+   AND NOT EXISTS (
+       SELECT 1 FROM snapshots WHERE sandbox_id = sandboxes.id
+         AND status = 'creating' AND captured_at IS NULL AND deleted_at IS NULL
+   )
 RETURNING id;
 
 -- name: getIngressRoute
@@ -1441,7 +1537,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE status = 'pausing'
    AND region = $2
@@ -1469,7 +1565,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE status = 'resuming'
    AND region = $2
@@ -1506,7 +1602,7 @@ SELECT id, COALESCE(host_id,''), status, mode, COALESCE(ip,''), COALESCE(mac,'')
        COALESCE(name, ''),
        cpu_vendor, cpu_family,
        drain_pause_attempts,
-       auto_pause_after_seconds, last_activity_at, last_metered_bytes
+       auto_pause_after_seconds, last_activity_at, last_metered_bytes, snapshot_id
   FROM sandboxes
  WHERE status = 'forking'
    AND region = $2
@@ -1518,6 +1614,14 @@ SELECT id, cached_until
  WHERE cached_host_id = $1
    AND cached_until IS NOT NULL
  ORDER BY COALESCE(last_resumed_at, paused_at) ASC;
+
+-- name: lockForkSource
+SELECT status, snapshot_manifest, bundle_uploaded_at, created_by, region
+ FROM sandboxes WHERE id = $1 FOR UPDATE;
+
+-- name: hasActiveFork
+-- A forking child leases the mutable source bundle until its copy completes.
+SELECT EXISTS (SELECT 1 FROM sandboxes WHERE forked_from = $1 AND status = 'forking');
 
 -- name: insertForkRow
 -- Insert a brand-new sandbox row in 'forking' state as a clone of the
@@ -2044,14 +2148,15 @@ UPDATE disks SET deleted_at = now()
  WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
 RETURNING id;
 
+-- name: lockDiskForDelete
+-- Acquire before the attachment check in a separate READ COMMITTED statement.
+SELECT id FROM disks
+ WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+ FOR UPDATE;
+
 -- name: deleteDiskIfUnattached
--- Atomic count-then-soft-delete, race-free against concurrent attach.
--- The FOR UPDATE on `disks` serializes against attachDiskIfRunning's
--- FOR KEY SHARE on the same row: a concurrent attach either commits
--- before our SELECT (then `attached.cnt > 0` and we skip the UPDATE)
--- or blocks until our transaction commits (then attach sees deleted_at
--- non-null and refuses to insert). Without this serialization a
--- count-then-delete pair would orphan the new attachment row.
+-- Caller already holds lockDiskForDelete. This new statement sees attachments
+-- committed while that lock was being acquired; the lock prevents new ones.
 -- Returns (exists, attached_count, deleted): caller distinguishes
 --   exists=false                  -> 404
 --   exists=true, deleted=false    -> 409 (still attached, cnt>0)
@@ -2741,10 +2846,11 @@ UPDATE device_sessions
  WHERE id = $1 AND device_id = $2
 RETURNING id, device_id, relay_host_id, endpoint_addr, created_at, expires_at;
 
+-- Retained memberships must never authorize access through a deleted network.
 -- name: listSubnetsForDeviceNetworks
 -- AllowedIPs material for a device session. Returns the union of host
 -- VM subnets (host.subnet_cidr) for every host that has at least one
--- running VM in any network the device is attached to. The client's
+-- running VM in any live network the device is attached to. The client's
 -- kernel uses these CIDRs to decide "which destination IPs route
 -- through the VPN tunnel."
 --
@@ -2752,6 +2858,7 @@ RETURNING id, device_id, relay_host_id, endpoint_addr, created_at, expires_at;
 -- running VMs yet — handler can degrade to just the device's /32.
 SELECT DISTINCT h.subnet_cidr
   FROM device_networks dn
+  JOIN networks n ON n.id = dn.network_id AND n.deleted_at IS NULL
   JOIN sandbox_networks sn ON sn.network_id = dn.network_id
   JOIN sandboxes s         ON s.id = sn.sandbox_id
   JOIN hosts     h         ON h.id = s.host_id
@@ -2764,10 +2871,10 @@ SELECT DISTINCT h.subnet_cidr
 -- name: listDevicePairsForRelay
 -- All ordered (a, b) device IP pairs where:
 --   - both devices have an active session on this relay
---   - they share at least one network
+--   - they share at least one live network
 -- Returns symmetric pairs so the BPF map has both directions.
 -- The relay's fc_wg_ingress BPF program looks up (src_ip, dst_ip)
--- in fc_vmip_pair; if present → allow, else drop.
+-- in its private relay pair map; if present → allow, else drop.
 SELECT DISTINCT
   host(da.client_ip) AS src_ip,
   host(db.client_ip) AS dst_ip
@@ -2776,6 +2883,7 @@ SELECT DISTINCT
   JOIN devices da ON da.id = sa.device_id
   JOIN devices db ON db.id = sb.device_id
   JOIN device_networks dna ON dna.device_id = sa.device_id
+  JOIN networks n ON n.id = dna.network_id AND n.deleted_at IS NULL
   JOIN device_networks dnb ON dnb.device_id = sb.device_id
                           AND dnb.network_id = dna.network_id
  WHERE sa.relay_host_id = $1
@@ -2786,10 +2894,10 @@ SELECT DISTINCT
    AND db.revoked_at IS NULL;
 
 -- name: listDeviceVMPairsForRelay
--- Symmetric (device_ip, vm_ip) pairs for fc_vmip_pair on the relay's
+-- Symmetric (device_ip, vm_ip) pairs for the private relay pair map on the relay's
 -- wg-devices ingress. Without these, fc_wg_ingress drops the decrypted
 -- device→VM packet (and the return path can't establish flow state).
--- Each (device, VM) sharing at least one network emits BOTH directions
+-- Each (device, VM) sharing at least one live network emits BOTH directions
 -- so device→VM and VM→device both look up an allowed pair.
 SELECT DISTINCT
   host(d.client_ip) AS src_ip,
@@ -2797,6 +2905,7 @@ SELECT DISTINCT
   FROM device_sessions ds
   JOIN devices d ON d.id = ds.device_id
   JOIN device_networks dn ON dn.device_id = d.id
+  JOIN networks n ON n.id = dn.network_id AND n.deleted_at IS NULL
   JOIN sandbox_networks sn ON sn.network_id = dn.network_id
   JOIN sandboxes s ON s.id = sn.sandbox_id
  WHERE ds.relay_host_id = $1
@@ -2812,6 +2921,7 @@ SELECT DISTINCT
   FROM device_sessions ds
   JOIN devices d ON d.id = ds.device_id
   JOIN device_networks dn ON dn.device_id = d.id
+  JOIN networks n ON n.id = dn.network_id AND n.deleted_at IS NULL
   JOIN sandbox_networks sn ON sn.network_id = dn.network_id
   JOIN sandboxes s ON s.id = sn.sandbox_id
  WHERE ds.relay_host_id = $1
@@ -2820,3 +2930,282 @@ SELECT DISTINCT
    AND s.status = 'running'
    AND s.ip IS NOT NULL
    AND s.ip <> '';
+
+
+-- Reusable user snapshots. Reads are owner-scoped; writes belong to one region.
+-- name: insertSnapshot
+INSERT INTO snapshots (id, user_id, name, type, status, region, host_id,
+                       shape, vcpu, mem_mib, disk_mib, rootfs, sandbox_id)
+VALUES ($1, $2, $3, $4, 'creating', $5, $6, $7, $8, $9, $10, $11, $12);
+
+-- name: getSnapshot
+SELECT id, user_id, name, type, status, region, host_id,
+       shape, vcpu, mem_mib, disk_mib, rootfs, snapshot_uri,
+       snapshot_manifest, size_bytes, error_code, created_at, ready_at, deleted_at, sandbox_id, captured_at
+  FROM snapshots
+ WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL;
+
+-- name: listUserSnapshots
+SELECT id, user_id, name, type, status, region, host_id,
+       shape, vcpu, mem_mib, disk_mib, rootfs, snapshot_uri,
+       snapshot_manifest, size_bytes, error_code, created_at, ready_at, deleted_at, sandbox_id, captured_at
+  FROM snapshots
+ WHERE user_id = $1 AND deleted_at IS NULL
+ ORDER BY created_at DESC, id
+ LIMIT $2 OFFSET $3;
+
+-- name: countUserSnapshots
+SELECT COUNT(*)::int FROM snapshots
+ WHERE user_id = $1 AND deleted_at IS NULL;
+
+-- name: countQuotaSnapshots
+SELECT COUNT(*)::int FROM snapshots
+ WHERE user_id = $1 AND deleted_at IS NULL
+   AND status IN ('creating', 'ready', 'deleting');
+
+-- name: markSnapshotReady
+-- The authenticated capture host publishes only after verifying durable storage.
+UPDATE snapshots
+   SET status = 'ready', snapshot_uri = $5, snapshot_manifest = $6,
+       size_bytes = $7, ready_at = now(), error_code = NULL
+ WHERE id = $1 AND user_id = $2 AND region = $3 AND host_id = $4
+   AND status = 'creating' AND deleted_at IS NULL
+   AND captured_at IS NOT NULL
+   AND NULLIF(btrim($5), '') IS NOT NULL
+   AND jsonb_typeof($6::jsonb) = 'object'
+ RETURNING status;
+
+-- name: markSnapshotFailed
+UPDATE snapshots
+   SET status = 'failed', error_code = $5
+ WHERE id = $1 AND user_id = $2 AND region = $3 AND host_id = $4
+   AND status = 'creating' AND deleted_at IS NULL
+ RETURNING status;
+
+-- name: softDeleteSnapshot
+-- Metadata deletion only: retained objects remain usable by in-flight restores.
+UPDATE snapshots SET status = 'deleting', deleted_at = now()
+ WHERE id = $1 AND user_id = $2 AND region = $3
+   AND status IN ('ready', 'failed', 'deleting') AND deleted_at IS NULL
+ RETURNING status;
+
+-- name: lockSandboxForCaptureOperation
+SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE;
+
+-- name: hasActiveSnapshotCapture
+SELECT EXISTS (
+    SELECT 1 FROM snapshots WHERE sandbox_id = $1
+      AND status = 'creating' AND captured_at IS NULL AND deleted_at IS NULL
+);
+
+-- name: snapshotSourceHasDisks
+-- Include attachments whose disk metadata has been deleted too.
+SELECT EXISTS (SELECT 1 FROM sandbox_disks WHERE sandbox_id = $1);
+
+-- name: markSnapshotCaptured
+-- Worker must first secure an independent checkpoint and resume a running source.
+UPDATE snapshots SET captured_at = now()
+ WHERE id = $1 AND user_id = $2 AND region = $3 AND host_id = $4
+   AND status = 'creating' AND captured_at IS NULL AND deleted_at IS NULL
+ RETURNING status;
+
+-- name: lockIdlePauseCandidates
+-- Avoid waiting on another lifecycle operation; the next sweep can retry.
+SELECT id FROM sandboxes WHERE id = ANY($1) ORDER BY id FOR UPDATE SKIP LOCKED;
+
+-- name: patchSandboxConfiguration
+-- All PATCH fields change together. Refuse a stale label merge rather than
+-- overwriting labels committed by another PATCH between read and lock.
+UPDATE sandboxes
+   SET ingress_enabled = COALESCE($4, ingress_enabled),
+       auto_pause_after_seconds = CASE WHEN $5 THEN NULL
+           ELSE COALESCE($6, auto_pause_after_seconds) END,
+       labels = COALESCE($7::jsonb, labels)
+ WHERE id = $1 AND created_by = $2 AND region = $3
+   AND ($7::jsonb IS NULL OR COALESCE(labels, '{}'::jsonb) = $8::jsonb)
+ RETURNING id;
+
+-- name: getHostSnapshot
+SELECT id, user_id, name, type, status, region, host_id,
+       shape, vcpu, mem_mib, disk_mib, rootfs, snapshot_uri,
+       snapshot_manifest, size_bytes, error_code, created_at, ready_at, deleted_at, sandbox_id, captured_at
+  FROM snapshots
+ WHERE id = $1 AND host_id = $2 AND region = $3 AND deleted_at IS NULL;
+
+-- name: listHostSnapshotJobs
+SELECT id, user_id, name, type, status, region, host_id,
+       shape, vcpu, mem_mib, disk_mib, rootfs, snapshot_uri,
+       snapshot_manifest, size_bytes, error_code, created_at, ready_at, deleted_at, sandbox_id, captured_at
+  FROM snapshots
+ WHERE host_id = $1 AND region = $2 AND status = 'creating' AND deleted_at IS NULL
+ ORDER BY created_at, id LIMIT 100;
+
+-- name: snapshotCaptureSource
+SELECT s.status
+ FROM sandboxes s JOIN snapshots p ON p.sandbox_id = s.id AND p.user_id = s.created_by
+ WHERE p.id = $1 AND p.host_id = $2 AND p.region = $3
+   AND p.status = 'creating' AND p.captured_at IS NULL AND p.deleted_at IS NULL;
+
+-- name: listHostSnapshotCaches
+SELECT id, cached_snapshots FROM hosts
+ WHERE status = 'active' AND last_seen > now() - interval '30 seconds'
+   AND cached_snapshots <> '[]'::jsonb;
+
+-- name: listResourceEvents
+SELECT id, region, resource_type, resource_id, severity, reason, message,
+       component, metadata, occurred_at
+  FROM events WHERE region = $1 AND resource_type = $2 AND resource_id = $3
+ ORDER BY occurred_at DESC, id DESC LIMIT $4;
+
+-- name: sweepExpiredEvents
+-- Bounded deletion in the writing region. Competing sweepers skip locked rows.
+DELETE FROM events WHERE id IN (
+    SELECT id FROM events WHERE region = $1 AND occurred_at < $2
+     ORDER BY occurred_at, id LIMIT 1000 FOR UPDATE SKIP LOCKED
+);
+
+-- name: getAdminUsage
+-- Aggregate per user and date before combining sources. Lifetime dashboards
+-- must not materialize every individual sandbox/audit row for DISTINCT counts.
+WITH activity AS MATERIALIZED (
+ SELECT to_char(date_trunc($4, occurred_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        user_id, count(*)::bigint AS events, 0::bigint AS sandbox_creates, min(occurred_at) AS first_at
+ FROM audit_events WHERE occurred_at >= $1 AND occurred_at < $2 AND action = ANY($3::text[])
+ AND ($5::text = '' OR user_id = $5)
+ AND ($6::text = '' OR COALESCE(NULLIF(metadata->>'region', ''), 'unattributed') = $6)
+ GROUP BY 1,2
+ UNION ALL
+ SELECT to_char(date_trunc($4, created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        created_by AS user_id, 0::bigint AS events, count(*)::bigint AS sandbox_creates, min(created_at) AS first_at
+ FROM sandboxes WHERE created_at >= $1 AND created_at < $2 AND created_by <> 'pool'
+ AND ($5::text = '' OR created_by = $5)
+ AND ($6::text = '' OR COALESCE(NULLIF(region, ''), 'unattributed') = $6)
+ GROUP BY 1,2
+), daily AS (
+ SELECT day, sum(events)::bigint AS events, count(DISTINCT user_id) AS accounts,
+        sum(sandbox_creates)::bigint AS sandbox_creates
+ FROM activity GROUP BY day
+)
+SELECT COALESCE(sum(events),0)::bigint AS events, count(DISTINCT user_id) AS accounts,
+       COALESCE(sum(sandbox_creates),0)::bigint AS sandbox_creates,
+       (SELECT COALESCE(jsonb_agg(daily ORDER BY day), '[]'::jsonb) FROM daily) AS days,
+       min(first_at) AS first_recorded_at
+FROM activity;
+
+-- name: getAdminFeatureUsage
+WITH activity AS MATERIALIZED (
+ SELECT action, user_id, occurred_at FROM audit_events
+ WHERE occurred_at >= $1 AND occurred_at < $2 AND action = ANY($3::text[])
+ AND ($5::text = '' OR user_id = $5)
+ AND ($6::text = '' OR COALESCE(NULLIF(metadata->>'region', ''), 'unattributed') = $6)
+), totals AS (
+ SELECT action, count(*) AS events, count(DISTINCT user_id) AS accounts
+ FROM activity GROUP BY action
+), daily AS (
+ SELECT action, to_char(date_trunc($4, occurred_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        count(*) AS events
+ FROM activity GROUP BY 1, 2
+), calendars AS (
+ SELECT action, jsonb_agg(jsonb_build_object('day', day, 'events', events) ORDER BY day) AS days
+ FROM daily GROUP BY action
+)
+SELECT totals.action, totals.events, totals.accounts, calendars.days
+FROM totals JOIN calendars USING (action)
+ORDER BY totals.events DESC, totals.action;
+
+-- name: getAdminUserUsage
+WITH activity AS (
+ SELECT user_id, COALESCE(NULLIF(metadata->>'region', ''), 'unattributed') AS region,
+        true AS audited, false AS created
+ FROM audit_events WHERE occurred_at >= $1 AND occurred_at < $2 AND action = ANY($3::text[])
+ UNION ALL
+ SELECT created_by AS user_id, COALESCE(NULLIF(region, ''), 'unattributed') AS region,
+        false AS audited, true AS created
+ FROM sandboxes WHERE created_at >= $1 AND created_at < $2 AND created_by <> 'pool'
+)
+SELECT user_id AS id, count(*) FILTER (WHERE created) AS sandbox_creates,
+       count(*) FILTER (WHERE audited) AS events, count(DISTINCT user_id) AS accounts
+FROM activity
+-- Include revoked internal keys: revoking an internal key does not make its
+-- owner an external account. Filter before ranking and pagination.
+WHERE NOT $6::boolean OR NOT EXISTS (
+ SELECT 1 FROM api_keys k WHERE k.user_id = activity.user_id AND k.is_internal = true
+)
+GROUP BY user_id
+ORDER BY sandbox_creates DESC, events DESC, id LIMIT $4 OFFSET $5;
+
+-- name: getAdminRegionUsage
+WITH activity AS (
+ SELECT user_id, COALESCE(NULLIF(metadata->>'region', ''), 'unattributed') AS region,
+        true AS audited, false AS created
+ FROM audit_events WHERE occurred_at >= $1 AND occurred_at < $2 AND action = ANY($3::text[])
+ UNION ALL
+ SELECT created_by AS user_id, COALESCE(NULLIF(region, ''), 'unattributed') AS region,
+        false AS audited, true AS created
+ FROM sandboxes WHERE created_at >= $1 AND created_at < $2 AND created_by <> 'pool'
+)
+SELECT region AS id, count(*) FILTER (WHERE created) AS sandbox_creates,
+       count(*) FILTER (WHERE audited) AS events, count(DISTINCT user_id) AS accounts
+FROM activity GROUP BY region
+ORDER BY sandbox_creates DESC, events DESC, id LIMIT $4 OFFSET $5;
+
+-- name: getAdminLiveCounts
+-- Read replicated state once, independent of the activity date window.
+SELECT count(*) FILTER (WHERE status = 'running'),
+       count(*) FILTER (WHERE status = 'paused')
+FROM sandboxes
+WHERE status IN ('running', 'paused') AND created_by <> 'pool'
+AND ($1::text = '' OR created_by = $1)
+AND ($2::text = '' OR COALESCE(NULLIF(region, ''), 'unattributed') = $2);
+
+-- name: getAdminActivity
+-- Re-read the latest window instead of advancing a timestamp cursor, so late
+-- replicated events can still appear. Each source is capped before merging.
+WITH creations AS (
+ SELECT 'sandbox:' || id AS id, created_at AS occurred_at,
+        'sandbox.create'::text AS action, created_by AS user_id,
+        COALESCE(NULLIF(region, ''), 'unattributed') AS region, id AS resource_id
+ FROM sandboxes
+ WHERE created_at >= $1 AND created_at < $2 AND created_by <> 'pool'
+ AND ($3::text = '' OR created_by = $3)
+ AND ($4::text = '' OR COALESCE(NULLIF(region, ''), 'unattributed') = $4)
+ ORDER BY created_at DESC, id DESC LIMIT 50
+), operations AS (
+ SELECT 'audit:' || id AS id, occurred_at, action, user_id,
+        COALESCE(NULLIF(metadata->>'region', ''), 'unattributed') AS region,
+        COALESCE(subject_id, '') AS resource_id
+ FROM audit_events
+ WHERE occurred_at >= $1 AND occurred_at < $2 AND action = ANY($5::text[])
+ AND action <> 'sandbox.create'
+ AND ($3::text = '' OR user_id = $3)
+ AND ($4::text = '' OR COALESCE(NULLIF(metadata->>'region', ''), 'unattributed') = $4)
+ ORDER BY occurred_at DESC, id DESC LIMIT 50
+)
+SELECT * FROM (SELECT * FROM creations UNION ALL SELECT * FROM operations) activity
+ORDER BY occurred_at DESC, id DESC LIMIT 50;
+
+-- name: getAdminSizingUsage
+-- Aggregate allocations before expanding dimensions, keeping Lifetime work
+-- proportional to distinct allocation/date groups rather than three full scans.
+-- Stored allocations describe current sizes, not measured usage or resize history.
+WITH allocations AS MATERIALIZED (
+ SELECT COALESCE(NULLIF(shape, ''), 'Unknown') AS shape,
+        COALESCE(mem_mib::text, 'Unknown') AS memory,
+        COALESCE(disk_mib::text, 'Unknown') AS disk,
+        to_char(date_trunc($3, created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        count(*) AS count
+ FROM sandboxes
+ WHERE created_at >= $1 AND created_at < $2 AND created_by <> 'pool'
+ AND ($4::text = '' OR created_by = $4)
+ AND ($5::text = '' OR COALESCE(NULLIF(region, ''), 'unattributed') = $5)
+ GROUP BY 1, 2, 3, 4
+), daily AS (
+ SELECT d.dimension, d.value, a.day, sum(a.count)::bigint AS count
+ FROM allocations a
+ CROSS JOIN LATERAL (VALUES ('shape',a.shape),('memory',a.memory),('disk',a.disk)) AS d(dimension,value)
+ GROUP BY d.dimension,d.value,a.day
+)
+SELECT dimension, value, sum(count)::bigint,
+       jsonb_agg(jsonb_build_object('day',day,'count',count) ORDER BY day)
+FROM daily GROUP BY dimension, value
+ORDER BY dimension, sum(count) DESC, value;

@@ -3,7 +3,7 @@ package audit
 import (
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func TestBuildSandboxDestroyDescribesAcceptedTransition(t *testing.T) {

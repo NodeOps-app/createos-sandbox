@@ -24,21 +24,21 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
-	"github.com/NodeOps-app/sandbox/internal/ca/renew"
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
-	"github.com/NodeOps-app/sandbox/internal/hosts/service"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/hosts/wg"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/renew"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/service"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/wg"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // bootstrapHTTPClient returns an http.Client used by the cert renewer
@@ -520,6 +520,7 @@ func Serve(c *cli.Context) error {
 	// so the API can drive them (exec / files / destroy) exactly
 	// as if this were the same process that originally spawned
 	// them. Any row that fails rehydrate gets marked destroyed.
+	freezeIntents := service.SnapshotFreezeIntents(cfg.Pause.PausedDir)
 	for _, r := range aliveRecords {
 		spec := vm.RehydrateSpec{
 			ID:                    r.ID,
@@ -555,6 +556,7 @@ func Serve(c *cli.Context) error {
 		if r.Rootfs != nil {
 			spec.Rootfs = *r.Rootfs
 		}
+		spec.Freezing = freezeIntents[r.ID] == r.FCPid && r.FCPid > 0
 		if err := mgr.Rehydrate(spec); err != nil {
 			fmt.Fprintf(os.Stderr, "[rehydrate] %s failed: %v — marking destroyed\n", r.ID, err)
 			rehydrateNote := "rehydrate failed: " + err.Error()
@@ -586,6 +588,8 @@ func Serve(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	svc.PauseCfg.PausedDir = cfg.Pause.PausedDir
+	svc.RecoverSnapshotGuests(ctx)
 	for _, r := range aliveRecords {
 		if sb, ok := mgr.Lookup(r.ID); ok {
 			svc.StartSelfSignal(sb)
@@ -616,11 +620,21 @@ func Serve(c *cli.Context) error {
 		return fmt.Errorf("init R2 storage: %w", err)
 	}
 	pausedDir := cfg.Pause.PausedDir
-	if err := os.MkdirAll(pausedDir, 0o700); err != nil {
+	if err := os.MkdirAll(pausedDir, 0o711); err != nil {
 		return fmt.Errorf("paused dir: %w", err)
+	}
+	// Slot UIDs need to traverse this parent, but must not list it.
+	// MkdirAll preserves existing modes; correct drift without touching
+	// the private per-sandbox directories or their contents.
+	if err := os.Chmod(pausedDir, 0o711); err != nil {
+		return fmt.Errorf("paused dir permissions: %w", err)
 	}
 	cached := &storage.LocalCache{Dir: pausedDir, Underlying: st}
 	svc.Storage = cached
+	// Cache initialization is optional: restores keep working without it.
+	if err := svc.InitSnapshotDownloadCache(pausedDir, cfg.SnapshotDir); err != nil {
+		log.Warnf("[snapshot-cache] disabled: %v", err)
+	}
 	pauseCfg := service.PauseConfig{
 		HostID:            cfg.Hostname,
 		PausedDir:         pausedDir,
@@ -641,15 +655,16 @@ func Serve(c *cli.Context) error {
 		pauseCfg.ZstdLevel = 1
 	}
 	svc.PauseCfg = pauseCfg
+	if err := svc.InitDiskBudget(); err != nil {
+		return fmt.Errorf("disk budget: %w", err)
+	}
+	svc.RecoverSnapshotGuests(ctx)
 	go svc.CacheReaperLoop(ctx)
-	// Crash recovery: any rows stuck in 'pausing'/'resuming' for
-	// this host belonged to goroutines that died with the previous
-	// process. Pause: try to complete from local files; mark the
-	// rest failed + clean up. Resume: just re-run the resume — R2
-	// has the canonical bundle and runResume is idempotent. Pause is
-	// synchronous (5-min bound) because we want failed rows cleaned
-	// before the host accepts new work; resume is fire-and-forget
-	// goroutines so startup isn't blocked by N parallel R2 downloads.
+	// Recover only this host's interrupted pause/resume operations. Pause
+	// recovery verifies completed local bundles before upload; incomplete
+	// captures fail, while operational errors retain artifacts for retry.
+	// It runs synchronously with a five-minute bound. Resume recovery starts
+	// background attempts from the durable bundle and verified local cache.
 	{
 		rctx, rcancel := context.WithTimeout(ctx, 5*time.Minute)
 		svc.RecoverStuckPauses(rctx)
@@ -658,7 +673,7 @@ func Serve(c *cli.Context) error {
 	svc.RecoverStuckResumes(ctx)
 	fmt.Fprintf(os.Stderr, "[pause] orchestrator enabled, bucket=%s paused_dir=%s\n", controlStorage.Bucket, pausedDir)
 
-	// Template orchestrator. Reuses the same R2 client + a dedicated
+	// Template orchestrator. Reuses the same object-storage client + a dedicated
 	// local-cache dir. Drives lazy ext4 fetches on first sandbox create
 	// and the TTL+LRU reaper. All knobs follow the standard flag/env >
 	// YAML > default precedence (see config.TemplatesFile / TEMPLATES_*
@@ -822,8 +837,9 @@ func Serve(c *cli.Context) error {
 	// happened synchronously up-front (see registerHost above).
 	go func() {
 		if err := runHeartbeat(ctx, HeartbeatConfig{
-			HostID:   cfg.Hostname,
-			DiskPath: cfg.SnapshotDir,
+			HostID:             cfg.Hostname,
+			DiskPath:           cfg.SnapshotDir,
+			SnapshotCacheHints: svc.SnapshotCacheHints,
 		}, repo, &mgrStater{m: mgr}, mgr, func() { mgr.KickPrewarm(ctx) }); err != nil {
 			fmt.Fprintf(os.Stderr, "heartbeat: %v\n", err)
 		}

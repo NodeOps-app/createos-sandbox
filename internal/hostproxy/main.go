@@ -28,7 +28,7 @@ type Proxy struct {
 	Logger    *log.Logger
 
 	// SniffTimeout bounds how long the ClientHello/Host peek may take.
-	// Zero means use the default (500ms).
+	// New sets 500ms; nonpositive values disable the sniff read deadline.
 	SniffTimeout time.Duration
 
 	domains *domainResolver
@@ -64,8 +64,8 @@ func (p *Proxy) Run(ctx context.Context) error {
 	}
 
 	// Inbound :8443 is intentionally plain TCP — the proxy peeks at the
-	// TLS ClientHello bytes to extract SNI then forwards bytes verbatim
-	// to the original destination. VMs aren't part of the mTLS mesh,
+	// TLS ClientHello bytes to extract SNI, then forwards bytes verbatim.
+	// Domain rules use host-resolved destinations; IP rules use the original IP. VMs aren't part of the mTLS mesh,
 	// so we never terminate TLS here. (The TLSCert/Key/CA paths are
 	// only used for the OUTBOUND proxy→control mTLS client.)
 	p.Logger.Printf("listening http=%s https=%s (transparent SNI sniff)",
@@ -194,8 +194,9 @@ func displayHost(h string) string {
 	return h
 }
 
-// splice copies bytes bidirectionally between client and upstream until
-// either side closes. Returns (client->upstream bytes, upstream->client bytes).
+// splice copies in both directions and waits for both copies to finish.
+// TCP EOF half-closes the destination write side; the opposite direction can
+// remain open. Returns (client->upstream bytes, upstream->client bytes).
 func splice(client, upstream net.Conn) (int64, int64) {
 	var (
 		up, down int64

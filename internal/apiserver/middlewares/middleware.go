@@ -9,19 +9,18 @@ import (
 	"context"
 	"strings"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/sandboxaccess"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/userapikey"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/sandboxaccess"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/userapikey"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 
 	"github.com/gofiber/fiber/v2"
 )
 
 // Request headers the control plane's gates inspect.
 const (
-	// HeaderAuthorization carries internal-service JWTs as
-	// `Bearer <jwt>` between control, hosts, gateway, ingress,
-	// scheduler, builder. NOT used for user-facing auth — those go
+	// HeaderAuthorization carries `Bearer <jwt>` on the builder and
+	// billing routes. Other service RPCs use mTLS. User-facing auth goes
 	// through the X-Api-Key / X-Auth-Token / X-Access-Token headers.
 	HeaderAuthorization   = "Authorization"
 	BearerPrefix          = "Bearer "
@@ -62,6 +61,7 @@ type Middleware struct {
 	Resolver      userapikey.Resolver
 	SandboxTokens SandboxTokenResolver
 	JWTVerifier   *authjwt.Verifier
+	MetricsToken  string
 	AdminToken    string
 	// BootstrapToken gates registration of role="compute" hosts (and
 	// legacy unset-role hosts). Distinct from RelayBootstrapToken so a
@@ -111,6 +111,14 @@ func bearerToken(header string) (string, bool) {
 	return tok, tok != ""
 }
 
+// allowQueryTokenForPath reports whether the path is one of the few
+// routes where `?token=…` is an acceptable auth fallback. Restricted
+// to the browser WebSocket endpoints — accepting it on every route
+// would leak bearer tokens into Cloudflare / nginx / fiber access logs.
+func allowQueryTokenForPath(p string) bool {
+	return strings.HasSuffix(p, "/shell-ws")
+}
+
 // ExtractAuthToken inspects an inbound request for one of the four
 // supported auth headers, in priority order. Returns the (auth_type,
 // token) pair or ("", "", false) if none was set / all empty.
@@ -126,14 +134,6 @@ func bearerToken(header string) (string, bool) {
 // avoids ambiguity in the cache key — a single request maps to a single
 // (type, hash) pair regardless of how clumsily the client populated
 // headers.
-// allowQueryTokenForPath reports whether the path is one of the few
-// routes where `?token=…` is an acceptable auth fallback. Restricted
-// to the browser WebSocket endpoints — accepting it on every route
-// would leak bearer tokens into Cloudflare / nginx / fiber access logs.
-func allowQueryTokenForPath(p string) bool {
-	return strings.HasSuffix(p, "/shell-ws")
-}
-
 func ExtractAuthToken(c *fiber.Ctx) (authType, token string, ok bool) {
 	if v := strings.TrimSpace(c.Get(HeaderXAuthToken)); v != "" {
 		return userapikey.AuthTypeAuthToken, strings.Clone(v), true

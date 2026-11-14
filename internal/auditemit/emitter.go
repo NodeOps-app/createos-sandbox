@@ -1,5 +1,5 @@
 // Package auditemit implements audit.Emitter against Postgres. Each
-// Emit inserts a row into audit_events; internal/auditshipper drains
+// non-internal Emit inserts a row into audit_events; internal/auditshipper drains
 // the table and POSTs to the backend audit-log endpoint.
 package auditemit
 
@@ -15,9 +15,9 @@ import (
 	"github.com/oklog/ulid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Emitter satisfies audit.Emitter. Safe for concurrent use.
@@ -30,15 +30,13 @@ func New(db *database.Db, retention time.Duration) *Emitter {
 	return &Emitter{DB: db, Retention: retention}
 }
 
-// Emit is fire-and-forget. Opens its own tx, inserts the row,
-// commits. Errors logged, never propagated.
+// Emit synchronously inserts and commits in its own transaction, without
+// waiting for outbound delivery. Errors are logged, never propagated.
 func (e *Emitter) Emit(ctx context.Context, ac audit.Context, action audit.Action, op audit.OperationType, md audit.Metadata) {
 	if e == nil {
 		return
 	}
-	// Internal users bypass audit persistence — no row is written.
-	// Async re-emission for internal history is a follow-up; for now
-	// the row simply doesn't exist. Cuts ~30 ms per hot-path claim.
+	// Calls marked internal bypass audit persistence; no row is written.
 	if ac.IsInternal {
 		return
 	}

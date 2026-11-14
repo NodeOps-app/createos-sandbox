@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 const queryHostID = "host_id"
@@ -40,9 +40,9 @@ type Client struct {
 func NewClient(baseURL string) *Client {
 	// Custom Transport instead of http.DefaultTransport — Go's default
 	// caps MaxIdleConnsPerHost at 2, so under any concurrent burst the
-	// 3rd+ in-flight call opens a fresh TCP+TLS handshake (several round
-	// trips each). The host hits this path on every create/exec/destroy
-	// via control's /v1/internal/db/* RPCs,
+	// 3rd+ in-flight call opens a fresh TCP+TLS handshake (~200ms each
+	// over our ~17ms control-host link). The host hits this path on
+	// every create/exec/destroy via control's /v1/internal/db/* RPCs,
 	// so the cost shows up directly as `db.insert` time on the host.
 	//
 	// Tuning: 100 idle conns/host comfortably exceeds peak per-VM call
@@ -74,7 +74,7 @@ func NewClient(baseURL string) *Client {
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		http:    &http.Client{Timeout: 30 * time.Second, Transport: &diagnosticTransport{base: transport}},
 	}
 }
 
@@ -127,7 +127,7 @@ func NewClientWithTLSAndVerify(
 
 	return &Client{
 		baseURL: url,
-		http:    &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		http:    &http.Client{Timeout: 30 * time.Second, Transport: &diagnosticTransport{base: transport}},
 	}, nil
 }
 
@@ -441,11 +441,9 @@ func (r *Client) GetHost(ctx context.Context, id string) (*models.Host, error) {
 	return &h, nil
 }
 
-// Rootfs catalog metadata is only read by control today (host/ingress/proxy
-// don't need it). We stub them through to control via the same
-// /v1/internal/db proxy in case a future caller needs them. If the
-// routes aren't mounted there yet
-// these will return a 404; that's fine — nothing on the host side calls them.
+// These rootfs metadata methods retain the repository interface, but the
+// control DB proxy does not register their routes. Host code must not rely
+// on them for catalog reads; registration and heartbeat supply host catalogs.
 func (r *Client) GetRootfsMetadata(ctx context.Context, name string) (*models.RootfsCatalog, error) {
 	var rec models.RootfsCatalog
 	if err := r.do(ctx, http.MethodGet, "/v1/internal/db/rootfs-catalog/"+name, nil, &rec); err != nil {
@@ -704,4 +702,36 @@ func (r *Client) Heartbeat(ctx context.Context, req proto.ControlHostHeartbeatRe
 		return out, err
 	}
 	return out, nil
+}
+
+func (r *Client) ListSnapshotJobs(ctx context.Context) ([]models.Snapshot, error) {
+	var rows []models.Snapshot
+	err := r.do(ctx, http.MethodGet, "/v1/internal/db/snapshots", nil, &rows)
+	return rows, err
+}
+func (r *Client) GetSnapshotJob(ctx context.Context, id string) (*models.Snapshot, error) {
+	var row models.Snapshot
+	err := r.do(ctx, http.MethodGet, "/v1/internal/db/snapshots/"+url.PathEscape(id), nil, &row)
+	if errors.Is(err, errNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+func (r *Client) SnapshotSource(ctx context.Context, id string) (*models.SnapshotCaptureSource, error) {
+	var row models.SnapshotCaptureSource
+	err := r.do(ctx, http.MethodGet, "/v1/internal/db/snapshots/"+url.PathEscape(id)+"/source", nil, &row)
+	if errors.Is(err, errNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+func (r *Client) SnapshotProgress(ctx context.Context, id, action string, req proto.ControlSnapshotProgressReq) error {
+	var resp proto.CASStatusResp
+	return r.do(ctx, http.MethodPost, "/v1/internal/db/snapshots/"+url.PathEscape(id)+"/"+url.PathEscape(action), req, &resp)
 }

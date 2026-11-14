@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 const maxHostPubkeyEntries = 16 * 1024
@@ -21,9 +21,8 @@ type pubkeyEntry struct {
 
 // HostPubkeys caches host signing keys and status by host id.
 //
-// Negative cache TTL is half the positive TTL — same convention as
-// CachedHostTokens — so a host that joins after a recent miss becomes
-// reachable in a bounded window without us pummelling the DB.
+// Negative entries live for half the positive TTL, so a lookup can
+// discover a newly registered host without repeatedly querying the DB.
 type HostPubkeys struct {
 	repo  *models.Repo
 	ttl   time.Duration
@@ -40,8 +39,8 @@ func NewHostPubkeys(repo *models.Repo, ttl time.Duration) *HostPubkeys {
 
 // Lookup returns the host's public key. Returns nil with status="" on
 // unknown host (cached negatively for ttl/2). Returns the cached pubkey
-// even if status=="dead" — the InternalJWTMiddleware decides whether to
-// honour a dead host's signature (typically: reject).
+// even if status=="dead"; callers must interpret status themselves.
+// The control server does not use this cache for inbound JWT verification.
 func (c *HostPubkeys) Lookup(ctx context.Context, hostID string) (ed25519.PublicKey, string, error) {
 	c.mu.RLock()
 	e, ok := c.cache[hostID]

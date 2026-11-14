@@ -28,6 +28,7 @@ const (
 )
 
 type inputOperation struct {
+	ctx    context.Context
 	kind   inputOperationKind
 	data   []byte
 	result chan inputOperationResult
@@ -112,7 +113,11 @@ func (r *processRecord) submitInput(ctx context.Context, kind inputOperationKind
 	if ctx == nil {
 		return 0, errors.New("input context is required")
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	operation := inputOperation{
+		ctx:    ctx,
 		kind:   kind,
 		data:   append([]byte(nil), data...),
 		result: make(chan inputOperationResult, 1),
@@ -147,6 +152,11 @@ func (r *processRecord) runInputLoop() {
 }
 
 func (r *processRecord) applyInputOperation(operation inputOperation) (uint64, error) {
+	// Cancellation while queued must not deliver stale input or close stdin.
+	// Once a write has begun, cancellation cannot retract bytes already sent.
+	if err := operation.ctx.Err(); err != nil {
+		return 0, err
+	}
 	switch operation.kind {
 	case inputOperationWrite:
 		writer, err := r.inputWriter()

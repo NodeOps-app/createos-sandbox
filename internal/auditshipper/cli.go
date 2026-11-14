@@ -11,8 +11,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 func Cli(c *cli.Context) error {

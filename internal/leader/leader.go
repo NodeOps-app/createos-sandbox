@@ -1,8 +1,7 @@
-// Package leader implements single-active leader election backed by a
-// Postgres advisory lock. The lock is held on a dedicated session-scoped
-// connection — when the connection drops (process death, network partition,
-// shutdown) Postgres releases the lock automatically, which is exactly the
-// fencing behavior we want for a singleton service.
+// Package leader elects a leader with a session-scoped PostgreSQL advisory
+// lock. PostgreSQL releases the lock when the owning session ends. Network
+// failures may take time to detect; callbacks must honor cancellation, and
+// the lock alone does not fence already-running external work.
 package leader
 
 import (
@@ -25,7 +24,7 @@ const (
 // Config configures the elector.
 type Config struct {
 	Pool           *pgxpool.Pool
-	Key            int64         // unique per role; e.g. scheduler = 0xFC5C5CHEDULE
+	Key            int64         // advisory lock key shared by replicas of the same role
 	AcquirePeriod  time.Duration // default 1s
 	LivenessPeriod time.Duration // default 3s
 	Logger         *slog.Logger  // default slog.Default()
@@ -91,7 +90,8 @@ func New(cfg Config, cb Callbacks) *Elector {
 func (e *Elector) IsLeader() bool { return e.isLeader.Load() }
 
 // Epoch returns the monotonic counter that increments on every successful
-// acquisition. Used as a fencing token in HTTP responses.
+// acquisition within this Elector instance. It resets with a new process and
+// is not a globally monotonic database fencing token.
 func (e *Elector) Epoch() int64 { return e.epoch.Load() }
 
 // Run blocks until ctx is cancelled. Returns ctx.Err() on shutdown.

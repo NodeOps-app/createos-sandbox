@@ -118,11 +118,10 @@ type ServeConfig struct {
 	// firecracker's built-in default filter.
 	SeccompFilterPath string
 
-	// AgentLivenessProbe destroys a VM when its guest agent stops answering
-	// while firecracker is still alive (guest self-halt / panic / wedge).
-	// Default ON — without it, killing the in-guest agent leaves a wedged
-	// firecracker VMM that WatchDeath can't see (the fc process is still
-	// alive). Set agent_liveness_probe:false in serve.yaml to disable.
+	// AgentLivenessProbe destroys a VM after five continuous minutes of failed
+	// guest-agent connection probes. Successful probes, snapshot freezing, and
+	// bandwidth capping reset the failure timer. Enabled by default.
+	// Set agent_liveness_probe: false in serve.yaml to disable.
 	AgentLivenessProbe bool
 
 	// AgentProbeTransport selects how waitForAgent dials the guest
@@ -255,6 +254,7 @@ type TemplatesFile struct {
 
 // AuthFile is the YAML schema for the per-server auth section.
 type AuthFile struct {
+	MetricsToken            *string         `yaml:"metrics_token"`
 	AdminToken              *string         `yaml:"admin_token"`
 	BootstrapToken          *string         `yaml:"bootstrap_token"`
 	BootstrapTokenFile      *string         `yaml:"bootstrap_token_file"`
@@ -317,7 +317,7 @@ func ServeFlags() []cli.Flag {
 		&cli.StringFlag{Name: "uffd", Value: "off", Usage: "snapshot memory backing: off|on|auto (default off; auto/on break VMs across serve restarts)", EnvVars: []string{"UFFD"}},
 		&cli.StringFlag{Name: "cpu-template-path", Value: "", Usage: "absolute path to firecracker custom CPU template JSON (cross-vendor snapshot portability; empty = host-native CPUID)", EnvVars: []string{"CPU_TEMPLATE_PATH"}},
 		&cli.StringFlag{Name: "seccomp-filter-path", Value: "", Usage: "absolute path to firecracker seccomp filter JSON (restricts VMM syscalls; empty = firecracker built-in default)", EnvVars: []string{"SECCOMP_FILTER_PATH"}},
-		&cli.BoolFlag{Name: "agent-liveness-probe", Value: true, Usage: "destroy a VM when its guest agent stops answering while firecracker is still alive (guest self-halt / panic / wedge detection)"},
+		&cli.BoolFlag{Name: "agent-liveness-probe", Value: true, Usage: "destroy a VM after five continuous minutes of failed guest-agent connection probes while firecracker is still alive"},
 		&cli.StringFlag{Name: "agent-probe-transport", Value: "vsock", Usage: "how waitForAgent dials the guest readiness signal: vsock|tcp. vsock is the default — bypasses virtio-net, ~3-5× faster agent phase on nested-virt hosts. Requires patched firecracker (vsock_override).", EnvVars: []string{"AGENT_PROBE_TRANSPORT"}},
 		&cli.StringFlag{Name: "metrics-addr", Value: "", Usage: "TCP listen address for the prometheus /metrics endpoint (e.g. :9091). Empty disables.", EnvVars: []string{"METRICS_ADDR"}},
 		&cli.StringFlag{Name: "metrics-token-file", Value: "", Usage: "path to the required bearer token file when the metrics listener is enabled", EnvVars: []string{"METRICS_TOKEN_FILE"}},

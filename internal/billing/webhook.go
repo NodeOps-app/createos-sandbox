@@ -1,6 +1,5 @@
 // Package billing delivers sandbox lifecycle events to the configured
-// external billing webhook. See docs (plan) and queries.sql section
-// "billing event outbox" for the surrounding design.
+// external billing webhook using the Postgres billing-event outbox.
 package billing
 
 import (
@@ -12,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/hmacsign"
+	"github.com/NodeOps-app/createos-sandbox/internal/hmacsign"
 )
 
 // Webhook is the delivery client. One per process; safe for concurrent
@@ -23,9 +22,8 @@ type Webhook struct {
 	Client *http.Client
 }
 
-// New constructs a Webhook with sensible defaults. Empty url returns a
-// zero-value Webhook whose Deliver always errors — caller should
-// short-circuit on len(URL)==0 instead.
+// New constructs a Webhook with a 10-second HTTP timeout. Deliver rejects an
+// empty URL. The CLI validates that both URL and signing secret are supplied.
 func New(url, secret string) *Webhook {
 	return &Webhook{
 		URL:    url,
@@ -49,7 +47,7 @@ func (w *Webhook) Sign(body []byte, ts time.Time) string {
 
 // Deliver POSTs one event to the webhook. Returns:
 //   - nil on 2xx (caller marks delivered)
-//   - PermanentError on 4xx except 408/429 (caller stops retrying)
+//   - PermanentError on other final HTTP statuses (caller stops retrying)
 //   - RetryableError on 408/429/5xx/transport (caller bumps attempts)
 func (w *Webhook) Deliver(ctx context.Context, eventID, eventType string, body []byte) error {
 	if w == nil || w.Client == nil || w.URL == "" {
@@ -100,8 +98,8 @@ type RetryableError struct{ Inner error }
 func (e *RetryableError) Error() string { return e.Inner.Error() }
 func (e *RetryableError) Unwrap() error { return e.Inner }
 
-// PermanentError signals the worker should stop retrying (4xx other
-// than 408/429 — billing-system bug or schema mismatch).
+// PermanentError signals a final HTTP status other than 2xx, 408, 429, or
+// 5xx. Redirects normally follow the configured HTTP client policy first.
 type PermanentError struct{ Inner error }
 
 func (e *PermanentError) Error() string { return e.Inner.Error() }

@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/agent/childreaper"
+	"github.com/NodeOps-app/createos-sandbox/internal/agent/childreaper"
 )
 
 type ProcessSpec struct {
@@ -60,7 +60,6 @@ func (m *Manager) CreateProcess(ctx context.Context, spec ProcessSpec) (CreatedP
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:     true,
-		Cloneflags:  syscall.CLONE_NEWCGROUP,
 		UseCgroupFD: true,
 		CgroupFD:    cgroup.fd(),
 	}
@@ -178,7 +177,6 @@ func (m *Manager) CreatePTY(ctx context.Context, spec PTYSpec) (CreatedProcess, 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:      true,
 		Setctty:     true,
-		Cloneflags:  syscall.CLONE_NEWCGROUP,
 		UseCgroupFD: true,
 		CgroupFD:    cgroup.fd(),
 	}
@@ -389,4 +387,57 @@ func defaultPTYArgv() []string {
 		return []string{"/bin/bash", "-i", "-l"}
 	}
 	return []string{"/bin/sh", "-l"}
+}
+
+// BindExecCommand gives a connection-scoped exec the same descendant tracking
+// as managed processes, without retaining a public process record. A detached
+// child may outlive a successfully completed command; only cancellation kills
+// the cgroup. Never signal a cached process-group ID after its leader exits.
+// Keep the guest cgroup namespace shared with its inherited cgroup mount.
+// A private namespace without a matching mount breaks nested runtimes such
+// as Docker buildx; UseCgroupFD still tracks descendants for cancellation.
+func BindExecCommand(cmd *exec.Cmd) (func(), error) {
+	id, err := newProcessID(processModePipes)
+	if err != nil {
+		return nil, err
+	}
+	cg, err := createProcessCgroup(id)
+	if err != nil {
+		return nil, err
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:     true,
+		UseCgroupFD: true,
+		CgroupFD:    cg.fd(),
+	}
+	cmd.Cancel = func() error {
+		signalErr := cg.signal(syscall.SIGTERM)
+		empty, waitErr := cg.waitEmptyFor(context.Background(), 2*time.Second)
+		if waitErr != nil || !empty {
+			if err := cg.kill(); err != nil {
+				return err
+			}
+		}
+		return signalErr
+	}
+	return func() {
+		cg.closeAttachFD()
+		// Wait also covers children intentionally detached by a successful exec.
+		// Removal must not race with a still-running cancellation callback: callers
+		// invoke cleanup after cmd.Wait, which joins exec.CommandContext's watcher.
+		cleanup := func() {
+			if err := cg.waitEmpty(context.Background()); err != nil {
+				log.Printf("agent.exec cgroup wait: %v", err)
+				return
+			}
+			if err := cg.remove(); err != nil {
+				log.Printf("agent.exec cgroup cleanup: %v", err)
+			}
+		}
+		if populated, err := cg.populated(); err == nil && !populated {
+			cleanup()
+		} else {
+			go cleanup()
+		}
+	}, nil
 }

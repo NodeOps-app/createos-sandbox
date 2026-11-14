@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 var hostScheme = "http"
 
+// SetHostScheme sets the fallback scheme for host addresses without one.
+// Call during startup, before concurrent requests; explicit URL schemes win.
 func SetHostScheme(scheme string) {
 	if scheme != "" {
 		hostScheme = scheme
@@ -116,6 +118,8 @@ func Resume(
 		"/v1/internal/sandboxes/"+sandbox.ID+"/resume", sandbox.CreatedBy, body, nil)
 }
 
+// PauseAccepted treats 2xx, 409, and 404 as accepted for orchestration.
+// It does not prove that the sandbox has finished pausing.
 func PauseAccepted(response *http.Response) bool {
 	if response == nil {
 		return false
@@ -124,6 +128,8 @@ func PauseAccepted(response *http.Response) bool {
 		(response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices)
 }
 
+// DestroyAccepted accepts 2xx or an already-absent resource (404).
+// Asynchronous acknowledgement does not prove local VM teardown is complete.
 func DestroyAccepted(response *http.Response) bool {
 	if response == nil {
 		return false

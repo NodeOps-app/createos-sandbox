@@ -3,19 +3,23 @@ package framework
 import (
 	"context"
 	"errors"
+	log "github.com/sirupsen/logrus"
 	"math/rand/v2"
 	"sort"
+	"sync/atomic"
+	"time"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Pipeline runs Filter → Score → Reserve. Construct directly or via
 // Registry.BuildPipeline.
 type Pipeline struct {
-	Filters       []Filter
-	Scorers       []Scorer
-	ScorerWeights []int // parallel to Scorers; 0 means "use Scorer.Weight()"
-	Reserver      Reserver
+	Filters          []Filter
+	Scorers          []Scorer
+	ScorerWeights    []int // parallel to Scorers; 0 means "use Scorer.Weight()"
+	Reserver         Reserver
+	lastRejectionLog atomic.Int64
 }
 
 type scored struct {
@@ -27,9 +31,8 @@ type scored struct {
 // the offending host and retries. When Pipeline.Reserver is nil, returns the
 // best-ranked host without reserving — useful for dry-runs and tests.
 //
-// sbID is the sandbox id the caller has already INSERTed (with status=creating
-// and host=NULL). The reserver keys its delta on this id so the destroy path
-// and hydrate can both reconcile against it without an opaque token.
+// sbID identifies the durable sandbox being created or resumed. The reserver
+// keys its delta on this id so hydration can reconcile it without a token.
 func (p *Pipeline) Schedule(ctx context.Context, sbID string, req *Request, hosts []models.Host) (*Decision, error) {
 	candidates := p.filter(req, hosts)
 	if len(candidates) == 0 {
@@ -52,10 +55,20 @@ func (p *Pipeline) Schedule(ctx context.Context, sbID string, req *Request, host
 		}
 	}
 	if len(candidates) == 0 {
+		p.logRejections(ctx, req, hosts)
 		return nil, ErrNoCapacity
 	}
 	preferred, fallback := preferredHostTiers(req, candidates)
+	// Operator placement policy takes precedence. Within each policy tier,
+	// prefer a complete cached snapshot before scoring equally local hosts.
+	// Reservation conflicts still fall through to uncached eligible hosts.
+	tiers := make([][]models.Host, 0, 4)
+	now := time.Now()
 	for _, tier := range [][]models.Host{preferred, fallback} {
+		cached, uncached := snapshotHostTiers(req, tier, now)
+		tiers = append(tiers, cached, uncached)
+	}
+	for _, tier := range tiers {
 		ranked := p.score(req, tier)
 		for len(ranked) > 0 {
 			idx := pickMaxRandom(ranked)
@@ -161,4 +174,49 @@ func pickMaxRandom(ranked []scored) int {
 		return 0
 	}
 	return rand.IntN(tied)
+}
+
+func snapshotHostTiers(req *Request, hosts []models.Host, now time.Time) ([]models.Host, []models.Host) {
+	if req == nil || req.SnapshotID == "" {
+		return nil, hosts
+	}
+	var cached, uncached []models.Host
+	for _, h := range hosts {
+		if h.HasCachedSnapshot(req.SnapshotID, now) {
+			cached = append(cached, h)
+		} else {
+			uncached = append(uncached, h)
+		}
+	}
+	return cached, uncached
+}
+
+// Report the first rejection per host, at most once a minute per pipeline.
+// This includes status and heartbeat age so unavailable hosts are distinguishable
+// from resource exhaustion. Never put request labels or credentials in logs.
+func (p *Pipeline) logRejections(ctx context.Context, req *Request, hosts []models.Host) {
+	now := time.Now()
+	last := p.lastRejectionLog.Load()
+	if last != 0 && now.UnixNano()-last < int64(time.Minute) {
+		return
+	}
+	if !p.lastRejectionLog.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	log.WithContext(ctx).WithField("host_count", len(hosts)).Warn("[scheduler] no eligible host")
+	for i := range hosts {
+		h := &hosts[i]
+		if h.Region != req.Region {
+			continue
+		}
+		for _, f := range p.Filters {
+			if ok, reason := f.Filter(req, h); !ok {
+				if f.Name() == "label_selector" {
+					reason = "label mismatch"
+				}
+				log.WithContext(ctx).WithFields(log.Fields{"host_id": h.ID, "filter": f.Name(), "reason": reason, "host_status": h.Status, "last_seen": h.LastSeen, "heartbeat_age": now.Sub(h.LastSeen)}).Warn("[scheduler] host rejected")
+				break
+			}
+		}
+	}
 }

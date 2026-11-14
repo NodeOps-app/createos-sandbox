@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
 )
 
 var traceEnabled atomic.Bool

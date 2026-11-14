@@ -19,16 +19,15 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	schedapi "github.com/NodeOps-app/sandbox/internal/scheduler/api"
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/internal/scheduler/plugins"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	schedapi "github.com/NodeOps-app/createos-sandbox/internal/scheduler/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/plugins"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// ServerConfig holds the HTTP-level config. Reservation TTL is owned by
-// the Instance (so the sweeper and the published ExpiresAtMs can't drift);
-// don't duplicate it here.
+// ServerConfig holds the scheduler listener and shutdown configuration.
 type ServerConfig struct {
 	Addr          string
 	ShutdownGrace time.Duration // default 10s
@@ -89,27 +88,15 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	app.Get("/readyz", s.handleReadyz)
 
 	v1 := app.Group("/v1")
-	// Scheduler is not exposed outside the cluster — the k8s Service
-	// is ClusterIP-only and the listener binds inside the createos
-	// namespace. Inbound auth is intentionally absent: every caller
-	// inside the mesh is trusted to submit placement requests. If you
-	// ever expose this port externally, restore an auth gate here
-	// (mTLS-role=control matches the rest of the system; see
-	// internal/apiserver/routes/main.go for the pattern).
+	// These routes have no application-level role gate. When configured,
+	// the TLS listener verifies client certificates against the configured CA.
+	// Plain HTTP relies on deployment-level network restrictions.
 	v1.Post("/schedule", s.handleSchedule)
-	// /v1/capacity — read-only per-host commit-vs-limit snapshot for
-	// all 4 admission dimensions. Behind the same MustBeControl gate
-	// as /schedule because the data is operationally sensitive (host
-	// utilization can be used to time attacks at peak load). Operators
-	// reach it via `kubectl exec deploy/createos-control -- curl
-	// http://createos-scheduler:9100/v1/capacity -H 'Authorization:
-	// Bearer <internal-jwt>'` or via a future control-plane proxy.
+	// Capacity uses the same listener authentication as schedule.
 	v1.Get("/capacity", s.handleCapacity)
-	// Note: there is no /release endpoint, by design. The scheduler learns
-	// about completed/failed/destroyed sandboxes via the 1s hydrate tick
-	// reading the durable sandboxes table. No ack, no callback, no
-	// coordination — host crashes, control crashes, and lost messages
-	// all converge correctly within the hydrate interval.
+	// There is no /release endpoint. Hydration reconciles reservations with
+	// durable sandbox rows at the configured interval; database failures
+	// can delay convergence.
 
 	tlsActive := s.cfg.TLSCertPath != "" && s.cfg.TLSKeyPath != "" && s.cfg.TLSCAPath != ""
 	s.logger.Info("listening",
@@ -183,8 +170,8 @@ func (s *HTTPServer) handleHealthz(c *fiber.Ctx) error {
 
 // handleCapacity returns the operator-visible per-host capacity snapshot.
 // Read-only: serves the scheduler's current hostCache view. Numbers
-// reflect live SUMs as of the last hydrate (≤ ReservationGracePeriod
-// stale); pending reservations are NOT included.
+// reflect the last successful hydrate; refresh failures can leave them stale.
+// Pending reservations are not included.
 func (s *HTTPServer) handleCapacity(c *fiber.Ctx) error {
 	hosts := s.instance.HostsSnapshot()
 	resp := schedapi.CapacityResponse{Hosts: make([]schedapi.HostCapacity, 0, len(hosts))}
@@ -219,7 +206,7 @@ func diskDimUsage(h models.Host) schedapi.DimensionUsage {
 	}
 }
 
-// dimUsage builds one DimensionUsage row. factor=0 falls back to dflt.
+// dimUsage builds one DimensionUsage row. Nonpositive factors use dflt.
 func dimUsage(committed, physical int64, factor, dflt int) schedapi.DimensionUsage {
 	if factor <= 0 {
 		factor = dflt
@@ -270,6 +257,7 @@ func (s *HTTPServer) handleSchedule(c *fiber.Ctx) error {
 	parseDur := time.Since(parseStarted)
 	scheduleStarted := time.Now()
 	d, h, err := s.instance.Schedule(c.UserContext(), req.SandboxID, &framework.Request{
+		SnapshotID:       req.SnapshotID,
 		Shape:            req.Shape,
 		Rootfs:           req.Rootfs,
 		MemMiB:           req.MemMiB,
@@ -316,6 +304,16 @@ func (s *HTTPServer) handleSchedule(c *fiber.Ctx) error {
 	}
 	if h != nil {
 		resp.HostAddr = h.Addr
+		if req.SnapshotID != "" {
+			log.WithContext(c.UserContext()).Infof("[scheduler] snapshot=%s host=%s cache_hint=%t", req.SnapshotID, h.ID, h.HasCachedSnapshot(req.SnapshotID, time.Now()))
+		}
+		// Reuse reserved capacity, never subtract more from schedulable disk.
+		// Leave half the safety reserve plus the entire transient reserve untouched.
+		budget := min(int64(20*1024), max(int64(0), h.DiskTotalMib*int64(s.instance.cfg.DiskSafetyPercent)/200))
+		resp.SnapshotCache = &proto.SnapshotCachePolicy{
+			BudgetMiB:    budget,
+			FreeFloorMiB: max(int64(0), h.DiskHeadroomMib-budget),
+		}
 	}
 	return httpx.Success(c, resp)
 }

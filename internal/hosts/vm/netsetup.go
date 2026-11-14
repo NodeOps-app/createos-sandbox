@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"time"
@@ -423,21 +424,6 @@ func EnsureInterVMIsolation(subnet string) error {
 		return fmt.Errorf("install wg-hosts forward ACCEPT: %w", err)
 	}
 
-	// Rule 4 (INPUT): ACCEPT proxy-bound traffic from VMs.
-	//
-	// The per-VM egress chain REDIRECTs tcp/80 + tcp/443 to the proxy
-	// at :8081 / :8443 (for domain-rule enforcement). REDIRECT rewrites
-	// the packet's destination to the host's own IP, so it lands on
-	// INPUT rather than FORWARD. Hosts with `-P INPUT DROP` (UFW,
-	// fail2ban, k8s nodes) blackhole it silently. Open the two proxy
-	// ports specifically for traffic originating from the VM subnet.
-	if err := ensureInputRule(
-		[]string{"-s", subnet, "-p", "tcp", "-m", "multiport",
-			"--dports", "8081,8443", "-j", "ACCEPT"},
-	); err != nil {
-		return fmt.Errorf("install INPUT accept for proxy ports: %w", err)
-	}
-
 	// Rule 5 (INPUT): DROP VM-originated attempts to reach host services
 	// that aren't part of the VM data plane. Defense-in-depth against a
 	// future pre-auth CVE in sshd / Go net-http / mTLS parser reachable
@@ -451,7 +437,7 @@ func EnsureInterVMIsolation(subnet string) error {
 	//   9091 createos metrics + pprof
 	//
 	// NOT blocked:
-	//   - 8081/8443 (proxy, accepted above)
+	//   - 8081/8443 (proxy, restricted to sandbox interfaces below)
 	//   - 169.254.20.10:53 (DNS stub, dst-based accept elsewhere)
 	//   - Host-initiated → VM:1024/1025 (agent RPC): the SYN-ACK reply
 	//     has DST PORT = host's ephemeral (32768+), never matches this
@@ -462,6 +448,50 @@ func EnsureInterVMIsolation(subnet string) error {
 			"-m", "comment", "--comment", "createos-vm-host-ports-block"},
 	); err != nil {
 		return fmt.Errorf("install INPUT drop for VM-side host probes: %w", err)
+	}
+	return ensureProxyInput(subnet)
+}
+
+// ensureProxyInput protects the shared transparent-proxy listeners. REDIRECT
+// changes the destination, but retains the incoming fcpN interface. A public
+// connection must never reach the proxy's source-IP lookup, even on hosts whose
+// INPUT policy is ACCEPT. IPv6 is not part of the sandbox data plane.
+func ensureProxyInput(subnet string) error {
+	if ip, _, err := net.ParseCIDR(subnet); err != nil || ip.To4() == nil {
+		return fmt.Errorf("invalid IPv4 proxy subnet %q", subnet)
+	}
+	const chain = "CREATEOS_PROXY_INPUT"
+	ports := fmt.Sprintf("%d,%d", ProxyHTTPPort, ProxyHTTPSPort)
+	jump := "-p tcp -m multiport --dports " + ports + " -j " + chain
+	for _, binary := range []string{"iptables", "ip6tables"} {
+		if binary == "ip6tables" {
+			if _, err := os.Stat("/proc/net/if_inet6"); os.IsNotExist(err) {
+				continue // Kernel has no IPv6 stack/listener to protect.
+			}
+		}
+		var rules strings.Builder
+		fmt.Fprintf(&rules, "*filter\n:%s - [0:0]\n-F %s\n", chain, chain)
+		if binary == "iptables" {
+			fmt.Fprintf(&rules, "-A %s -i %s+ -s %s -j ACCEPT\n", chain, VethHostPrefix, subnet)
+			// Remove the old subnet-only permission as part of the same commit.
+			legacy := "-s " + subnet + " -p tcp -m multiport --dports " + ports + " -j ACCEPT"
+			if runIPT(append([]string{"-C", "INPUT"}, strings.Fields(legacy)...)...) == nil {
+				fmt.Fprintf(&rules, "-D INPUT %s\n", legacy)
+			}
+		}
+		fmt.Fprintf(&rules, "-A %s -j DROP\n", chain)
+		args := append([]string{"-w", "2", "-C", "INPUT"}, strings.Fields(jump)...)
+		if exec.Command(binary, args...).Run() == nil {
+			fmt.Fprintf(&rules, "-D INPUT %s\n", jump)
+		}
+		// Move the gate ahead of existing broad ACCEPT/ESTABLISHED rules.
+		// Replacing the chain and jump atomically avoids an open restart window.
+		fmt.Fprintf(&rules, "-I INPUT 1 %s\nCOMMIT\n", jump)
+		cmd := exec.Command(binary+"-restore", "--noflush", "-w", "2")
+		cmd.Stdin = strings.NewReader(rules.String())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("install proxy INPUT protection (%s): %w (%s)", binary, err, strings.TrimSpace(string(out)))
+		}
 	}
 	return nil
 }

@@ -9,13 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/leader"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/leader"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// Cli is the urfave/cli Action for `control scheduler`.
+// Cli starts the scheduler service, leader election, and HTTP listener.
 func Cli(c *cli.Context) error {
 	cfg, err := config.SchedulerFromContext(c)
 	if err != nil {
@@ -89,9 +89,7 @@ func Cli(c *cli.Context) error {
 	}()
 	go func() { _ = elector.Run(runCtx) }()
 
-	// Scheduler runs unauthenticated on its cluster-internal port —
-	// see internal/scheduler/http.go for the rationale (no external
-	// exposure, no inbound auth gate).
+	// Configure listener-level mTLS when all TLS paths are supplied.
 	httpSrv := NewHTTPServer(inst, ServerConfig{
 		Addr:        cfg.Addr,
 		TLSCertPath: cfg.TLSCertPath,

@@ -14,7 +14,7 @@ import (
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 const agentPort = 1024
@@ -143,6 +143,12 @@ type Sandbox struct {
 
 	cancel context.CancelFunc
 
+	// File transfers belong to this VM incarnation. Teardown cancels them
+	// before its network slot can be reused, including after host rehydration.
+	fileOnce   sync.Once
+	fileCtx    context.Context
+	fileCancel context.CancelFunc
+
 	// UFFD page server, if the VM was restored via UFFD snapshot. nil for
 	// cold-boot or file-backed snapshot. Must be closed on sandbox destroy
 	// so the listening socket + mmap are released.
@@ -171,6 +177,25 @@ type Sandbox struct {
 	// or it will race pause to a Destroy. Set-once; the sandbox is torn
 	// down right after pause completes, so there's no need to clear.
 	Freezing atomic.Bool
+}
+
+func (s *Sandbox) initFileContext() {
+	s.fileOnce.Do(func() { s.fileCtx, s.fileCancel = context.WithCancel(context.Background()) })
+}
+
+func (s *Sandbox) FileTransferContext(parent context.Context) (context.Context, context.CancelFunc) {
+	s.initFileContext()
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.fileCtx, cancel)
+	if s.fileCtx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() { stop(); cancel() }
+}
+
+func (s *Sandbox) cancelFileTransfers() {
+	s.initFileContext()
+	s.fileCancel()
 }
 
 // CachedOwner returns the owner cached for host-side hot-path authorization.

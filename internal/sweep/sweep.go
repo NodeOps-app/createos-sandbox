@@ -1,19 +1,8 @@
-// Package sweep implements a one-shot janitor pass over the
-// sandboxes/hosts tables. Designed to run as a Kubernetes CronJob —
-// the binary executes one pass and exits; the cron schedule supplies
-// the tick. Three responsibilities, moved out of `control` so the
-// API server stays request-path only:
-//
-//   - orphan-creating sweep: rows stuck in `creating` past their
-//     placement window (control crashed between Schedule and the
-//     host's create completion).
-//   - stuck-transition sweep: rows pinned in `pausing` / `resuming`
-//     past the orchestrator's expected duration, and rows in
-//     `destroying` / `forking` with no host stamped (no reconciler
-//     will ever claim them).
-//   - dead-host eviction: sandboxes pinned to hosts whose heartbeat
-//     hasn't landed in longer than the configured TTL — the host is
-//     never coming back, so the rows are user-invisible junk.
+// Package sweep runs a one-shot maintenance pass, normally from a CronJob.
+// It handles idle pause, stale lifecycle transitions, host heartbeat reaping,
+// optional dead-host eviction, drain migration, and expired metadata cleanup.
+// Asynchronous host work can continue after the pass exits; later runs observe
+// persisted state and retry or advance the operation.
 package sweep
 
 import (
@@ -22,23 +11,23 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/auditemit"
-	"github.com/NodeOps-app/sandbox/internal/billingemit"
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/idlepause"
-	"github.com/NodeOps-app/sandbox/internal/sandboxlifecycle"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/auditemit"
+	"github.com/NodeOps-app/createos-sandbox/internal/billingemit"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/idlepause"
+	"github.com/NodeOps-app/createos-sandbox/internal/sandboxlifecycle"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Config is the resolved runtime configuration for a single sweep.
 type Config struct {
 	PostgresDSN string
 
-	// Per-sweep cutoffs. Zero means use defaults (60s / 15m / 5m).
+	// Per-sweep cutoffs. Nonpositive values use defaults (5m / 15m / 5m).
 	OrphanCreatingAge   time.Duration
 	StuckTransitionAge  time.Duration
 	OrphanDestroyingAge time.Duration
@@ -48,16 +37,17 @@ type Config struct {
 
 	// HostStaleAfter is the heartbeat freshness budget — hosts whose
 	// last_seen is older than this get flipped to status=dead so the
-	// scheduler stops placing on them. ≤ 0 disables the reap pass.
+	// scheduler stops placing on them. Nonpositive values use
+	// models.HostHeartbeatStaleAfter; they do not disable reaping.
 	HostStaleAfter time.Duration
 
-	// Storage is the R2 backend used to clean snapshot bundles for
+	// Storage is the object-storage backend used to clean pause bundles for
 	// orphan-destroying rows. Nil is valid for rows without a bundle.
 	Storage storage.Storage
 
-	// Drain pass dependencies. All three required to run drain — if any
-	// is nil the drain pass is skipped. HTTPClient must be wired with
-	// control's outbound mTLS Transport for the host resume kickoff.
+	// Drain runs when both clients are non-nil. Region selects the hosts
+	// owned by this sweep. HTTPClient needs the control-role mTLS transport
+	// when host listeners require client certificates.
 	SchedulerClient *schedclient.Client
 	HTTPClient      *http.Client
 	Region          string
@@ -77,7 +67,7 @@ type Result struct {
 	DeadHostEvicted         int
 	DrainPaused             int // running→pause kicks during drain
 	DrainResumed            int // paused→resume kicks during drain
-	DrainDestroyed          int // failed-pause fallback destroys during drain
+	DrainBlocked            int // running sandboxes held after exhausting pause retries
 	ScheduledRevokes        int // issued_certs rows whose grace window elapsed
 	ExpiredSessions         int // device_sessions past TTL
 	StaleNetworkMemberships int // terminal sandbox / deleted-network join rows
@@ -85,8 +75,8 @@ type Result struct {
 
 // drainPauseMaxAttempts is the per-sandbox pause-retry budget during
 // drain. After this many consecutive failed pause-trigger attempts,
-// sweep falls back to destroy so a stuck pause path can't permanently
-// block a host from finishing drain.
+// sweep leaves the sandbox intact and reports the blocked drain for operator
+// recovery. Exhausting retries must never authorize workload destruction.
 const drainPauseMaxAttempts = 5
 
 // classifyDrainRows separates actionable states from asynchronous states that
@@ -118,13 +108,13 @@ func (c *Config) defaults() {
 		c.OrphanDestroyingAge = 5 * time.Minute
 	}
 	if c.HostStaleAfter <= 0 {
-		c.HostStaleAfter = 60 * time.Second
+		c.HostStaleAfter = models.HostHeartbeatStaleAfter
 	}
 }
 
 // Run executes every sweep pass once and returns aggregate counts.
-// Per-pass failures are logged but do not abort subsequent passes —
-// one stuck table shouldn't block another's cleanup.
+// Initialization failures are returned. Later failures do not abort subsequent
+// passes; some are logged, so a nil error does not prove every action succeeded.
 func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, error) {
 	if log == nil {
 		log = func(string, ...any) {}
@@ -140,13 +130,9 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 	}
 	defer db.Close()
 	repo := &models.Repo{DB: db}
-	// Local emitter so every Mark* sweep calls records a billing event
-	// atomically with the status flip. Shapes-provider is nil here —
-	// sweep doesn't have access to the live shapes cache, so burstable
-	// shapes fall back to vcpu * 1000 millicores. Acceptable: sweep-
-	// driven events are watchdog terminations, not regular lifecycle
-	// transitions; the billing pipeline can re-derive precise CPU from
-	// the sandbox.shape field downstream if needed.
+	// Pass the billing emitter into lifecycle updates that support atomic
+	// status/event writes. With no shape provider, CPU allocation falls back
+	// to vCPU * 1000 rather than a shape-specific fractional quota.
 	emitter := billingemit.New(db, nil)
 	auditEmitter := auditemit.New(db, 90*24*time.Hour)
 
@@ -211,7 +197,7 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 	// --- 3b. stuck forking ------------------------------------------------
 	// A fork's background goroutine (handlers.runForkBackground) may die
 	// silently — process restart between MarkForking and MarkForkPaused,
-	// an R2 outage longer than the in-process retry budget, or a panic
+	// an object-storage outage longer than the in-process retry budget, or a panic
 	// in the goroutine. No host owns the row (host = '' until MarkForkPaused
 	// + auto-resume schedule it), so no reconciler will ever claim it.
 	// Flip the row to 'failed' once it exceeds the transition cutoff so
@@ -228,6 +214,17 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 			if st, err := repo.MarkForkFailed(ctx, r.ID, &msg, emitter); err == nil && st != "" {
 				res.StuckForking++
 				log("stuck-forking: flipped %s → failed", r.ID)
+				// The terminal child releases its source bundle lease. A lost
+				// worker may have copied only some objects before exiting.
+				if cfg.Storage != nil {
+					cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					for _, name := range []string{storage.ArtifactMemfile, storage.ArtifactVMState, storage.ArtifactOverlay, storage.ArtifactManifest} {
+						if err := cfg.Storage.Delete(cleanupCtx, storage.BundlePrefix(r.ID)+name); err != nil {
+							log("stuck-forking: cleanup %s artifact=%s: %v", r.ID, name, err)
+						}
+					}
+					cancel()
+				}
 			}
 		}
 	}
@@ -288,15 +285,24 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 		}
 	}
 
+	// Retention is region-scoped and bounded so event history cannot grow forever.
+	if !cfg.DryRun {
+		if n, err := repo.SweepExpiredEvents(ctx, cfg.Region, now); err != nil {
+			log("events retention: %v", err)
+		} else if n > 0 {
+			log("events retention: removed %d expired events", n)
+		}
+	}
+
 	// --- 6. dead-host eviction --------------------------------------------
-	if cfg.DeadHostEvictAfter > 0 {
+	if cfg.DeadHostEvictAfter > 0 && cfg.Region != "" {
 		hosts, err := repo.ListHosts(ctx)
 		if err != nil {
 			log("dead-host-evict: list hosts: %v", err)
 		} else {
 			hostCutoff := now.Add(-cfg.DeadHostEvictAfter)
 			for _, h := range hosts {
-				if h.Status != models.HostStatusDead || !h.LastSeen.Before(hostCutoff) {
+				if h.Region != cfg.Region || h.Status != models.HostStatusDead || !h.LastSeen.Before(hostCutoff) {
 					continue
 				}
 				recs, err := repo.List(ctx, h.ID, "", "", 10000)
@@ -311,7 +317,7 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 					// the row pinned forever — control's eager destroy
 					// never returned, and the host-side reconcile-tick
 					// can't drain because the host is gone. Paused rows
-					// are NOT evicted — their R2 bundle is recoverable
+					// are NOT evicted — their durable pause bundle can be restored
 					// on a different host via /resume.
 					if r.Status != models.StatusRunning &&
 						r.Status != models.StatusCreating &&
@@ -322,7 +328,12 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 						log("dead-host-evict: DRY-RUN would destroy %s on dead host %s", r.ID, h.ID)
 						continue
 					}
-					if err := repo.MarkDestroyed(ctx, r.ID, time.Now().UTC(), &note, emitter); err == nil {
+					changed, err := repo.MarkDestroyedOnDeadHost(ctx, r.ID, h.ID, cfg.Region, hostCutoff, time.Now().UTC(), &note, emitter)
+					if err != nil {
+						log("dead-host-evict: sandbox=%s host=%s: %v", r.ID, h.ID, err)
+						continue
+					}
+					if changed {
 						res.DeadHostEvicted++
 						auditEmitter.Emit(ctx, audit.Context{
 							UserID: r.CreatedBy, Actor: "sweeper",
@@ -336,11 +347,10 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 	}
 
 	// --- 7. drain orchestration -------------------------------------------
-	// Operator marks a host as `draining` via the admin endpoint; we pace
-	// the migration from here. For each running sandbox: trigger pause;
-	// for each paused sandbox still pinned to the draining host: kick off
-	// a resume on a fresh host. Idempotent — re-issuing pause on an
-	// already-pausing row is a 409, treated as success.
+	// Hosts marked draining are advanced by runDrain. It requests pauses for
+	// running rows and resumes paused rows associated with the source host.
+	// Accepted pause responses acknowledge the request, not completed capture;
+	// subsequent passes wait for lifecycle state to advance.
 	if cfg.SchedulerClient != nil && cfg.HTTPClient != nil {
 		runDrain(ctx, repo, cfg, &res, log)
 	}
@@ -359,11 +369,8 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 	}
 
 	// --- 9. expired device sessions ---------------------------------------
-	// Device VPN sessions have a short TTL (~5min, refreshed via WG
-	// keepalive). If a client disconnects without DELETE, the row sits
-	// until this sweep drops it. Removal triggers the relay reconciler
-	// to remove the kernel WG peer on its next 5s tick, and the
-	// per-host netreconciler to remove the /32 route on its next tick.
+	// EU removes expired device-session rows. Relay and host reconciliation
+	// subsequently remove peers and routes no longer authorized by those rows.
 	if !cfg.DryRun && cfg.Region == models.EuropeRegion {
 		if devIDs, err := repo.ExpireDeviceSessions(ctx); err != nil {
 			log("expired-sessions: %v", err)
@@ -390,19 +397,19 @@ func Run(ctx context.Context, cfg Config, log func(string, ...any)) (Result, err
 		log("stale-network-memberships: removed %d row(s)", n)
 	}
 
-	log("summary orphan_creating=%d stuck_pausing=%d stuck_resuming=%d stuck_forking=%d orphan_destroying=%d hosts_reaped=%d dead_host_evicted=%d drain_paused=%d drain_resumed=%d drain_destroyed=%d scheduled_revokes=%d expired_sessions=%d stale_network_memberships=%d dry_run=%v",
+	log("summary orphan_creating=%d stuck_pausing=%d stuck_resuming=%d stuck_forking=%d orphan_destroying=%d hosts_reaped=%d dead_host_evicted=%d drain_paused=%d drain_resumed=%d drain_blocked=%d scheduled_revokes=%d expired_sessions=%d stale_network_memberships=%d dry_run=%v",
 		res.OrphanCreating, res.StuckPausing, res.StuckResuming, res.StuckForking, res.OrphanDestroying,
 		res.HostsReaped, res.DeadHostEvicted,
-		res.DrainPaused, res.DrainResumed, res.DrainDestroyed, res.ScheduledRevokes, res.ExpiredSessions,
+		res.DrainPaused, res.DrainResumed, res.DrainBlocked, res.ScheduledRevokes, res.ExpiredSessions,
 		res.StaleNetworkMemberships, cfg.DryRun)
 	return res, nil
 }
 
-// runDrain handles the per-tick drain orchestration. Each sweep run is
-// one tick; the cron schedules the cadence. The per-sandbox pause-retry
-// counter that lived in the long-running ticker is gone — with sweep
-// cadence at ~1 min, pause-trigger failures naturally retry on each
-// tick and the stuck-pausing watchdog catches genuinely-stuck rows.
+// runDrain advances drain migration once per sweep. Failed pause triggers
+// increment the persisted DrainPauseAttempts counter across runs. At the
+// retry limit the sandbox is preserved and the drain requires operator recovery.
+// Accepted triggers reset that counter; later runs observe pause completion
+// and start resume placement. The sweeper does not wait for the VM to run.
 func runDrain(ctx context.Context, repo *models.Repo, cfg Config, res *Result, log func(string, ...any)) {
 	hosts, err := repo.ListHosts(ctx)
 	if err != nil {
@@ -416,12 +423,12 @@ func runDrain(ctx context.Context, repo *models.Repo, cfg Config, res *Result, l
 		Region:   cfg.Region,
 	}
 	for _, h := range hosts {
-		if h.Status != models.HostStatusDraining {
+		if h.Region != cfg.Region || h.Status != models.HostStatusDraining {
 			continue
 		}
 		// ListPinnedToHost: matches `host_id = h.ID` OR (paused AND
 		// `cached_host_id = h.ID`). The second branch is what catches
-		// VMs we already paused this drain pass — MarkPaused wipes
+		// VMs paused during earlier drain passes — MarkPaused wipes
 		// host_id but keeps cached_host_id so locality scoring on
 		// resume can prefer the original host. We rely on that same
 		// breadcrumb to know what's still pending migration.
@@ -445,23 +452,11 @@ func runDrain(ctx context.Context, repo *models.Repo, cfg Config, res *Result, l
 			continue
 		}
 		for _, r := range running {
-			// Past-budget sandboxes fall back to destroy so a host that
-			// keeps refusing pause can't permanently block drain. The
-			// counter survives sweep restarts via the DB column —
-			// in-memory state isn't an option for a CronJob.
+			// Keep the workload intact when pause cannot be started. This running
+			// row continues to prevent drain completion on subsequent passes.
 			if r.DrainPauseAttempts >= drainPauseMaxAttempts {
-				response, err := hostrpc.Destroy(ctx, cfg.HTTPClient, h, r.ID, r.CreatedBy)
-				if err != nil {
-					log("drain: host=%s sandbox=%s: destroy fallback failed: %v", h.ID, r.ID, err)
-					continue
-				}
-				response.Body.Close()
-				if !hostrpc.DestroyAccepted(response) {
-					log("drain: host=%s sandbox=%s: destroy fallback returned %d", h.ID, r.ID, response.StatusCode)
-					continue
-				}
-				log("drain: host=%s sandbox=%s: destroyed after %d failed pauses", h.ID, r.ID, r.DrainPauseAttempts)
-				res.DrainDestroyed++
+				log("drain: host=%s sandbox=%s: blocked after %d failed pauses; sandbox preserved; operator recovery required", h.ID, r.ID, r.DrainPauseAttempts)
+				res.DrainBlocked++
 				continue
 			}
 			response, err := hostrpc.Pause(ctx, cfg.HTTPClient, h, r.ID, r.CreatedBy)

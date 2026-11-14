@@ -197,6 +197,32 @@ func TestTTLEvictYAMLAndCLIStayInSync(t *testing.T) {
 	}
 }
 
+func TestTTLEvictUserMaxAge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ttlevict.yaml")
+	if err := os.WriteFile(path, []byte("region: eu\nmax_age: 24h\nuser_max_age:\n  user-a: 10m\n  user-b: 48h\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := TTLEvictFromContext(configContext(t, TTLEvictFlags(), "--config", path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxAge != 24*time.Hour || cfg.UserMaxAge["user-a"] != 10*time.Minute || cfg.UserMaxAge["user-b"] != 48*time.Hour {
+		t.Fatalf("unexpected TTL config: %+v", cfg)
+	}
+	cfg, err = TTLEvictFromContext(configContext(t, TTLEvictFlags(), "--config", path, "--user-max-age", "user-c=30m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.UserMaxAge) != 1 || cfg.UserMaxAge["user-c"] != 30*time.Minute {
+		t.Fatalf("CLI did not replace YAML overrides: %v", cfg.UserMaxAge)
+	}
+	for _, value := range []string{"user-a=0s", "user-a=-1m", "user-a=invalid", "=10m", "pool=10m", "user-a"} {
+		if _, err := TTLEvictFromContext(configContext(t, TTLEvictFlags(), "--user-max-age", value)); err == nil {
+			t.Errorf("accepted invalid override %q", value)
+		}
+	}
+}
+
 func configContext(t *testing.T, flags []cli.Flag, args ...string) *cli.Context {
 	t.Helper()
 	set := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -233,5 +259,24 @@ func TestEnabledCrossRegionUsers(t *testing.T) {
 				t.Fatalf("users = %v", cfg.EnabledCrossRegionUsers)
 			}
 		})
+	}
+}
+
+func TestMetricsTokenConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.yaml")
+	if err := os.WriteFile(path, []byte("region: eu\nauth:\n  admin_token: operator-secret\n  metrics_token: metrics-secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ControlFromContext(configContext(t, ControlFlags(), "--config", path))
+	if err != nil || cfg.MetricsToken != "metrics-secret" || cfg.AdminToken != "operator-secret" {
+		t.Fatal("separate YAML credentials not loaded", err)
+	}
+	cfg, err = ControlFromContext(configContext(t, ControlFlags(), "--config", path, "--metrics-token", "override"))
+	if err != nil || cfg.MetricsToken != "override" {
+		t.Fatal("CLI override not loaded", err)
+	}
+	_, err = ControlFromContext(configContext(t, ControlFlags(), "--config", path, "--metrics-token", "operator-secret"))
+	if err == nil {
+		t.Fatal("identical operator and metrics tokens accepted")
 	}
 }

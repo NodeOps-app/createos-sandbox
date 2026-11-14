@@ -95,10 +95,10 @@ func OpenDbWithPoolConfig(ctx context.Context, dsn string, poolConfig PoolConfig
 	// queue wait when 100 concurrent creates hit 60/pod × 3 = 180 slots
 	// (each pool_hit does TWO Begins: main claim tx + separate billing
 	// INSERT tx, so 200 concurrent Acquires competing for 180 slots).
-	// 120 per pod leaves enough headroom for the current double-Begin
-	// pattern. Trade-off: ~10 MB of idle backend memory per slot, so size
-	// Postgres max_connections for pods × 120. Revert if pg memory becomes
-	// constrained.
+	// 120/pod × 3 = 360 slots — enough headroom for the current double-Begin
+	// pattern. Trade-off: ~360 × 10 MB ≈ 3.6 GB idle backend footprint,
+	// still safe on the pg pod (max_connections=800). Revert if pg
+	// memory becomes constrained.
 	if cfg.MaxConns < 120 {
 		cfg.MaxConns = 120
 	}

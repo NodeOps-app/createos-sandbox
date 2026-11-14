@@ -12,7 +12,7 @@ const (
 // DeviceRegister captures a new device registration. Pubkey is logged
 // (it's public by construction) so operators can correlate audit
 // entries with later WG handshakes. Private key never leaves the
-// client, so nothing sensitive in this struct.
+// client. Device names and host details still require normal audit access controls.
 type DeviceRegister struct {
 	DeviceID string `json:"device_id"`
 	Name     string `json:"name"`

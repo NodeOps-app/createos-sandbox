@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
 )
 
 // InstrumentInternalRPC labels metrics with registered route templates, never

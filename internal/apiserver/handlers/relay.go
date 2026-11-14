@@ -36,13 +36,13 @@ import (
 	"github.com/oklog/ulid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type deviceViewJSON struct {
@@ -255,22 +255,11 @@ func (h *Handler) HandleDeviceCreate(c *fiber.Ctx) error {
 		}
 	}
 
-	ip, err := h.repo.AssignDeviceIP(ctx, h.region)
-	if err != nil {
-		log.WithContext(c.UserContext()).Errorf("[devices] assign IP: %v", err)
-		return httpx.Error(c, fiber.StatusServiceUnavailable, "internal error")
-	}
-	if ip == "" {
-		return httpx.Fail(c, fiber.StatusServiceUnavailable,
-			types.FieldError{"capacity": "device IP pool exhausted in region"})
-	}
-
 	rec := models.Device{
-		ID:       newDeviceID(),
-		UserID:   userID,
-		Name:     strings.TrimSpace(req.Name),
-		Pubkey:   pubkey,
-		ClientIP: ip,
+		ID:     newDeviceID(),
+		UserID: userID,
+		Name:   strings.TrimSpace(req.Name),
+		Pubkey: pubkey,
 	}
 	if s := strings.TrimSpace(req.Hostname); s != "" {
 		rec.Hostname = &s
@@ -279,8 +268,16 @@ func (h *Handler) HandleDeviceCreate(c *fiber.Ctx) error {
 		rec.OS = &s
 	}
 
-	created, err := h.repo.CreateDevice(ctx, rec)
+	created, err := h.repo.CreateDevice(ctx, rec, h.region)
 	if err != nil {
+		if errors.Is(err, models.ErrDeviceIPExhausted) {
+			return httpx.Fail(c, fiber.StatusServiceUnavailable,
+				types.FieldError{"capacity": "device IP pool exhausted in region"})
+		}
+		if errors.Is(err, models.ErrDeviceIPAllocation) {
+			log.WithContext(ctx).Errorf("[devices] assign IP: %v", err)
+			return httpx.Error(c, fiber.StatusServiceUnavailable, "internal error")
+		}
 		// 23505 = unique_violation. Could be name (per-user) or pubkey.
 		// Differentiate via message so the user knows which to change.
 		msg := err.Error()

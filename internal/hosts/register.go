@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // resolveRegisterAddr computes the "host:port" this serve process advertises

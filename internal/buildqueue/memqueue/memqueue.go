@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/buildqueue"
+	"github.com/NodeOps-app/createos-sandbox/internal/buildqueue"
 )
 
 type entry struct {

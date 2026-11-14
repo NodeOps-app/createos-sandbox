@@ -7,9 +7,9 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 var computerOperations = map[string]struct{}{

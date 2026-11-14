@@ -32,8 +32,8 @@ func newControlRouteClient(bases []string, client *http.Client) *controlRouteCli
 	return &controlRouteClient{bases: bases, client: client}
 }
 
-// sortedControlURLs returns stable, deduplicated control endpoints. Sorting
-// keeps the order deterministic while retaining peer-control fallback.
+// sortedControlURLs returns deduplicated endpoints ordered lexically by
+// region name. This is deterministic fallback order, not locality detection.
 func sortedControlURLs(byRegion map[string]string) []string {
 	regions := make([]string, 0, len(byRegion))
 	for region := range byRegion {

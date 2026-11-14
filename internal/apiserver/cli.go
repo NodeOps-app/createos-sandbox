@@ -11,21 +11,21 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/cache"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/diskcrypto"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/handlers"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/metrics"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/userapikey"
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/clickhouse"
-	"github.com/NodeOps-app/sandbox/internal/createos"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/internal/placementpolicy"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/cache"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/diskcrypto"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/handlers"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/userapikey"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/clickhouse"
+	"github.com/NodeOps-app/createos-sandbox/internal/createos"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/placementpolicy"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Cli is the urfave/cli Action for `control api-server`.
@@ -58,9 +58,9 @@ func Cli(c *cli.Context) error {
 		return err
 	}
 	defer repo.Close()
-	// Per-host pubkey cache feeds InternalJWTMiddleware. Looks up
-	// hosts.public_key + hosts.status; the verifier closure inside
-	// control.Server uses status to refuse JWTs from dead hosts.
+	// Retain the host-key cache for registration invalidation wiring.
+	// Inbound JWT verification resolves only static builder/billing keys;
+	// host RPCs authenticate through mTLS, not this cache.
 	hostPubkeys := cache.NewHostPubkeys(repo, 30*time.Second)
 
 	// Static actor pubkeys for inbound JWT verification. Post-mTLS, only
@@ -158,6 +158,7 @@ func Cli(c *cli.Context) error {
 		PanicMode:                  cfg.PanicMode,
 		DisableDeviceRegistration:  !cfg.DeviceRegistrationEnabled,
 		Resolver:                   resolverFromRepo(repo, apiKeyPepper, cfg.AuthCacheTTL, cfg.ExternalAuthURL, cfg.ExternalAuthTTL),
+		MetricsToken:               cfg.MetricsToken,
 		AdminToken:                 cfg.AdminToken,
 		PromSDToken:                loadPromSDTokenOrDie(cfg.PromSDTokenFile),
 		BootstrapToken:             cfg.BootstrapToken,

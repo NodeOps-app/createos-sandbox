@@ -1,6 +1,6 @@
-// Package audit emits typed lifecycle events to the backend audit log.
-// Internal callers (api_keys.is_internal=true) are persisted to
-// audit_events with is_internal=true so the backend can filter them.
+// Package audit defines typed lifecycle events and metadata for audit emitters.
+// The Postgres emitter skips calls marked IsInternal; other calls are queued
+// for asynchronous delivery by auditshipper.
 //
 // # Sensitive-data policy
 //
@@ -67,9 +67,8 @@ type Context struct {
 	SubjectID   string
 }
 
-// Emit is fire-and-forget: returns without blocking on outbound
-// delivery. Errors are logged, never propagated — audit must not break
-// the happy path of the operation it's recording.
+// Emit persists synchronously but does not wait for outbound delivery.
+// The Postgres implementation logs errors rather than returning them.
 //
 // EmitInTx writes the audit row inside the caller's pgx transaction so
 // business mutation + audit either both commit or both roll back. Used

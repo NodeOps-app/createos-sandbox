@@ -10,17 +10,13 @@ import (
 	"time"
 )
 
-// PublicKeyResolver returns the public key to verify a JWT against. kid is
-// the value from the JWT header (and must match Claims.Iss; the verifier
-// enforces that). Returning (nil, nil) means "no such signer" and the
-// caller emits 401. Returning (nil, err) means the lookup itself failed
-// (e.g. DB error) — caller should emit 503.
+// PublicKeyResolver looks up the key for the JWT header kid, which Verify
+// requires to match Claims.Iss. Nil keys and lookup errors both cause Verify
+// to return an error; HTTP status selection belongs to the caller.
 type PublicKeyResolver func(kid string) (ed25519.PublicKey, error)
 
-// Verifier validates JWTs minted by some Signer in the cluster. Resolver
-// is the strategy that maps `kid` → pubkey; for createos it's typically a
-// closure over the host-pubkey cache plus a static map of operator-role
-// pubkeys (control, ingress, gateway) loaded from config.
+// Verifier validates signatures and validity windows using a caller-supplied
+// resolver. The resolver decides which issuers are trusted.
 type Verifier struct {
 	Resolve PublicKeyResolver
 }
@@ -30,7 +26,7 @@ type Verifier struct {
 // Validation steps (in order):
 //
 //  1. Parse header.payload.signature — must be exactly 3 base64url segments.
-//  2. Decode header — alg must be "EdDSA", typ must be "JWT", kid present.
+//  2. Decode header — alg must be "EdDSA", typ absent/empty or "JWT", kid present.
 //  3. Decode payload into Claims.
 //  4. Enforce header.kid == Claims.Iss (rfc7515 §4.1.4 says kid is a hint;
 //     we make it authoritative-and-must-match the iss claim to prevent any
@@ -38,10 +34,10 @@ type Verifier struct {
 //     another).
 //  5. Resolve the pubkey via Resolve(kid).
 //  6. ed25519.Verify the signature.
-//  7. Check exp > now-leeway and nbf <= now+leeway.
+//  7. Require positive exp, now <= exp+leeway, and nbf <= now+leeway when set.
 //
-// Caller is responsible for additional claim checks (aud, op, sandbox_id) —
-// VerifyExpect helper below does the common case.
+// Caller must enforce audience and resource permissions. VerifyExpect checks
+// audience; Verify does not validate iat, cap token lifetime, or track jti reuse.
 func (v *Verifier) Verify(token string) (*Claims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -121,8 +117,7 @@ func (v *Verifier) Verify(token string) (*Claims, error) {
 
 // VerifyExpect runs Verify and additionally enforces that the claims match
 // the expected audience. Pass "" to skip the check. Per-route operation
-// authorization happens at the handler level (e.g. RequireSandboxOwner
-// for sandbox writes), not in the JWT itself.
+// authorization remains the caller's responsibility.
 func (v *Verifier) VerifyExpect(token, expectedAud string) (*Claims, error) {
 	c, err := v.Verify(token)
 	if err != nil {
@@ -134,10 +129,8 @@ func (v *Verifier) VerifyExpect(token, expectedAud string) (*Claims, error) {
 	return c, nil
 }
 
-// StaticResolver is a convenience PublicKeyResolver that looks up kids in
-// an in-memory map. Suitable for control/ingress/gateway pubkeys loaded
-// from config at startup. For host pubkeys (which live in Postgres), use
-// a closure over the host pubkey cache.
+// StaticResolver looks up keys in the supplied map. It does not copy or lock
+// the map; callers must avoid concurrent mutation while verification runs.
 func StaticResolver(keys map[string]ed25519.PublicKey) PublicKeyResolver {
 	return func(kid string) (ed25519.PublicKey, error) {
 		return keys[kid], nil

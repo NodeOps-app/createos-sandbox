@@ -14,10 +14,10 @@ import (
 	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 const (
@@ -35,22 +35,71 @@ type TemplateConfig struct {
 	ReapInterval time.Duration // 1m default
 }
 
-// TemplateOrchestrator owns the per-host template ext4 cache.
-//
-// EnsureTemplate fetches a template's ext4 from R2 the first time the
-// host needs it, sha256-verifies against the canonical templates row,
-// and registers the on-disk path in vm.Manager.Rootfses so the existing
-// VM boot machinery treats the tpl_id as a regular rootfs name.
-//
-// ReaperLoop runs the same TTL + LRU-disk-budget pattern that
-// pauseresume.CacheReaperLoop uses for paused-bundle locality caches.
-// (EnsureTemplate / ReaperLoop now live as methods on Service.)
+// templateUse protects the interval from template lookup through VM publication.
+// An eviction owns done exclusively; creates wait for it before fetching again.
+type templateUse struct {
+	users int
+	done  chan struct{}
+}
 
-// EnsureTemplate makes sure the template ext4 is on local disk and
-// registered in vm.Manager.Rootfses. Idempotent and concurrency-safe:
-// concurrent calls for the same tpl_id share the single fetch.
-//
-// Returns the local file path on success.
+func (s *Service) useTemplate(ctx context.Context, id string) (func(), error) {
+	for {
+		s.tplMu.Lock()
+		if s.tplUses == nil {
+			s.tplUses = make(map[string]*templateUse)
+		}
+		use := s.tplUses[id]
+		if use != nil && use.done != nil {
+			done := use.done
+			s.tplMu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if use == nil {
+			use = &templateUse{}
+			s.tplUses[id] = use
+		}
+		use.users++
+		s.tplMu.Unlock()
+		return func() {
+			s.tplMu.Lock()
+			defer s.tplMu.Unlock()
+			use.users--
+			if use.users == 0 {
+				delete(s.tplUses, id)
+			}
+		}, nil
+	}
+}
+
+func (s *Service) claimTemplateEviction(id string) (func(), bool) {
+	s.tplMu.Lock()
+	defer s.tplMu.Unlock()
+	if s.tplUses[id] != nil {
+		return nil, false
+	}
+	if s.tplUses == nil {
+		s.tplUses = make(map[string]*templateUse)
+	}
+	done := make(chan struct{})
+	s.tplUses[id] = &templateUse{done: done}
+	return func() {
+		s.tplMu.Lock()
+		defer s.tplMu.Unlock()
+		delete(s.tplUses, id)
+		close(done)
+	}, true
+}
+
+// EnsureTemplate fetches, verifies, and registers a template rootfs on demand.
+// The caller must hold useTemplate until VM creation or restore finishes.
+// Concurrent requests for the same template share one download. Service owns
+// the cache; ReaperLoop applies its TTL and disk-budget eviction policy.
+// Returns the local ext4 path on success.
 func (s *Service) EnsureTemplate(ctx context.Context, tplID, sandboxID string) (string, error) {
 	started := time.Now()
 	fields := log.Fields{
@@ -502,19 +551,32 @@ func (s *Service) runReap(ctx context.Context) {
 // row. Aborts if any active sandbox on this host references the
 // template (safety check mirrors pauseresume.evictLocalCache).
 func (s *Service) evict(ctx context.Context, tplID string) bool {
+	release, ok := s.claimTemplateEviction(tplID)
+	if !ok {
+		return false
+	}
+	defer release()
 	n, err := s.Repo.HostCachedTemplateHasActiveSandbox(ctx, s.TplCfg.HostID, tplID)
 	if err != nil {
 		log.WithContext(ctx).Warnf("[tpl-reaper] safety check %s: %v", tplID, err)
 		return false
 	}
+	// Local publication can precede the database update or its visibility.
+	s.Mgr.Mu.RLock()
+	for _, sb := range s.Mgr.Sandboxes {
+		if sb.Rootfs == tplID {
+			n++
+			break
+		}
+	}
+	s.Mgr.Mu.RUnlock()
 	if n > 0 {
 		// Live workloads still using it; refresh cached_until so we
 		// don't immediately re-attempt every reap interval.
 		_ = s.refreshCacheRow(ctx, tplID)
 		return false
 	}
-	// Drop in-memory entry first so concurrent creates fail fast on
-	// LookupRootfs miss (forcing a re-fetch through EnsureTemplate).
+	// Waiting creates acquire their lease after deletion and fetch again.
 	s.Mgr.RemoveRootfs(tplID)
 	// Drop snapshots for every shape that referenced the template.
 	s.removeTemplateSnapshots(tplID)

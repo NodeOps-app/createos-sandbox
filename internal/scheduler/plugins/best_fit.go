@@ -1,39 +1,15 @@
 package plugins
 
 import (
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// BestFitScorer optimizes for bin-packing density on BIG requests:
-// when a request would consume a significant fraction of a host's
-// capacity in any dimension, prefer hosts where placing it leaves the
-// SMALLEST residual gap. Complements BalancedAllocScorer which spreads
-// load — together they handle both heterogeneous (mix of small + big
-// requests) and homogeneous (all small) workloads correctly.
-//
-// Why a separate scorer instead of folding into BalancedAlloc:
-//
-//	BalancedAlloc says: "pick the host with most headroom on the binder"
-//	BestFit says:       "for big requests, pick the host where the fit
-//	                     is tightest, even if that host has less total
-//	                     headroom"
-//
-// These goals can conflict — a 60 GiB-mem request placed on the
-// emptiest host wastes that host's remaining capacity, but the same
-// request placed on a moderately-loaded host fills the gap perfectly.
-// BestFit pulls toward tight fits; BalancedAlloc pulls toward
-// dispersed load. Their weighted sum produces a hybrid that:
-//   - on small requests: BestFit returns neutral (50) so balanced wins
-//   - on big requests: BestFit dominates with a high signal so
-//     placement lands on a host that fills snugly
-//
-// Threshold for "big" is 20% of the host's effective limit in ANY
-// dimension. Below that, the request is "small" and we don't intervene.
-//
-// Backward-compat: legacy hosts (CPUCount=0, DiskTotalMib=0) score by
-// memory only. Returns 0 when the request wouldn't fit at all
-// (admission filter will reject too, but be defensive).
+// BestFitScorer favors tighter fits for requests using at least 20% of a
+// host's effective limit in a dimension. It scores the highest post-placement
+// utilization among qualifying dimensions, or 50 when all are small.
+// Missing dimensions are skipped; a request exceeding a checked limit scores
+// zero. Other scorers still contribute to the final placement decision.
 type BestFitScorer struct{}
 
 func (BestFitScorer) Name() string { return "best_fit" }
@@ -45,12 +21,8 @@ func (BestFitScorer) Name() string { return "best_fit" }
 // workload is more mixed-size than ours.
 func (BestFitScorer) Weight() int { return 15 }
 
-// bigDimThreshold is the request-to-host-limit ratio above which a
-// request is considered "big" in that dimension. 20% is a
-// conservative middle ground — typical sandbox shapes (1 GiB mem
-// on 120 GiB hosts = 0.8%) stay below, while custom large shapes
-// (60 GiB disk on 936 GiB hosts = 6.4%) approach it, and very large
-// requests (32 GiB mem) blow past it.
+// bigDimThreshold is the minimum request-to-limit ratio for a dimension
+// to contribute to the tight-fit score.
 const bigDimThreshold = 0.20
 
 func (BestFitScorer) Score(req *framework.Request, h *models.Host) int {
@@ -58,11 +30,8 @@ func (BestFitScorer) Score(req *framework.Request, h *models.Host) int {
 		return 0
 	}
 
-	// Track the "biggest" dimension by request-to-limit ratio, and
-	// what that dim's snugness would be (snug = host-becomes-full).
-	// We use the binder-of-this-request dim, not the binder-of-host —
-	// what matters for fragmentation is which dim THIS req fills the
-	// most.
+	// Track maximum post-placement utilization across all dimensions
+	// where the request reaches the threshold.
 	bestSnugness := 0.0
 	anyBigDim := false
 	anyDim := false
@@ -142,7 +111,7 @@ func (BestFitScorer) Score(req *framework.Request, h *models.Host) int {
 		return 0
 	}
 
-	// Small request in every dim → neutral. Balanced decides.
+	// Small request in every dimension: other scorers determine placement.
 	if !anyBigDim {
 		return 50
 	}

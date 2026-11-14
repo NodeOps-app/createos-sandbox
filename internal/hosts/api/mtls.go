@@ -5,12 +5,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 // InstrumentInternalRPC labels metrics with registered route templates, never

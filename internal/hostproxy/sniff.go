@@ -10,13 +10,13 @@ import (
 
 const sniffBufSize = 4096
 
-// SniffHostname peeks up to 4KB of a connection's initial bytes to extract a
-// domain the caller can match against rules. Returns "" if not found within
-// a small timeout.
+// SniffHostname reads once, up to 4 KiB, to extract a hostname for rule
+// matching. A positive timeout sets a read deadline. Fragmented or larger
+// headers may not yield a hostname because the function does not accumulate reads.
 //
 // Supported signals (first one wins):
 //   - TLS ClientHello SNI
-//   - HTTP request-line Host header
+//   - HTTP Host header after a recognized request line
 //
 // The returned buffer contains the bytes already read from conn, which the
 // caller must replay to the upstream connection before splicing.

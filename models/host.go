@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -20,6 +21,10 @@ const (
 	HostStatusDraining HostStatus = "draining" // operator drain in progress; existing VMs being destroyed
 	HostStatusDead     HostStatus = "dead"     // last_seen exceeded the reap window
 )
+
+// HostHeartbeatStaleAfter is shared by scheduler admission and the sweeper.
+// Reject stale hosts during scheduling without waiting for the next sweep.
+const HostHeartbeatStaleAfter = time.Minute
 
 // HostRole names the kind of work a host row does. Stored in
 // hosts.role; defaults to RoleCompute. Every comparison/assignment
@@ -36,13 +41,15 @@ const (
 // Host describes a registered createos host in multi-host mode
 // (mirror of store.HostRecord).
 type Host struct {
-	ID             string `json:"id" sql:"id"`
-	Addr           string `json:"addr" sql:"addr"` // "host:port" of host's internal API
-	MemCapacityMib int    `json:"mem_capacity_mib" sql:"mem_capacity_mib"`
-	InUseMib       int    `json:"in_use_mib" sql:"in_use_mib"`
-	VMCount        int    `json:"vm_count" sql:"vm_count"`
-	Status         string `json:"status" sql:"status"` // "active" | "draining" | "dead"
-	Role           string `json:"role" sql:"role"`     // "compute" | "relay"
+	// Scheduler-only cache hints; never expose other tenants snapshot IDs publicly.
+	CachedSnapshots []proto.CachedSnapshot `json:"-" sql:"-"`
+	ID              string                 `json:"id" sql:"id"`
+	Addr            string                 `json:"addr" sql:"addr"` // "host:port" of host's internal API
+	MemCapacityMib  int                    `json:"mem_capacity_mib" sql:"mem_capacity_mib"`
+	InUseMib        int                    `json:"in_use_mib" sql:"in_use_mib"`
+	VMCount         int                    `json:"vm_count" sql:"vm_count"`
+	Status          string                 `json:"status" sql:"status"` // "active" | "draining" | "dead"
+	Role            string                 `json:"role" sql:"role"`     // "compute" | "relay"
 	// RelayDevicesPubkey is the wg-devices pubkey for role='relay' hosts;
 	// nil/empty for compute hosts. Distinct from WGPublicKey (wg-hosts).
 	RelayDevicesPubkey []byte    `json:"relay_devices_pubkey,omitempty" sql:"relay_devices_pubkey"`
@@ -307,12 +314,20 @@ func RegisterRegion(ctx context.Context, d *database.Db, name string) (int, erro
 	return slot, nil
 }
 
-func HeartbeatHost(ctx context.Context, d *database.Db, id string, inUseMib, vmCount int, status string, diskUsedMib int64, at time.Time) error {
+func HeartbeatHost(ctx context.Context, d *database.Db, id string, inUseMib, vmCount int, status string, diskUsedMib int64, at time.Time, cached ...[]proto.CachedSnapshot) error {
 	q, err := query(d, "heartbeatHost")
 	if err != nil {
 		return err
 	}
-	_, err = d.Con.Exec(ctx, q, id, inUseMib, vmCount, status, diskUsedMib, at)
+	hints := []proto.CachedSnapshot{}
+	if len(cached) > 0 && cached[0] != nil {
+		hints = cached[0]
+	}
+	raw, err := json.Marshal(hints)
+	if err != nil {
+		return err
+	}
+	_, err = d.Con.Exec(ctx, q, id, inUseMib, vmCount, status, diskUsedMib, at, raw, EventHostRecovered)
 	return err
 }
 
@@ -418,7 +433,7 @@ func MarkStaleHosts(ctx context.Context, d *database.Db, cutoff time.Time, regio
 	if err != nil {
 		return 0, err
 	}
-	rows, err := d.Con.Query(ctx, q, cutoff, region)
+	rows, err := d.Con.Query(ctx, q, cutoff, region, EventHostHeartbeatStale)
 	if err != nil {
 		return 0, err
 	}
@@ -432,4 +447,18 @@ func MarkStaleHosts(ctx context.Context, d *database.Db, cutoff time.Time, regio
 		n++
 	}
 	return n, rows.Err()
+}
+
+// HasCachedSnapshot ignores expired hints even between scheduler refreshes.
+// A short margin avoids intentionally selecting an entry already near eviction.
+func (h Host) HasCachedSnapshot(id string, now time.Time) bool {
+	if id == "" {
+		return false
+	}
+	for _, hint := range h.CachedSnapshots {
+		if hint.ID == id && hint.ExpiresAt.After(now.Add(5*time.Second)) {
+			return true
+		}
+	}
+	return false
 }

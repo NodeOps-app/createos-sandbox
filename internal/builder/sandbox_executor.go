@@ -14,7 +14,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 //go:embed sandbox_runner.sh
@@ -124,7 +124,7 @@ func (e *SandboxExecutor) create(ctx context.Context, tplID string) (string, err
 	ingress := false
 	rootfs := e.cfg.Rootfs
 	// Sandbox names are capped at 22 characters. Keep the tail of the ULID,
-	// which contains enough randomness to make concurrent builder names unique.
+	// which carries the random portion. Name uniqueness is enforced by control.
 	idSuffix := strings.ToLower(strings.TrimPrefix(tplID, "tpl_"))
 	if len(idSuffix) > 16 {
 		idSuffix = idSuffix[len(idSuffix)-16:]
@@ -249,7 +249,7 @@ func (e *SandboxExecutor) destroy(ctx context.Context, id string) error {
 	return expectSuccess(resp)
 }
 
-// ListBuildSandboxes discovers build sandboxes from server-side labels. The
+// ListBuildSandboxes discovers running build sandboxes from server-side labels. The
 // dedicated builder API key scopes the listing to sandboxes owned by builder,
 // while the system label excludes any unrelated sandbox owned by that user.
 func (e *SandboxExecutor) ListBuildSandboxes(ctx context.Context) ([]BuildSandbox, error) {

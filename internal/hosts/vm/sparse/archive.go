@@ -1,6 +1,7 @@
 package sparse
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -55,6 +56,12 @@ const (
 // hex sha256 of the archive bytes (computed during write so callers
 // don't have to re-read the dst).
 func WriteArchive(srcPath, dstPath string) (apparent int64, written int64, sha256Hex string, err error) {
+	return WriteArchiveContext(context.Background(), srcPath, dstPath)
+}
+
+// WriteArchiveContext bounds capture work between filesystem operations. A
+// canceled attempt never publishes the destination archive.
+func WriteArchiveContext(ctx context.Context, srcPath, dstPath string) (apparent int64, written int64, sha256Hex string, err error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return 0, 0, "", err
@@ -96,7 +103,7 @@ func WriteArchive(srcPath, dstPath string) (apparent int64, written int64, sha25
 	_ = mw // unused; we'll re-hash at the end below
 
 	src2 := src // keep alias; we Seek on src
-	regionCount, dataBytes, err := iterateSparseRegions(src2, dst, apparent)
+	regionCount, dataBytes, err := iterateSparseRegions(ctx, src2, dst, apparent)
 	if err != nil {
 		dst.Close()
 		return 0, 0, "", err
@@ -132,7 +139,7 @@ func WriteArchive(srcPath, dstPath string) (apparent int64, written int64, sha25
 		return 0, 0, "", err
 	}
 	defer rd.Close()
-	if _, err := io.Copy(hasher, rd); err != nil {
+	if _, err := io.Copy(hasher, archiveContextReader{ctx, rd}); err != nil {
 		return 0, 0, "", err
 	}
 	_ = dataBytes
@@ -146,7 +153,7 @@ func WriteArchive(srcPath, dstPath string) (apparent int64, written int64, sha25
 // [offset(8) | length(8) | bytes(length)] tuples for each data region
 // into dst (sequentially after dst's current position). Returns the
 // number of regions written and the total data bytes copied.
-func iterateSparseRegions(src *os.File, dst *os.File, size int64) (int64, int64, error) {
+func iterateSparseRegions(ctx context.Context, src *os.File, dst *os.File, size int64) (int64, int64, error) {
 	fd := int(src.Fd())
 	var regions int64
 	var dataBytes int64
@@ -180,6 +187,9 @@ func iterateSparseRegions(src *os.File, dst *os.File, size int64) (int64, int64,
 		remaining := regionLen
 		offset := dataAt
 		for remaining > 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
 			n := int64(len(buf))
 			if n > remaining {
 				n = remaining
@@ -291,4 +301,16 @@ func readArchive(srcPath, dstPath string) error {
 		return dst.Sync()
 	}
 	return nil
+}
+
+type archiveContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r archiveContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }

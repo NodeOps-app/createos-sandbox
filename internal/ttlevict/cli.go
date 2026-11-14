@@ -6,15 +6,14 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/diskcrypto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/diskcrypto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// Cli is the urfave/cli Action for `control ttl-evict`. Reads its own
-// dedicated config surface (DSN + max-age + optional disk-credential-key
-// path) — never touches control.yaml. That decoupling means adding or
-// removing a control-plane tuning knob can't crash the evictor.
+// Cli starts the one-shot TTL evictor with its dedicated configuration:
+// database, region, default and per-user TTLs, dry-run mode, and environment
+// decryption key. It does not load the API server's control configuration.
 func Cli(c *cli.Context) error {
 	tcfg, err := config.TTLEvictFromContext(c)
 	if err != nil {
@@ -43,6 +42,7 @@ func Cli(c *cli.Context) error {
 		PostgresDSN: tcfg.PostgresDSN,
 		Region:      tcfg.Region,
 		MaxAge:      tcfg.MaxAge,
+		UserMaxAge:  tcfg.UserMaxAge,
 		DryRun:      tcfg.DryRun,
 	}
 	logf := func(format string, args ...any) {

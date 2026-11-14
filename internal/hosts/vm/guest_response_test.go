@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 func TestGuestLineBounds(t *testing.T) {
@@ -239,5 +239,35 @@ func TestGuestExecCancellation(t *testing.T) {
 				t.Fatal("cancellation did not unblock read promptly")
 			}
 		})
+	}
+}
+
+// Teardown must cancel the old incarnation even when the same sandbox ID is
+// later resumed, and a late transfer registration must inherit cancellation.
+func TestFileTransfersFollowVMTeardown(t *testing.T) {
+	sb := &Sandbox{ID: "test"}
+	mgr := &Manager{Sandboxes: map[string]*Sandbox{"test": sb}}
+	ctx, stop := sb.FileTransferContext(context.Background())
+	defer stop()
+	unlock, ok := mgr.BeginTeardown(sb)
+	if !ok {
+		t.Fatal("teardown rejected")
+	}
+	unlock()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("transfer survived teardown")
+	}
+	late, stopLate := sb.FileTransferContext(context.Background())
+	defer stopLate()
+	if late.Err() == nil {
+		t.Fatal("late transfer accepted on removed incarnation")
+	}
+	fresh := &Sandbox{ID: "test"}
+	next, stopNext := fresh.FileTransferContext(context.Background())
+	defer stopNext()
+	if next.Err() != nil {
+		t.Fatal("new incarnation inherited cancellation")
 	}
 }

@@ -11,14 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
 )
 
 const certificateReloadInterval = 2 * time.Minute
 
 // certificateReloader retains the last complete cert/key pair and periodically
-// checks disk during TLS handshakes. Certificate renewal replaces the two files
-// separately, so a transient mismatched pair must not break new connections.
+// checks disk when a handshake requests a client certificate, at most once
+// every two minutes. Failed reloads retain the last pair; this does not extend
+// that pair's validity or guarantee the peer will accept it.
 type certificateReloader struct {
 	certPath string
 	keyPath  string
@@ -55,9 +56,9 @@ func (r *certificateReloader) get(*tls.CertificateRequestInfo) (*tls.Certificate
 }
 
 // NewTLSConfig builds a TLS 1.3 client configuration with a reloadable client
-// certificate and the supplied CA bundle. It returns nil when any path is
-// empty, preserving plaintext local-development behavior for callers that
-// explicitly allow it.
+// certificate. The supplied CA bundle is added to the system trust roots and
+// loaded once. If any path is empty, it returns nil; the caller determines
+// whether to use plaintext, default TLS, or an existing transport configuration.
 func NewTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error) {
 	if certPath == "" || keyPath == "" || caPath == "" {
 		return nil, nil
@@ -85,7 +86,9 @@ func NewTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error) {
 }
 
 // NewTransport returns a clone of base configured for outbound mTLS. When any
-// TLS path is empty it returns base unchanged.
+// TLS path is empty it returns base unchanged, including nil. With all paths
+// set, a nil base selects http.DefaultTransport, and the clone receives a new
+// TLSClientConfig rather than merging the base's TLS settings.
 func NewTransport(certPath, keyPath, caPath string, base *http.Transport) (*http.Transport, error) {
 	return NewTransportWithVerify(certPath, keyPath, caPath, base, nil)
 }

@@ -11,17 +11,17 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/placementpolicy"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/sandboxlifecycle"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/placementpolicy"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/sandboxlifecycle"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type forkReq struct {
@@ -242,7 +242,7 @@ func (h *Handler) HandleResume(c *fiber.Ctx) error {
 	return nil
 }
 
-// handleFork creates a new sandbox by R2-copying the source bundle.
+// handleFork creates a new sandbox by server-side copying the source bundle.
 // Source must be 'paused'. Default behavior: forking → running. With
 // start_paused=true: forking → paused.
 func (h *Handler) HandleFork(c *fiber.Ctx) error {
@@ -269,7 +269,7 @@ func (h *Handler) HandleFork(c *fiber.Ctx) error {
 			"bandwidth_quota_bytes is not settable at fork; use POST /v1/sandboxes/:id/bandwidth/recharge to grow the quota")
 	}
 
-	// Fork requires R2-backed storage for the server-side bundle copy.
+	// Fork requires object storage for the server-side bundle copy.
 	if h.storage == nil {
 		return httpx.Error(c, fiber.StatusServiceUnavailable, "fork feature not enabled")
 	}
@@ -301,9 +301,8 @@ func (h *Handler) HandleFork(c *fiber.Ctx) error {
 	if src.Status != models.StatusPaused {
 		return httpx.Fail(c, fiber.StatusConflict, "source must be paused")
 	}
-	// Fork happens in the owning region (R2 server-side CopyObject is
-	// within one bucket / region pair). Cross-region requests forward to
-	// the source's region — same scheduler-authority argument as resume.
+	// Fork runs in the source sandbox's region, which owns scheduling and
+	// lifecycle updates. Forward cross-region requests to that control.
 	if src.Region != "" && src.Region != h.region {
 		return h.forwardToPeerControl(c, src.Region, c.Method(), c.Path())
 	}
@@ -366,14 +365,17 @@ func (h *Handler) HandleFork(c *fiber.Ctx) error {
 		newRow.Envs = req.Envs
 	}
 	created, err := h.repo.MarkForking(ctx, srcID, newRow)
+	if errors.Is(err, models.ErrForkSourceUnavailable) {
+		return httpx.Fail(c, fiber.StatusConflict, "source is no longer available for fork")
+	}
 	if err != nil {
 		log.WithContext(c.UserContext()).Errorf("[fork] %s → %s MarkForking: %v", srcID, newID, err)
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 	}
 
-	// Run the R2 copy + (optional) resume in a background goroutine
+	// Run the object copy + (optional) resume in a background goroutine
 	// so the API call returns 202 quickly.
-	go h.runForkBackground(srcID, newID, *src, req.StartPaused)
+	go h.runForkBackground(strings.Clone(srcID), newID, *created, req.StartPaused)
 
 	c.Set("X-Poll-After", "1")
 	view := api.NewSandboxView(*created)
@@ -384,49 +386,72 @@ func (h *Handler) HandleFork(c *fiber.Ctx) error {
 }
 
 func (h *Handler) runForkBackground(srcID, newID string, src models.Sandbox, startPaused bool) {
-	ctx := context.Background()
-
-	srcPrefix := storage.BundlePrefix(srcID)
-	dstPrefix := storage.BundlePrefix(newID)
-	for _, name := range []string{
-		storage.ArtifactMemfile, storage.ArtifactVMState, storage.ArtifactOverlay, storage.ArtifactManifest,
-	} {
+	// Bound the copy independently of the client connection. A separate cleanup
+	// context can still publish failure when the copy deadline has expired.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	published := false
+	defer func() {
+		if !published {
+			h.cleanupFailedFork(newID)
+		}
+	}()
+	srcPrefix, dstPrefix := storage.BundlePrefix(srcID), storage.BundlePrefix(newID)
+	for _, name := range []string{storage.ArtifactMemfile, storage.ArtifactVMState, storage.ArtifactOverlay, storage.ArtifactManifest} {
+		if err := ctx.Err(); err != nil {
+			log.Errorf("[fork] %s copy deadline: %v", newID, err)
+			return
+		}
 		if err := h.storage.Copy(ctx, srcPrefix+name, dstPrefix+name); err != nil {
 			log.Errorf("[fork] %s → %s copy %s: %v", srcID, newID, name, err)
-			copyMsg := "fork copy failed: " + err.Error()
-			if _, mErr := h.repo.MarkForkFailed(ctx, newID, &copyMsg, h.billingEmitter); mErr != nil {
-				log.Errorf("[fork] %s MarkForkFailed: %v", newID, mErr)
-			}
 			return
 		}
 	}
-
-	// New manifest is a byte-identical copy; reuse src's snapshot_manifest.
-	now := time.Now().UTC()
 	uri := "s3://" + dstPrefix
-	if _, err := h.repo.MarkForkPaused(ctx, newID, src.SnapshotManifest, &uri, now, h.billingEmitter); err != nil {
+	status, err := h.repo.MarkForkPaused(ctx, newID, src.SnapshotManifest, &uri, time.Now().UTC(), h.billingEmitter)
+	if err != nil {
 		log.Errorf("[fork] %s MarkForkPaused: %v", newID, err)
-		// Surface the failure rather than leaving the row pinned at
-		// 'forking'. The CAS in MarkForkFailed (WHERE status='forking')
-		// preserves correctness if a concurrent retry won the race.
-		mfMsg := "fork: mark paused failed: " + err.Error()
-		if _, mErr := h.repo.MarkForkFailed(ctx, newID, &mfMsg, h.billingEmitter); mErr != nil {
-			log.Errorf("[fork] %s MarkForkFailed: %v", newID, mErr)
-		}
 		return
 	}
-
+	if status != string(models.StatusPaused) {
+		log.Infof("[fork] %s completion skipped: state changed", newID)
+		return
+	}
+	published = true
 	if startPaused {
 		log.Infof("[fork] %s → %s done (start_paused=true)", srcID, newID)
 		return
 	}
-
-	// Default flow: forking → running. Trigger resume on the new row.
-	// The resume handler will mark resuming + schedule + forward.
-	dummyCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	if err := h.KickoffInternalResume(dummyCtx, newID); err != nil {
+	resumeCtx, stop := context.WithTimeout(context.Background(), 60*time.Second)
+	defer stop()
+	if err := h.KickoffInternalResume(resumeCtx, newID); err != nil {
 		log.Warnf("[fork] %s auto-resume: %v", newID, err)
+	}
+}
+
+func (h *Handler) cleanupFailedFork(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	message := "Unable to create sandbox copy. Please try again."
+	if _, err := h.repo.MarkForkFailed(ctx, id, &message, h.billingEmitter); err != nil {
+		log.Errorf("[fork] %s MarkForkFailed: %v", id, err)
+		return
+	}
+	// A successful/ambiguous publication must never lose its durable bundle.
+	states, err := h.repo.StatusOfIDs(ctx, []string{id})
+	if err != nil {
+		log.Errorf("[fork] %s cleanup status: %v", id, err)
+		return
+	}
+	switch models.Status(states[id]) {
+	case models.StatusFailed, models.StatusDestroying, models.StatusDestroyed:
+	default:
+		return
+	}
+	for _, name := range []string{storage.ArtifactMemfile, storage.ArtifactVMState, storage.ArtifactOverlay, storage.ArtifactManifest} {
+		if err := h.storage.Delete(ctx, storage.BundlePrefix(id)+name); err != nil {
+			log.Warnf("[fork] %s cleanup %s: %v", id, name, err)
+		}
 	}
 }
 
@@ -517,11 +542,6 @@ func (h *Handler) HandleInternalWake(c *fiber.Ctx) error {
 	log.WithContext(c.UserContext()).Infof("[wake] %s resume kicked off (wake-on-request)", id)
 	return httpx.SuccessStatus(c, fiber.StatusAccepted, struct{}{})
 }
-
-// newSandboxID and signer access live in server.go; we re-declare a
-// thin shim here so this file compiles without depending on private
-// helpers. If the project later exposes newSandboxID at package level
-// we can drop this.
 
 func (h *Handler) DbMarkPausing(c *fiber.Ctx) error {
 	var r proto.ControlMarkPausingReq

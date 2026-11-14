@@ -7,10 +7,9 @@ import (
 	"sync"
 )
 
-// PubkeyMap is a static map of "<role>:<id>" → pubkey, populated from
-// operator config files (builder.pub, billing.pub). Hosts' pubkeys
-// are NOT in here — those live in Postgres and are fetched via
-// HostPubkeyResolver (the cache at internal/auth/host_pubkey_cache.go).
+// PubkeyMap stores issuer keys with synchronized map access. Set and Get
+// retain/return the supplied key slices without copying them; callers must
+// treat those slices as immutable.
 type PubkeyMap struct {
 	mu sync.RWMutex
 	m  map[string]ed25519.PublicKey
@@ -51,10 +50,8 @@ func (p *PubkeyMap) Get(kid string) ed25519.PublicKey {
 	return p.m[kid]
 }
 
-// HostPubkeyResolver is a strategy interface implemented by the
-// host-public-key cache. Defined here so this package doesn't import
-// internal/auth (avoids cycle); the wiring layer adapts whatever cache
-// type into one of these.
+// HostPubkeyResolver supplies dynamic host keys without coupling this package
+// to a particular repository or cache implementation.
 type HostPubkeyResolver interface {
 	Lookup(kid string) (ed25519.PublicKey, error)
 }
@@ -64,14 +61,9 @@ type HostResolverFunc func(kid string) (ed25519.PublicKey, error)
 
 func (f HostResolverFunc) Lookup(kid string) (ed25519.PublicKey, error) { return f(kid) }
 
-// CombinedResolver returns a PublicKeyResolver that consults `hosts` for
-// kids beginning with "host:" and `staticActors` for everything else
-// ("ingress:*", "gateway:*", "control:*"). Either side can be nil.
-//
-// This is the single entry point used by control's and host's
-// InternalJWTMiddleware setup — it captures the design decision that
-// hosts are dynamic (registered, cached) and ingress/gateway/control are
-// static (config-loaded).
+// CombinedResolver consults hosts for kids beginning with "host:" and
+// staticActors for all others. Either side can be nil, rejecting that class
+// of issuer. The control server currently supplies nil for hosts.
 func CombinedResolver(hosts HostPubkeyResolver, staticActors *PubkeyMap) PublicKeyResolver {
 	return func(kid string) (ed25519.PublicKey, error) {
 		if strings.HasPrefix(kid, "host:") {

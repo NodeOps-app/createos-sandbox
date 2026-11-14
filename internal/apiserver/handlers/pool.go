@@ -13,24 +13,24 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/metrics"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	schedapi "github.com/NodeOps-app/sandbox/internal/scheduler/api"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	schedapi "github.com/NodeOps-app/createos-sandbox/internal/scheduler/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // matchesPool is strict on purpose: a pool VM is a bare box, so any
 // personalization field must send the request to the normal create
 // path where those fields can actually be applied.
 func matchesPool(cfg config.PoolConfig, req *proto.CreateReq) bool {
-	if !cfg.Enabled {
+	if !cfg.Enabled || req.SnapshotID != nil {
 		return false
 	}
 	spec := cfg.Spec

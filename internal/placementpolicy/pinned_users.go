@@ -3,9 +3,9 @@ package placementpolicy
 
 import "sync"
 
-// Policy pins every new sandbox for a user to Region. PreferredHostIDs are
-// sent to scheduler only when the requested shape appears in Shapes; other
-// shapes use ordinary scheduling within the pinned region.
+// Policy overrides the region for new sandboxes when Region is nonempty.
+// PreferredHostIDs are soft preferences used only when both region and shape
+// match; eligible hosts outside that list remain fallback candidates.
 type Policy struct {
 	Region           string
 	Shapes           []string

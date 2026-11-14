@@ -2,24 +2,17 @@
 // Ed25519 public key, so confidentiality survives transmission over a
 // plaintext channel.
 //
-// It exists so createos services can ship secrets (S3 disk credentials
-// today; future env vars, tokens, etc.) over the existing plain-HTTP
-// RPC between control and hosts without trusting the channel. JWT auth
-// already proves WHO is calling; cryptobox protects WHAT they sent.
+// Callers must authenticate the recipient key and the sender separately.
+// Encryption alone does not prove who sent an envelope or prevent replay.
 //
 // Construction:
-//   - The recipient already owns an Ed25519 long-term keypair (the JWT
-//     signer: pub in hosts.public_key, priv at host_signing.key on disk).
-//     We deterministically derive the matching X25519 keypair from those
-//     bytes — same key material, two different "shapes" — so no new key
-//     files are needed.
-//   - The sender generates a fresh ephemeral X25519 keypair per message,
-//     performs ECDH against the recipient's X25519 pub, derives a
-//     symmetric key with HKDF-SHA256, and seals with ChaCha20-Poly1305.
-//   - The wire envelope carries the ephemeral pubkey + nonce + ciphertext.
-//     The ephemeral private key is discarded as soon as Seal returns —
-//     forward secrecy: a later compromise of the recipient's long-term
-//     key does NOT decrypt previously captured ciphertext.
+//   - Convert the recipient's Ed25519 key material to X25519.
+//   - Generate a fresh ephemeral X25519 keypair and derive a shared secret
+//     against the recipient public key. HKDF-SHA256 derives the
+//     ChaCha20-Poly1305 key.
+//   - Send the ephemeral public key, nonce, and ciphertext. This does not
+//     provide forward secrecy against compromise of the recipient private
+//     key: that key and a captured envelope recover the shared secret.
 //
 // Domain separation:
 //   - Every Seal/Open call takes a Purpose string. Two messages with
@@ -106,8 +99,8 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 }
 
 // Seal encrypts plaintext to the recipient identified by their Ed25519
-// public key. The returned envelope is safe to JSON-marshal and place
-// on a plaintext channel.
+// public key. The envelope is JSON-serializable; sender authentication and
+// replay protection remain the caller's responsibility.
 //
 // Open must be called with the same purpose; mismatched purposes
 // produce different symmetric keys and decryption fails closed.
@@ -124,7 +117,8 @@ func Seal(recipientEd25519Pub ed25519.PublicKey, p Purpose, plaintext []byte) (*
 		return nil, fmt.Errorf("cryptobox: convert recipient pubkey: %w", err)
 	}
 
-	// Ephemeral keypair — random per message, destroyed on return.
+	// Ephemeral keypair, random per message. The local private-key buffer is
+	// cleared after successful ECDH; this is not a guarantee of zeroization.
 	var ephPriv [curve25519.ScalarSize]byte
 	if _, err := io.ReadFull(rand.Reader, ephPriv[:]); err != nil {
 		return nil, fmt.Errorf("cryptobox: read randomness: %w", err)
@@ -160,8 +154,9 @@ func Seal(recipientEd25519Pub ed25519.PublicKey, p Purpose, plaintext []byte) (*
 }
 
 // Open decrypts an envelope sealed by Seal. recipientEd25519Priv is the
-// same private seed used by the JWT signer; conversion to X25519 happens
-// internally.
+// full 64-byte Ed25519 private key, not a raw 32-byte seed. Conversion to
+// X25519 happens internally. Validate wire envelopes with UnmarshalEnvelope
+// before calling Open.
 //
 // Purpose mismatches surface as a generic Open error — the AEAD tag
 // fails. Don't try to "recover" by guessing the right purpose: that's a

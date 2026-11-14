@@ -18,13 +18,13 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
-	"github.com/NodeOps-app/sandbox/internal/trace"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/trace"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func (s *Server) handleCreate(c *fiber.Ctx) error {
@@ -116,7 +116,10 @@ func (s *Server) handleExec(c *fiber.Ctx) error {
 		return s.handleExecStream(c, id, req)
 	}
 
-	resp, err := s.Svc.Exec(c.UserContext(), id, utils.UserID(c), req)
+	ctx, stop := requestctx.WithDisconnect(c.UserContext(), c.Context().Conn())
+	defer stop()
+	c.SetUserContext(ctx)
+	resp, err := s.Svc.Exec(ctx, id, utils.UserID(c), req)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return httpx.Fail(c, fiber.StatusNotFound, "sandbox not found")
@@ -202,7 +205,7 @@ func (s *Server) handleExecStream(c *fiber.Ctx, id string, req proto.ExecRequest
 	// Snapshot — the callback fires on a separate goroutine that may
 	// outlive the request handler. Anything captured from `c` directly
 	// is a panic waiting to happen.
-	capID := id
+	capID := strings.Clone(id)
 	capReq := req
 	svc := s.Svc
 	// Capture the authenticated user_id NOW (from c.Locals stamped by
@@ -213,16 +216,17 @@ func (s *Server) handleExecStream(c *fiber.Ctx, id string, req proto.ExecRequest
 	// ErrNotFound, surfacing to the client as the misleading
 	// "sandbox not found" NDJSON error. The buffered Exec path
 	// inherits c.UserContext() and never hit this.
-	capUserID := utils.UserID(c)
+	capUserID := strings.Clone(utils.UserID(c))
 
 	// Detach from cancellation here: parentCtx is tied to the inbound
 	// request and gets cancelled the moment Fiber recycles c. Long-running
-	// streaming would die immediately. The real cancellation signal is the
-	// broken-pipe write inside the stream loop, propagated downward.
+	// streaming would die immediately. Observe the client socket separately
+	// so silent streams cancel without waiting for broken-pipe writes.
 	// WithoutCancel keeps the request id for log correlation.
 	detached := context.WithoutCancel(c.UserContext())
+	clientConn := c.Context().Conn()
 	c.Response().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
-		ctx, cancel := context.WithCancel(utils.WithUserID(detached, capUserID))
+		ctx, cancel := requestctx.WithDisconnect(utils.WithUserID(detached, capUserID), clientConn)
 		defer cancel()
 		flush := func() { _ = w.Flush() }
 		if err := svc.ExecStream(ctx, capID, capUserID, capReq, w, flush); err != nil {

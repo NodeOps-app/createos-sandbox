@@ -1,15 +1,60 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
+	"github.com/valyala/fasthttp"
 )
+
+func TestHostConnectionErrorsPreserveCauseWithoutRequestSecrets(t *testing.T) {
+	var output bytes.Buffer
+	oldOutput := log.StandardLogger().Out
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+	app := fiber.New()
+	defer app.Shutdown()
+	var err error = &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+	called := false
+	app.Server().ErrorHandler = func(c *fasthttp.RequestCtx, got error) {
+		called = true
+		if got != err {
+			t.Fatalf("original error replaced: %v", got)
+		}
+		c.SetStatusCode(500)
+	}
+	logHostConnectionErrors(app)
+	var c fasthttp.RequestCtx
+	c.Request.Header.Set("Authorization", "Bearer secret-test-token")
+	c.Request.SetRequestURI("/?key=secret-test-token")
+	c.Request.SetBodyString("secret-test-token")
+	app.Server().ErrorHandler(&c, err)
+	if !called || c.Response.StatusCode() != 500 {
+		t.Fatal("existing error handler was not preserved")
+	}
+	got := output.String()
+	if !strings.Contains(got, "connection reset by peer") || !strings.Contains(got, "network_operation=read") {
+		t.Fatalf("missing transport cause: %s", got)
+	}
+	if strings.Contains(got, "secret-test-token") {
+		t.Fatal("request secret leaked into connection log")
+	}
+	output.Reset()
+	err = fmt.Errorf("invalid header: secret-test-token")
+	app.Server().ErrorHandler(&c, err)
+	if strings.Contains(output.String(), "secret-test-token") {
+		t.Fatal("parser error leaked raw request bytes")
+	}
+}
 
 func TestInternalMetricsUseRouteTemplates(t *testing.T) {
 	app := fiber.New()

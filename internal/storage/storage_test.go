@@ -3,12 +3,19 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // memRoundTrip exercises Put -> Get -> Exists -> Copy -> Delete on
@@ -94,39 +101,6 @@ func TestLocalCacheHitMiss(t *testing.T) {
 	}
 }
 
-// TestLocalCachePopulate verifies that GetWithCachePopulate writes
-// the bytes to disk on a miss so the next Get is a hit.
-func TestLocalCachePopulate(t *testing.T) {
-	dir := t.TempDir()
-	ms := NewMemStorage()
-	ctx := context.Background()
-	if err := ms.Put(ctx, "sub/k", bytes.NewReader([]byte("payload")), 7, ""); err != nil {
-		t.Fatal(err)
-	}
-	lc := &LocalCache{Dir: dir, Underlying: ms}
-
-	rc, _, err := lc.GetWithCachePopulate(ctx, "sub/k")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, _ := io.ReadAll(rc)
-	if err := rc.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	if string(got) != "payload" {
-		t.Fatalf("read got=%q", got)
-	}
-
-	// File should exist on disk now.
-	onDisk, err := os.ReadFile(filepath.Join(dir, "sub/k"))
-	if err != nil {
-		t.Fatalf("expected populated cache file: %v", err)
-	}
-	if string(onDisk) != "payload" {
-		t.Fatalf("disk got=%q", onDisk)
-	}
-}
-
 func TestHashingReader(t *testing.T) {
 	hr := NewHashingReader(strings.NewReader("hello world"))
 	_, _ = io.Copy(io.Discard, hr) // strings.Reader never errors; the assertions below cover it
@@ -174,5 +148,117 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 	if err := parsed.VerifyArtifact(ArtifactMemfile, "aaa", 99); err == nil {
 		t.Fatal("expected size mismatch error")
+	}
+}
+
+// A storage backend may accept the body and stall before response headers.
+// The caller's upload deadline must stop the SDK, including its internal retries.
+func TestR2PutDeadlineWhileWaitingForResponse(t *testing.T) {
+	received := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-received:
+		default:
+			close(received)
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(release)
+	store, err := NewR2(R2Config{Endpoint: server.URL, Region: "test", Bucket: "test-bucket", AccessKeyID: "test", SecretAccessKey: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = store.Put(ctx, "snapshot", strings.NewReader("snapshot"), 8, "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected upload deadline, got %v", err)
+	}
+	select {
+	case <-received:
+	default:
+		t.Fatal("server never received upload")
+	}
+}
+
+func TestUploadProgressStopsStallsButAllowsActiveTransfers(t *testing.T) {
+	logger := log.New()
+	logger.SetOutput(io.Discard)
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprint(active), func(t *testing.T) {
+			parent, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer stop()
+			ctx, cancel := context.WithCancelCause(parent)
+			defer cancel(nil)
+			progress := &uploadProgress{start: time.Now()}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				progress.watch(ctx, cancel, log.NewEntry(logger), 150*time.Millisecond, 10*time.Millisecond)
+			}()
+			if active {
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+			loop:
+				for {
+					select {
+					case <-ctx.Done():
+						break loop
+					case <-ticker.C:
+						progress.Read([]byte("progress"))
+					}
+				}
+			}
+			<-done
+			want := errUploadIdle
+			if active {
+				want = context.DeadlineExceeded
+			}
+			if !errors.Is(context.Cause(ctx), want) {
+				t.Fatalf("cause=%v, want %v", context.Cause(ctx), want)
+			}
+		})
+	}
+}
+
+func TestManifestPreservesFirecrackerBuild(t *testing.T) {
+	artifact := ArtifactDescriptor{SHA256: strings.Repeat("a", 64), Size: 1}
+	original, body, err := NewManifest(artifact, artifact, artifact, "overlay", "rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := ParseManifest(body)
+	if err != nil || legacy.FirecrackerBuild != "" {
+		t.Fatalf("legacy manifest: %#v %v", legacy, err)
+	}
+	original.FirecrackerBuild = strings.Repeat("b", 64)
+	body, err = json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, full := range []bool{false, true} {
+		if !full {
+			delete(original.Artifacts, ArtifactMemfile)
+			delete(original.Artifacts, ArtifactVMState)
+			body, err = json.Marshal(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			original.Artifacts[ArtifactMemfile] = artifact
+			original.Artifacts[ArtifactVMState] = artifact
+			body, err = json.Marshal(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		parsed, err := ParseCaptureManifest(body, full)
+		if err != nil || parsed.FirecrackerBuild != original.FirecrackerBuild {
+			t.Fatalf("capture manifest lost build: %#v %v", parsed, err)
+		}
 	}
 }

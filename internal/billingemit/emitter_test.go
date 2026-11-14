@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // fakeShapesProvider is a tiny stand-in for the DB-backed shape cache

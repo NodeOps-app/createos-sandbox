@@ -10,11 +10,11 @@ import (
 
 	"github.com/minio/minio-go/v7"
 
-	"github.com/NodeOps-app/sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/jwt"
 )
 
 // GrantTTL is how long the per-build grants (JWT + presigned URLs)
-// remain valid. Must comfortably exceed the build timeout (10 min)
+// remain valid. This exceeds the default build timeout (10 min)
 // because the build sandbox uses these grants near the end of the build.
 const GrantTTL = 30 * time.Minute
 
@@ -22,14 +22,14 @@ const GrantTTL = 30 * time.Minute
 // Scoped to a single tpl_id; all expire within GrantTTL.
 //
 // Build logs are streamed to control's POST /v1/internal/templates/:id/log
-// (ClickHouse-backed) using the same JWT — no R2 grant needed for logs.
+// (ClickHouse-backed) using the same JWT — no object-storage grant is needed.
 type Grants struct {
 	JWT          string // sub=tpl_<id>, aud=control
-	RootfsPutURL string // R2 PUT signed URL for templates/<id>/rootfs.ext4.zst
+	RootfsPutURL string // S3-compatible PUT signed URL for templates/<id>/rootfs.ext4.zst
 }
 
 // GrantIssuer mints per-build grants. Holds the builder's signing key
-// and an R2 client for pre-signing.
+// and an S3-compatible client for pre-signing.
 type GrantIssuer struct {
 	signer *jwt.Signer
 	bucket string
@@ -41,7 +41,7 @@ func NewGrantIssuer(signer *jwt.Signer, r2 *minio.Client, bucket string) *GrantI
 	return &GrantIssuer{signer: signer, r2: r2, bucket: bucket}
 }
 
-// Issue mints a fresh JWT + two presigned PUT URLs for tplID.
+// Issue mints a fresh JWT and one presigned rootfs PUT URL for tplID.
 func (g *GrantIssuer) Issue(ctx context.Context, tplID string) (*Grants, error) {
 	now := time.Now().UTC()
 	claims := jwt.Claims{

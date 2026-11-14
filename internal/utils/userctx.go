@@ -27,7 +27,7 @@ func SetUserIDHeader(req *http.Request, userID string) {
 }
 
 // GetUserIDHeader returns the X-CreateOS-User-Id header from an inbound
-// fiber request, trimmed. Empty when absent.
+// Fiber request as supplied by Fiber, without additional trimming. Empty when absent.
 func GetUserIDHeader(c *fiber.Ctx) string {
 	return c.Get(HeaderUserID)
 }

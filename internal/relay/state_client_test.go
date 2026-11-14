@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 func TestCachedStateExpiresWithoutRefresh(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 // LogServerErrors emits request metadata and a value-free description of the
@@ -61,8 +61,9 @@ func LogServerErrors(component string) fiber.Handler {
 }
 
 // RequestPeer returns the actual TCP peer and, when present, the identity from
-// its verified mTLS leaf. RemoteAddr is read from the socket rather than from a
-// forwarding header, so an untrusted request cannot spoof the diagnostic.
+// the presented TLS leaf. Certificate verification is the listener's job; this
+// helper does not inspect verified chains. RemoteAddr comes from the connection,
+// not a forwarding header.
 func RequestPeer(c *fiber.Ctx) (remoteAddr, mtlsPeer string) {
 	if addr := c.Context().RemoteAddr(); addr != nil {
 		remoteAddr = addr.String()

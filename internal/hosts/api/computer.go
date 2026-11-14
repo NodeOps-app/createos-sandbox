@@ -10,8 +10,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 const computerPathMarker = "/computer/"
@@ -124,6 +124,13 @@ func validComputerScreenAction(action string) bool {
 // guest service sharing agent port 1028. The service's binary screenshot is
 // preserved verbatim; JSON operations receive the platform's JSend envelope.
 func (s *Server) handleComputerProxy(c *fiber.Ctx) error {
+	ctx, stop, ok := s.beginProcessRequest(c, false)
+	if !ok {
+		c.Set(fiber.HeaderRetryAfter, "1")
+		return httpx.Fail(c, fiber.StatusTooManyRequests, "computer capacity busy")
+	}
+	defer stop()
+	c.SetUserContext(ctx)
 	target, err := s.processTarget(c)
 	if err != nil {
 		return writeProcessTargetError(c, err)

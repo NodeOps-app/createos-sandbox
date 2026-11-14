@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func resumeStringPtr(value string) *string { return &value }

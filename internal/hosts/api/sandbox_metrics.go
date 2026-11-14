@@ -5,8 +5,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
 )
 
 // handleSandboxMetrics returns the on-demand resource snapshot for one

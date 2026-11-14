@@ -10,9 +10,7 @@ const (
 	routeCacheEvictBatch = 512
 )
 
-// cache is a bounded per-id positive/negative TTL cache. Plain RWMutex+map
-// — no sync.Map (the codebase has been bitten by Go's HashTrieMap panic
-// twice already).
+// cache is a bounded per-id positive/negative TTL cache guarded by an RWMutex.
 type cache struct {
 	posTTL time.Duration
 	negTTL time.Duration
@@ -59,8 +57,8 @@ func (c *cache) get(id string) (ingressRoute, bool, bool) {
 // creating/…): those are being actively polled to change, so caching them
 // for the full posTTL would leave the ingress serving a stale "paused"
 // route — and the waking page — for up to posTTL after the sandbox is
-// already running. The short TTL lets the flip to `running` be seen within
-// a poll cycle.
+// already running. The shorter TTL reduces that delay; lookup latency and
+// database replication can still delay observing the state change.
 func (c *cache) putPositive(id string, route ingressRoute, ttl time.Duration) {
 	c.put(id, cacheEntry{route: route, expires: time.Now().Add(ttl)})
 }

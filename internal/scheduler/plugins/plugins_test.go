@@ -7,13 +7,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func active(id string, cap, used, vms, max int, rootfses ...string) models.Host {
 	return models.Host{
-		ID: id, Status: "active", Region: "eu",
+		ID: id, Status: "active", Region: "eu", LastSeen: time.Now(),
 		MemCapacityMib: cap, InUseMib: used, VMCount: vms, MaxVMs: max,
 		Rootfses: rootfses,
 	}
@@ -77,7 +78,7 @@ func TestRootfsFilter_emptyRequestMatchesAny(t *testing.T) {
 
 func TestRootfsFilter_legacyHostMatchesAny(t *testing.T) {
 	hosts := []models.Host{
-		{ID: "legacy", Status: "active", Region: "eu", MemCapacityMib: 4096, Rootfses: nil},
+		{ID: "legacy", Status: "active", LastSeen: time.Now(), Region: "eu", MemCapacityMib: 4096, Rootfses: nil},
 	}
 	p := pipelineNoReserver(t)
 	if _, err := p.Schedule(context.Background(), "sb_test", &framework.Request{MemMiB: 256, Rootfs: "python", Region: "eu"}, hosts); err != nil {
@@ -246,7 +247,7 @@ func TestInMemReserver_reconcileLive(t *testing.T) {
 	h := active("a", 1000, 0, 0, 0)
 	_ = r.Reserve(context.Background(), "sb_aaa", &framework.Request{MemMiB: 200}, &h)
 	// Hydrate sees sb_aaa in the live set → delta should drop it.
-	r.Reconcile(map[string]bool{"sb_aaa": true}, nil, time.Now().Add(-time.Hour))
+	r.Reconcile(nil, map[string]bool{"sb_aaa": true}, nil, time.Now().Add(-time.Hour))
 	if got := r.Snapshot(); len(got) != 0 {
 		t.Errorf("delta after reconcile-live = %+v, want empty", got)
 	}
@@ -257,7 +258,7 @@ func TestInMemReserver_reconcileTerminated(t *testing.T) {
 	defer r.Stop()
 	h := active("a", 1000, 0, 0, 0)
 	_ = r.Reserve(context.Background(), "sb_aaa", &framework.Request{MemMiB: 200}, &h)
-	r.Reconcile(nil, map[string]bool{"sb_aaa": true}, time.Now().Add(-time.Hour))
+	r.Reconcile(nil, nil, map[string]bool{"sb_aaa": true}, time.Now().Add(-time.Hour))
 	if got := r.Snapshot(); len(got) != 0 {
 		t.Errorf("delta after reconcile-terminated = %+v, want empty", got)
 	}
@@ -269,12 +270,12 @@ func TestInMemReserver_reconcileGrace(t *testing.T) {
 	h := active("a", 1000, 0, 0, 0)
 	_ = r.Reserve(context.Background(), "sb_aaa", &framework.Request{MemMiB: 200}, &h)
 	// reservedAt is "now"; cutoff in the past → keeps entry.
-	r.Reconcile(nil, nil, time.Now().Add(-time.Hour))
+	r.Reconcile(nil, nil, nil, time.Now().Add(-time.Hour))
 	if got := r.Snapshot(); got["a"].UsedMib != 232 {
 		t.Errorf("delta should still have entry, got %+v", got)
 	}
 	// cutoff in the future → drops entry.
-	r.Reconcile(nil, nil, time.Now().Add(time.Hour))
+	r.Reconcile(nil, nil, nil, time.Now().Add(time.Hour))
 	if got := r.Snapshot(); len(got) != 0 {
 		t.Errorf("delta after grace expiry = %+v, want empty", got)
 	}
@@ -306,5 +307,86 @@ func TestRegisterBuiltins_buildsDefaultPipeline(t *testing.T) {
 	// Stop the reserver to free its sweeper goroutine.
 	if r, ok := p.Reserver.(*InMemReserver); ok {
 		r.Stop()
+	}
+}
+
+func TestSnapshotCacheCannotBypassPlacementFilters(t *testing.T) {
+	for _, mode := range []string{"capacity", "region", "cordon", "vendor", "host_pin"} {
+		t.Run(mode, func(t *testing.T) {
+			cached := active("cached", 4096, 0, 0, 100, "image")
+			other := active("other", 4096, 0, 0, 100, "image")
+			cached.CPUVendor, other.CPUVendor = "GenuineIntel", "GenuineIntel"
+			cached.CachedSnapshots = []proto.CachedSnapshot{{ID: "snapshot", ExpiresAt: time.Now().Add(time.Minute)}}
+			req := &framework.Request{SnapshotID: "snapshot", MemMiB: 512, Rootfs: "image", Region: "eu", SourceCPUVendor: "GenuineIntel"}
+			switch mode {
+			case "capacity":
+				cached.InUseMib = 4096
+			case "region":
+				cached.Region = "us"
+			case "cordon":
+				cached.SchedulingDisabled = true
+			case "vendor":
+				cached.CPUVendor = "AuthenticAMD"
+			case "host_pin":
+				req.HostID = "other"
+			}
+			p := pipelineNoReserver(t)
+			d, err := p.Schedule(context.Background(), "test", req, []models.Host{cached, other})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.HostID != "other" {
+				t.Fatalf("cache bypassed %s filter", mode)
+			}
+		})
+	}
+}
+
+func TestStatusFilterHeartbeatFreshness(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seen time.Time
+		want bool
+	}{
+		{"fresh", time.Now().Add(-5 * time.Second), true},
+		{"stale active host", time.Now().Add(-models.HostHeartbeatStaleAfter - time.Second), false},
+		{"missing", time.Time{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := active("host", 4096, 0, 0, 100)
+			h.LastSeen = tc.seen
+			pass, reason := (StatusFilter{}).Filter(&framework.Request{}, &h)
+			if pass != tc.want {
+				t.Fatalf("pass=%v reason=%s", pass, reason)
+			}
+			if !pass && !strings.Contains(reason, "heartbeat") {
+				t.Fatalf("missing heartbeat reason: %s", reason)
+			}
+		})
+	}
+}
+
+func TestPipelineRejectsStaleActiveHost(t *testing.T) {
+	p := pipelineNoReserver(t)
+	stale := active("stale", 4096, 0, 0, 100)
+	stale.LastSeen = time.Now().Add(-2 * models.HostHeartbeatStaleAfter)
+	fresh := active("fresh", 4096, 0, 0, 100)
+	req := &framework.Request{Region: "eu", MemMiB: 256, PreferredHostIDs: []string{"stale"}}
+	d, err := p.Schedule(context.Background(), "test", req, []models.Host{stale, fresh})
+	if err != nil || d.HostID != "fresh" {
+		t.Fatalf("decision=%v error=%v", d, err)
+	}
+	req.HostID = "stale"
+	if _, err = p.Schedule(context.Background(), "test", req, []models.Host{stale, fresh}); !errors.Is(err, framework.ErrNoCapacity) {
+		t.Fatalf("pinned stale host: %v", err)
+	}
+	req.HostID = ""
+	if _, err = p.Schedule(context.Background(), "test", req, []models.Host{stale}); !errors.Is(err, framework.ErrNoCapacity) {
+		t.Fatalf("all stale: %v", err)
+	}
+	// A newly received heartbeat makes the same active host eligible again.
+	stale.LastSeen = time.Now()
+	if _, err = p.Schedule(context.Background(), "test", req, []models.Host{stale}); err != nil {
+		t.Fatal(err)
 	}
 }

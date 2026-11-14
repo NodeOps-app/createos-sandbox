@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 // HostCachedTemplate is one row of host_cached_templates — the per-host

@@ -1,4 +1,5 @@
-// Package requestctx carries request and sandbox IDs in context.Context.
+// Package requestctx carries request and sandbox IDs and connection cancellation
+// in context.Context.
 // HTTP helpers and API/host handlers attach the IDs; logging and database
 // tracing read them to correlate operations. Keeping the shared context keys
 // here avoids coupling those consumers to Fiber or API-server packages.

@@ -5,7 +5,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 // shapeMillicores returns the billable CPU allocation for a shape, in

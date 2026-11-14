@@ -3,7 +3,8 @@
 // Postgres advisory locks, and exposes an HTTP API for the control plane.
 //
 // On leadership acquire it hydrates from `sandboxes` (durable record of live
-// VMs) into the framework's reserver, then waits one heartbeat cycle before
+// VMs) into its host cache and reconciles reservations, then waits the
+// configured warming period before
 // opening for traffic. On lock loss it stops accepting Schedule requests
 // until re-elected.
 package scheduler
@@ -17,12 +18,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/leader"
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/internal/scheduler/plugins"
-	"github.com/NodeOps-app/sandbox/internal/vmcapacity"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/leader"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/plugins"
+	"github.com/NodeOps-app/createos-sandbox/internal/vmcapacity"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // State is the readiness state machine. See api.ReadyzResponse for the
@@ -57,7 +58,7 @@ func (s State) String() string {
 type Config struct {
 	LeaderID       string        // identifier for /readyz; defaults to hostname-flavoured "scheduler"
 	WarmingPeriod  time.Duration // default 10s — gap after hydrate before accepting traffic
-	ReservationTTL time.Duration // default plugins.DefaultReservationTTL — applies to both the inmem sweeper and the published ExpiresAtMs
+	ReservationTTL time.Duration // retained for compatibility; reservation cleanup uses ReservationGracePeriod
 
 	// HydrateInterval is the cadence at which the scheduler re-reads the
 	// durable record (listLiveSandboxes + statusOfIDs) to refresh the host
@@ -94,8 +95,8 @@ type Config struct {
 	Repo         *models.Repo
 }
 
-// Instance is the running scheduler. Cheap to construct; call Run with the
-// elector and Repo wired in to start serving.
+// Instance holds scheduler state. The leader elector drives its callbacks;
+// HTTPServer exposes its scheduling and readiness methods.
 type Instance struct {
 	cfg    Config
 	logger *slog.Logger
@@ -111,8 +112,8 @@ type Instance struct {
 	startedAt time.Time
 
 	// hostCache is the metadata view used for filtering. Populated from
-	// listActiveHosts on hydrate and on each pollBackstop tick. Capacity
-	// counters in this cache are the absolute DB-reported values; the
+	// listActiveHosts on initial and periodic hydration. Capacity
+	// counters combine host data with durable live-sandbox sums; the
 	// reserver layers an in-mem delta on top.
 	mu        sync.RWMutex
 	hostCache map[string]models.Host
@@ -203,7 +204,7 @@ func NewInstance(cfg Config) (*Instance, error) {
 	return i, nil
 }
 
-// Stop releases instance-owned resources (sweeper goroutines, etc).
+// Stop calls the reserver cleanup hook; the current in-memory hook is a no-op.
 func (i *Instance) Stop() {
 	if i.reserver != nil {
 		i.reserver.Stop()
@@ -229,10 +230,8 @@ func (i *Instance) LeaderCallbacks() leader.Callbacks {
 	}
 }
 
-// SetEpoch updates the published epoch. Called by the elector wire-up in
-// main_server.go after a successful acquisition (before OnAcquire fires
-// the elector has already incremented its own epoch counter, but our
-// Ready/Schedule paths consume i.epoch which we keep in lockstep here).
+// SetEpoch updates the published epoch. The CLI resets it on acquisition
+// and periodically copies the elector's epoch into this instance.
 func (i *Instance) SetEpoch(e int64) { i.epoch.Store(e) }
 
 // onAcquire is the leader callback. Blocks until ctx is cancelled.
@@ -240,10 +239,8 @@ func (i *Instance) onAcquire(ctx context.Context) error {
 	i.state.Store(int32(StateHydrating))
 	i.logger.Info("hydrating from DB")
 	if err := i.hydrate(ctx); err != nil {
-		// On hydrate failure: stay in Hydrating so /readyz reports it.
-		// Returning here drops out of OnAcquire; the elector keeps the
-		// lock until liveness fails or shutdown. A future tick will
-		// retry hydrate via the poll backstop.
+		// Initial hydration failure is logged, but warm-up still proceeds.
+		// Periodic hydration retries after the instance becomes active.
 		i.logger.Warn("hydrate failed, will retry on backstop tick", slog.String("err", err.Error()))
 	}
 
@@ -276,25 +273,17 @@ func (i *Instance) onAcquire(ctx context.Context) error {
 
 func (i *Instance) onLose() {
 	i.state.Store(int32(StateLostLock))
-	// Drop host cache so a future re-acquire forces a fresh hydrate. The
-	// in-mem reserver's per-host deltas reset when UpsertCounters runs
-	// on the next heartbeat, so they're not actively wrong while we're
-	// not leader — Schedule simply won't run.
+	// Clear host metadata and reject schedules while leadership is lost.
+	// The next acquisition hydrates again and reconciles pending reservations.
 	i.mu.Lock()
 	i.hostCache = make(map[string]models.Host)
 	i.mu.Unlock()
 	i.logger.Info("lost leadership")
 }
 
-// hydrate refreshes the host cache and the reserver's in-mem delta from
-// the durable record. Two queries:
-//  1. listActiveHosts — host metadata (capacity, status, rootfses).
-//  2. listLiveSandboxes — per-row (id, host_id, mem) for creating/running.
-//
-// Aggregates 2 into per-host SUM (drives absolute view) and a per-id
-// seen set (drives reserver.Reconcile). Pending reserver entries that
-// didn't appear in the live set get their durable status looked up so
-// terminal rows drop fast instead of waiting on the grace timer.
+// hydrate loads active hosts, durable live-sandbox usage, and advisory
+// template/snapshot caches. It reconciles pending reservations against live
+// rows, terminal statuses, and the reservation grace cutoff.
 func (i *Instance) hydrate(ctx context.Context) error {
 	hosts, err := i.repo.ListActiveHosts(ctx)
 	if err != nil {
@@ -334,9 +323,13 @@ func (i *Instance) hydrate(ctx context.Context) error {
 		}
 	}
 
+	// Cache inventory is advisory. A read failure disables locality this tick.
+	snapshotsByHost, _ := i.repo.ListHostSnapshotCaches(ctx)
+
 	// Build cache from active hosts; layer in absolute counters.
 	cache := make(map[string]models.Host, len(hosts))
 	for _, h := range hosts {
+		h.CachedSnapshots = snapshotsByHost[h.ID]
 		h.DiskHeadroomMib = diskHeadroomMiB(
 			h.DiskTotalMib,
 			i.cfg.DiskSafetyPercent,
@@ -380,7 +373,7 @@ func (i *Instance) hydrate(ctx context.Context) error {
 				}
 			}
 		}
-		i.reserver.Reconcile(liveSet, terminated, time.Now().Add(-i.cfg.ReservationGracePeriod))
+		i.reserver.Reconcile(cache, liveSet, terminated, time.Now().Add(-i.cfg.ReservationGracePeriod))
 	}
 
 	i.mu.Lock()
@@ -403,8 +396,7 @@ func diskHeadroomMiB(totalMiB int64, safetyPercent int, transientMiB int64) int6
 	return reserve
 }
 
-// refreshHostCache pulls the latest host rows + usage. Called every second
-// by the poll backstop; semantically a partial re-hydrate.
+// refreshHostCache performs a full hydrate on each HydrateInterval tick.
 func (i *Instance) refreshHostCache(ctx context.Context) error {
 	return i.hydrate(ctx)
 }
@@ -492,8 +484,8 @@ func (i *Instance) Release(ctx context.Context, sbID string) error {
 	return i.pipeline.Reserver.Release(ctx, sbID)
 }
 
-// UpsertHostCounters lets the heartbeat fan-out path push authoritative
-// counters into the in-mem reserver.
+// UpsertHostCounters updates cached memory and VM counts. The in-memory
+// reserver retains a no-op compatibility hook; hydration reconciles its deltas.
 func (i *Instance) UpsertHostCounters(hostID string, usedMib, vmCount int) {
 	if i.reserver != nil {
 		i.reserver.UpsertCounters(hostID, usedMib, vmCount)
@@ -510,9 +502,8 @@ func (i *Instance) UpsertHostCounters(hostID string, usedMib, vmCount int) {
 // LeaderID is the identifier the instance reports in /readyz.
 func (i *Instance) LeaderID() string { return i.cfg.LeaderID }
 
-// ReservationTTL is the lifetime of a reservation token. Used by the HTTP
-// handler to compute ExpiresAtMs so the published deadline matches the
-// in-mem sweeper's actual expiry.
+// ReservationTTL returns the legacy configuration value. The current
+// reserver uses ReservationGracePeriod during hydration, not a token timer.
 func (i *Instance) ReservationTTL() time.Duration { return i.cfg.ReservationTTL }
 
 // UptimeMs is milliseconds since NewInstance.

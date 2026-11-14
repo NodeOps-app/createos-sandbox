@@ -12,16 +12,16 @@ const (
 type ExecRequest struct {
 	Cmd  string   `json:"cmd"`
 	Args []string `json:"args,omitempty"`
-	// Env is the per-sandbox env-var map injected by the host's exec
-	// handler before the request hits the agent. Users never set this
-	// directly — the host populates it from the persistent sandbox
-	// envs (sandboxes.envs in the DB). Agent merges into os.Environ().
+	// Env carries the effective environment sent to the guest. The host merges
+	// persisted sandbox values with per-exec overrides, allowing overrides only
+	// for keys declared at sandbox creation. The agent merges it into os.Environ().
 	Env map[string]string `json:"env,omitempty"`
 	// Stream switches the wire protocol from a single buffered
 	// ExecResponse to a stream of newline-delimited ExecStreamEvent
 	// objects. The agent emits one event per stdout/stderr chunk plus
-	// a heartbeat tick, terminating with a final {"exit": N}. Disconnect
-	// at any layer kills the command in the VM.
+	// a heartbeat tick, terminating with a final {"exit_code": N}. Observed
+	// connection closure cancels the command; silent network loss may take
+	// longer to detect.
 	Stream bool `json:"stream,omitempty"`
 	// Stdin is fed to the spawned process's standard input. EOF is
 	// signalled on close, so commands like `cat` see a complete input
@@ -48,8 +48,7 @@ type ExecResponse struct {
 //
 //	{"stdout":"..."}     — stdout chunk
 //	{"stderr":"..."}     — stderr chunk
-//	{"hb":true}          — heartbeat (every 5s; forces a write so a dead
-//	                        peer is noticed within ~5s on silent commands)
+//	{"hb":true}          — heartbeat (every 5s while the stream remains open)
 //	{"exit_code":N}      — terminal frame with the cmd's exit code
 //	{"error":"..."}      — agent-level failure (couldn't start cmd, etc.)
 type ExecStreamEvent struct {

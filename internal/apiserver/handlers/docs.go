@@ -3,7 +3,7 @@ package handlers
 import (
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/docs"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/docs"
 )
 
 func (h *Handler) HandleSwagger(c *fiber.Ctx) error {

@@ -1,22 +1,15 @@
-// Package buildlogs is createos's ClickHouse-backed build log store.
-//
-// Wire model:
-//   - Builder sandbox streams `[stdout|stderr]` lines as NDJSON to
-//     control's POST /v1/internal/templates/:id/log (builder JWT auth).
-//   - Control's handler buffers lines and Append()s to ClickHouse.
-//   - User reader path: GET /v1/templates/:id/logs[?follow=true].
-//     Non-follow returns the full log (capped); follow polls
-//     ClickHouse every 1 s and emits new rows as NDJSON.
-//
-// We use ClickHouse's HTTP interface (port 8123) with JSONEachRow
-// formatted inserts. No native client dep needed — a plain http.Client
-// suffices and we already have one in the standard library.
+// Package clickhouse stores and reads template build logs through the
+// ClickHouse HTTP interface using JSONEachRow. Control handlers provide
+// authenticated ingestion and user-facing log reads; schema migrations are
+// applied separately.
 package clickhouse
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +21,12 @@ import (
 // MaxLineBytes caps any single log line. Larger lines are truncated
 // at the writer; the truncation marker is appended so the user knows.
 const MaxLineBytes = 16 * 1024
+
+// MaxResponseBytes bounds encoded log history per fetch, including JSON escaping.
+// A row count alone permits GiB-sized responses from tenant-generated build logs.
+const MaxResponseBytes = 8 * 1024 * 1024
+
+var ErrResponseTooLarge = errors.New("build log response exceeds byte limit")
 
 // Line is one row in build_logs.
 type Line struct {
@@ -80,12 +79,11 @@ func New(cfg Config) *Client {
 // Bootstrap is a no-op. ClickHouse schema is operator-managed via the
 // standalone goose CLI — see `make migrate-ch-up` / `make migrate-ch-status`.
 // The binary never embeds or runs migrations. Migration files live at
-// internal/buildlogs/migrations_fs/*.sql as plain .sql for goose to read.
+// internal/clickhouse/migrations_fs/*.sql as plain .sql for goose to read.
 func (c *Client) Bootstrap(ctx context.Context) error { return nil }
 
-// Append writes a batch of lines for a single tpl_id. Caller must
-// have called Bootstrap or any other method first; we handle the
-// bootstrap-on-first-call path here too.
+// Append writes a batch of lines for one template, truncating oversized lines.
+// The schema must already exist; Bootstrap does not create it.
 func (c *Client) Append(ctx context.Context, tplID string, lines []Line) error {
 	if len(lines) == 0 {
 		return nil
@@ -124,7 +122,7 @@ func (c *Client) Append(ctx context.Context, tplID string, lines []Line) error {
 	return c.post(ctx, q, &buf)
 }
 
-// GetAll returns lines for tpl_id, oldest first, capped at `limit`.
+// GetAll returns lines for tpl_id ordered by attempt then timestamp, capped at limit.
 // `attempt` filters to one specific build attempt; pass 0 for all
 // attempts (mostly useful for forensic comparisons across retries).
 func (c *Client) GetAll(ctx context.Context, tplID string, attempt uint8, limit int) ([]Line, error) {
@@ -177,10 +175,9 @@ func (c *Client) LatestAttempt(ctx context.Context, tplID string) (uint8, error)
 }
 
 // Tail watches for new lines after `since` and emits them on `out`.
-// Polls every `interval` (default 1s). Returns when ctx is done.
-// `done` may be nil; if non-nil, Tail closes it before returning so
-// the caller can know the goroutine is finished without ranging on
-// `out` to drain.
+// Queries immediately, then polls every interval (default 1s). Returns on
+// cancellation or query/parse error and does not close out. Each query returns
+// at most 5000 rows strictly after the last observed timestamp.
 func (c *Client) Tail(ctx context.Context, tplID string, since time.Time, interval time.Duration, out chan<- Line) error {
 	if interval <= 0 {
 		interval = time.Second
@@ -237,7 +234,7 @@ func (c *Client) post(ctx context.Context, q url.Values, body io.Reader) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		buf, _ := io.ReadAll(resp.Body)
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("clickhouse insert: HTTP %d: %s",
 			resp.StatusCode, truncate(string(buf), 200))
 	}
@@ -258,7 +255,7 @@ func (c *Client) query(ctx context.Context, query string) (io.ReadCloser, error)
 		return nil, err
 	}
 	if resp.StatusCode/100 != 2 {
-		buf, _ := io.ReadAll(resp.Body)
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
 		return nil, fmt.Errorf("clickhouse query: HTTP %d: %s",
 			resp.StatusCode, truncate(string(buf), 200))
@@ -276,9 +273,9 @@ func (c *Client) applyAuth(req *http.Request) {
 
 func escSQL(s string) string {
 	// build_logs.tpl_id is `tpl_<ulid>` — alphanumeric + underscore.
-	// Reject anything that could be a SQL injection. We don't need
-	// anything fancier than this because the query is otherwise built
-	// from constants.
+	// Strip all other bytes before embedding the ID in a quoted SQL literal.
+	// This normalizes the input rather than returning a validation error;
+	// the separately interpolated database name comes from trusted config.
 	out := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -290,12 +287,16 @@ func escSQL(s string) string {
 }
 
 func parseJSONEachRow(r io.Reader) ([]Line, error) {
-	body, err := io.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
+	limited := &io.LimitedReader{R: r, N: MaxResponseBytes + 1}
+	scanner := bufio.NewScanner(limited)
+	// A line can expand sixfold in JSON. Allow metadata space as well.
+	scanner.Buffer(make([]byte, 4096), MaxLineBytes*6+4096)
 	var out []Line
-	for _, raw := range bytes.Split(body, []byte("\n")) {
+	for scanner.Scan() {
+		if limited.N == 0 {
+			return nil, ErrResponseTooLarge
+		}
+		raw := scanner.Bytes()
 		if len(raw) == 0 {
 			continue
 		}
@@ -320,6 +321,12 @@ func parseJSONEachRow(r io.Reader) ([]Line, error) {
 			Line:    row.Line,
 			Attempt: row.Attempt,
 		})
+	}
+	if limited.N == 0 || errors.Is(scanner.Err(), bufio.ErrTooLong) {
+		return nil, ErrResponseTooLarge
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

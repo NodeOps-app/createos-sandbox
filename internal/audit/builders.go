@@ -12,7 +12,7 @@ package audit
 import (
 	"encoding/base64"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func base64Std(b []byte) string {

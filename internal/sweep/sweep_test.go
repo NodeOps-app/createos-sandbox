@@ -3,7 +3,7 @@ package sweep
 import (
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func TestClassifyDrainRowsWaitsForTransitions(t *testing.T) {

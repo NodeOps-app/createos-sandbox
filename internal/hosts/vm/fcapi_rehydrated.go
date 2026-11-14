@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -22,12 +23,54 @@ func NewFirecrackerAPI(socketPath string) *FirecrackerAPI {
 	// persistConn goroutines would outlive the FirecrackerAPI struct
 	// and leak until process exit.
 	tr := &http.Transport{
-		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", socketPath)
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		},
 		DisableKeepAlives: true,
 	}
 	return &FirecrackerAPI{client: &http.Client{Transport: tr}}
+}
+
+const (
+	FirecrackerStatePaused  = "Paused"
+	FirecrackerStateRunning = "Running"
+)
+
+// VMState reads Firecracker's actual state from GET /. Unexpected states and
+// invalid responses are errors, never evidence that a guest has resumed.
+func (a *FirecrackerAPI) VMState(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("get VM state: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get VM state: HTTP %d", res.StatusCode)
+	}
+	const maxStateBytes = 4096
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxStateBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > maxStateBytes {
+		return "", fmt.Errorf("VM state response exceeds size limit")
+	}
+	var info struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return "", fmt.Errorf("decode VM state: %w", err)
+	}
+	switch info.State {
+	case FirecrackerStatePaused, FirecrackerStateRunning:
+		return info.State, nil
+	default:
+		return "", fmt.Errorf("unexpected VM state %q", info.State)
+	}
 }
 
 func (a *FirecrackerAPI) do(ctx context.Context, method, path, body string) error {

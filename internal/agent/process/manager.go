@@ -12,8 +12,9 @@ const (
 	defaultMaxObservers = 64
 )
 
-// Config contains guest-local safety limits. These values are not yet exposed
-// as public API or host configuration; runtime wiring is added in a later chunk.
+// Config contains guest-local limits for managed processes and observers.
+// The agent uses defaults; these values are not exposed as public API or host
+// configuration.
 type Config struct {
 	MaxProcesses     int
 	MaxObservers     int

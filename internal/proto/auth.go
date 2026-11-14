@@ -12,16 +12,15 @@ import (
 // must send before its real payload. Wire form: "AUTH <token>\n".
 const AuthPrefix = "AUTH "
 
-// MaxAuthLine bounds the auth handshake read so a stalled or hostile peer
-// can't slowloris the listener with an unterminated line.
+// MaxAuthLine bounds auth-line memory consumption. Callers must also set a
+// read deadline to bound how long a peer can stall the handshake.
 const MaxAuthLine = 256
 
 // MaxFileUploadBytes is enforced at every hop of the streaming file API.
 const MaxFileUploadBytes int64 = 10 * 1024 * 1024 * 1024
 
 // WriteAuthLine writes "AUTH <token>\n" to w. Host dialers call this as
-// the first write on every connection to the agent's :1024/:1025/:1026
-// listeners.
+// the first write on connections using the agent's AUTH-line protocol.
 func WriteAuthLine(w io.Writer, token string) error {
 	_, err := fmt.Fprintf(w, "%s%s\n", AuthPrefix, token)
 	return err

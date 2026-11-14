@@ -9,9 +9,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm/sparse"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm/sparse"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // RecoverStuckPauses scans pausing rows owned by this host and either
@@ -27,7 +27,7 @@ import (
 // Three outcomes:
 //
 //  1. **Complete**: a manifest and all three matching artifacts exist locally.
-//     Verify the completed bundle, upload to R2, then MarkPaused.
+//     Verify the completed bundle, upload to object storage, then MarkPaused.
 //     The user's `pausing` request becomes invisibly successful.
 //
 //  2. **Fail**: snapshot files incomplete (crash before /snapshot/create
@@ -143,7 +143,7 @@ func (s *Service) completeStuckPause(ctx context.Context, row models.Sandbox) (b
 
 // RecoverStuckResumes scans `resuming` rows owned by this host and
 // retries the resume from where the prior process left off. Much
-// simpler than pause recovery: R2 holds the canonical bundle, so any
+// simpler than pause recovery: Object storage holds the canonical bundle, so any
 // crash before MarkResumed is recoverable by just re-running the
 // resume goroutine — the existing locality cache + sha256 verify
 // inside runResume make it idempotent (skips fetch/decompress when

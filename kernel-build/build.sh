@@ -7,8 +7,9 @@
 # Output: kernel-build/vmlinux  (copy to images/vmlinux when verified)
 set -euo pipefail
 
-KVER="${KVER:-6.12.95}"
-KMAJ="6.x"
+KVER="${KVER:-7.3.1}"
+KMAJ="${KVER%%.*}.x"
+JOBS="${JOBS:-$(nproc)}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "[kbuild] target: linux-${KVER}"
@@ -20,8 +21,10 @@ docker run --rm -v "$here":/out -w /build debian:13-slim bash -euo pipefail -c "
       bc bison flex build-essential libelf-dev libssl-dev \
       curl ca-certificates xz-utils kmod cpio >/dev/null
   echo '[kbuild] downloading linux-${KVER}'
-  curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v${KMAJ}/linux-${KVER}.tar.xz -o linux.tar.xz
-  tar -xf linux.tar.xz
+  curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v${KMAJ}/linux-${KVER}.tar.xz -o linux-${KVER}.tar.xz
+  curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v${KMAJ}/sha256sums.asc -o sha256sums.asc
+  grep -E '^[0-9a-f]{64}  linux-${KVER}\.tar\.xz$' sha256sums.asc | sha256sum -c -
+  tar -xf linux-${KVER}.tar.xz
   cd linux-${KVER}
 
   echo '[kbuild] base config = firecracker reference (6.1) + olddefconfig forward-port'
@@ -42,7 +45,7 @@ docker run --rm -v "$here":/out -w /build debian:13-slim bash -euo pipefail -c "
   [ \"\$fail\" = 0 ] || { echo '[kbuild] FAIL: one or more options not =y'; exit 1; }
 
   echo '[kbuild] compiling vmlinux (this is the slow part)'
-  make -j\"\$(nproc)\" vmlinux >/dev/null
+  make -j${JOBS} vmlinux >/dev/null
 
   echo '[kbuild] post-build: xt_mark in the built objects?'
   ls -la net/netfilter/xt_mark.o 2>&1 || echo 'xt_mark.o NOT BUILT'

@@ -1,18 +1,19 @@
 // Package pool runs the predictive pre-warm sandbox grow/shrink loop.
-// Replicas coordinate via a Postgres advisory lock so only one issues
-// spawns per tick.
+// Each control replica runs a bounded refill loop with capacity-failure backoff.
 package pool
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/metrics"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Spawner is the narrow subset of control-plane ops the loop needs.
@@ -24,11 +25,13 @@ type Spawner interface {
 }
 
 type Pool struct {
-	cfg     config.PoolConfig
-	region  string
-	db      *database.Db
-	spawner Spawner
-	now     func() time.Time // injectable for tests
+	cfg             config.PoolConfig
+	region          string
+	db              *database.Db
+	spawner         Spawner
+	now             func() time.Time // injectable for tests
+	capacityBackoff time.Duration
+	nextGrow        time.Time
 }
 
 func New(cfg config.PoolConfig, region string, db *database.Db, spawner Spawner) *Pool {
@@ -71,6 +74,7 @@ func (p *Pool) tick(ctx context.Context, bucketName string, b config.PoolBucket)
 	// lock would need to pin a Postgres connection for the whole tick,
 	// which under load exhausts the pgxpool and cascades into every
 	// other DB path (auth lookup, heartbeats, sandbox list) failing.
+	// See git history for the freeze that motivated this design.
 	metrics.PoolTarget.WithLabelValues(p.region, p.cfg.Spec.Shape, bucketName).Set(float64(b.Target))
 
 	depth, err := models.CountPoolDepth(ctx, p.db, p.region, p.cfg.Spec.Shape, p.cfg.Spec.DiskMib, p.cfg.Spec.Rootfs)
@@ -80,7 +84,11 @@ func (p *Pool) tick(ctx context.Context, bucketName string, b config.PoolBucket)
 	}
 	metrics.PoolDepth.WithLabelValues(p.region, p.cfg.Spec.Shape).Set(float64(depth))
 
-	if gap := b.Target - depth; gap > 0 {
+	if depth >= b.Target {
+		p.capacityBackoff = 0
+		p.nextGrow = time.Time{}
+	}
+	if gap := b.Target - depth; gap > 0 && !p.now().Before(p.nextGrow) {
 		n := gap
 		if n > p.cfg.PerHostGrowRate {
 			n = p.cfg.PerHostGrowRate
@@ -91,9 +99,16 @@ func (p *Pool) tick(ctx context.Context, bucketName string, b config.PoolBucket)
 			}
 			if _, err := p.spawner.SpawnPoolSandbox(ctx); err != nil {
 				metrics.PoolGrowTotal.WithLabelValues("fail").Inc()
+				if errors.Is(err, client.ErrNoCapacity) {
+					p.capacityBackoff = min(max(5*time.Second, p.capacityBackoff*2), time.Minute)
+					p.nextGrow = p.now().Add(p.capacityBackoff)
+					log.WithContext(ctx).WithField("retry_after", p.capacityBackoff).Warn("[pool] no capacity; delaying refill")
+				}
 				log.WithContext(ctx).Warnf("[pool] spawn: %v", err)
 				return // stop hammering a failing scheduler
 			}
+			p.capacityBackoff = 0
+			p.nextGrow = time.Time{}
 			metrics.PoolGrowTotal.WithLabelValues("ok").Inc()
 		}
 	}
@@ -139,7 +154,8 @@ func (p *Pool) shrinkAged(ctx context.Context) error {
 	return nil
 }
 
-// shrinkExcess destroys n oldest pool sandboxes regardless of age.
+// shrinkExcess attempts to destroy up to n oldest eligible pool sandboxes.
+// Ownership may change after selection; DestroyPoolSandbox rechecks it.
 // Reuses SelectAgedPoolSandboxes with maxAge=0, which yields
 // `created_at < now()` — matches every row. Avoids adding a near-
 // duplicate model function just to change one filter.

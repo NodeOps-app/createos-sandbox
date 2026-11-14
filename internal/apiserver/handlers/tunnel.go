@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 // pkgHostDialTLS is the *tls.Config control uses when dialing hosts for

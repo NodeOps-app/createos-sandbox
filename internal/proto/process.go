@@ -53,7 +53,8 @@ type ProcessOutputSummary struct {
 
 const managedProcessIDRandomBytes = 16
 
-// ValidateManagedProcessID accepts only opaque IDs minted by the guest agent.
+// ValidateManagedProcessID checks the format of opaque guest-agent IDs.
+// It does not prove an ID was issued or authorize access to its process.
 // Public and host proxies call this before interpolating an ID into an upstream
 // URL, preventing encoded separators or path traversal from reaching a router.
 func ValidateManagedProcessID(raw string) error {

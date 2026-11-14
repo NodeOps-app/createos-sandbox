@@ -17,7 +17,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
 )
 
 // validSandboxIDRe matches the gateway's view of a sandbox id: `sb-` prefix
@@ -28,18 +28,14 @@ import (
 // HTTP request line built by openTunnel and the URL in fetchSandbox.
 var validSandboxIDRe = regexp.MustCompile(`^sb-[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$`)
 
-// sandboxPeek is what we unmarshal out of the control-plane JSend
-// response. Field tags match the raw store.Record (capitalized Go field
-// names, no json tags) that the internal DB proxy returns. Callers that
-// used the public api.SandboxView shape would fail to populate these.
+// sandboxPeek decodes the fields used from control's internal sandbox view.
 type sandboxPeek struct {
 	ID         string   `json:"id"`
 	IP         string   `json:"ip"`
 	HostID     string   `json:"host_id"`
 	SSHPubkeys []string `json:"ssh_pubkeys"`
-	// CreatedBy is the user_id of the sandbox owner. Threaded through
-	// to the tunnel JWT's uid claim so the host's requireOwner check
-	// passes (fails closed on empty uid since the security pass).
+	// CreatedBy is retained from the internal view; direct host tunnels
+	// authenticate the gateway certificate rather than a forwarded owner token.
 	CreatedBy string `json:"created_by"`
 	// Status is checked at auth time so a destroyed/destroying/failed
 	// sandbox can't have its lingering ssh_pubkeys honoured. Without
@@ -71,9 +67,8 @@ func (g *Gateway) authPublicKey(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.
 	// auth-error text. Operator-visible reasons stay in the log lines.
 	const opaqueAuthErr = "authentication failed"
 
-	// Per-source-IP rate limit BEFORE any lookup. Closes the timing
-	// channel between "real sandbox" (1 DB read) and "invalid format"
-	// (O(µs) regex reject) once the bucket is drained.
+	// Rate-limit before lookup to bound repeated control requests. This
+	// does not equalize timing between format rejection and database lookup.
 	if g.authLimiter != nil {
 		key := remote
 		if tcpAddr, ok := meta.RemoteAddr().(*net.TCPAddr); ok && tcpAddr != nil {
@@ -89,8 +84,7 @@ func (g *Gateway) authPublicKey(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.
 	if !validSandboxIDRe.MatchString(user) {
 		log.Infof("[gateway] auth remote=%s user=%q fp=%s outcome=reject reason=invalid sandbox id format",
 			remote, user, fp)
-		// Dummy compare so the format-reject path doesn't return
-		// noticeably faster than the post-lookup paths.
+		// Keep a comparison on rejection, without claiming database-equivalent timing.
 		incoming := normalizeKey(key)
 		_ = subtle.ConstantTimeCompare([]byte(incoming), []byte(incoming))
 		return nil, errors.New(opaqueAuthErr)
@@ -101,20 +95,13 @@ func (g *Gateway) authPublicKey(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.
 	if err != nil {
 		log.Infof("[gateway] auth remote=%s user=%s fp=%s outcome=reject reason=%v",
 			remote, user, fp, err)
-		// Burn a constant-time compare against the caller's own key on
-		// the not-found path so timing doesn't trivially separate
-		// "sandbox unknown" from "sandbox known, key not in list".
+		// Compare against the incoming key before the shared rejection response.
 		_ = subtle.ConstantTimeCompare([]byte(incoming), []byte(incoming))
 		return nil, errors.New(opaqueAuthErr)
 	}
 
-	// Only running sandboxes are SSH-reachable. The DB proxy returns
-	// rows for destroyed/destroying/paused/failed sandboxes too —
-	// their ssh_pubkeys array is preserved, so without this gate the
-	// owner (or anyone holding their key) keeps SSH-tunnelling into a
-	// sandbox the API says is gone. Same constant-time dummy compare
-	// as the not-found path so timing doesn't separate "wrong status"
-	// from "no such sandbox".
+	// Only running sandboxes may establish a new SSH session. Other states
+	// can retain authorized keys in the database after access should stop.
 	if sb.Status != "running" {
 		log.Infof("[gateway] auth remote=%s user=%s fp=%s sandbox=%s outcome=reject reason=status=%q",
 			remote, user, fp, sb.ID, sb.Status)
@@ -152,10 +139,8 @@ func (g *Gateway) authPublicKey(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.
 	return nil, errors.New(opaqueAuthErr)
 }
 
-// fetchSandbox calls the control plane and returns the sandbox record
-// (with its authorized pubkeys). Returns an error suitable for surfacing
-// to the SSH client — the fingerprint-tagged log line above has the
-// detail for operators.
+// fetchSandbox reads the internal sandbox view from control. Detailed errors
+// are logged by authPublicKey, which returns an opaque SSH authentication error.
 func (g *Gateway) fetchSandbox(ctx context.Context, id string) (*sandboxPeek, error) {
 	if id == "" {
 		return nil, errors.New("unknown sandbox")

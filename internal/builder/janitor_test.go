@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/buildqueue"
-	"github.com/NodeOps-app/sandbox/internal/buildqueue/memqueue"
+	"github.com/NodeOps-app/createos-sandbox/internal/buildqueue"
+	"github.com/NodeOps-app/createos-sandbox/internal/buildqueue/memqueue"
 )
 
 type janitorExecutor struct {

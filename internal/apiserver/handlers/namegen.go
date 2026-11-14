@@ -4,7 +4,7 @@ import (
 	"math/rand/v2"
 	"strings"
 
-	"github.com/NodeOps-app/sandbox/internal/namesgenerator"
+	"github.com/NodeOps-app/createos-sandbox/internal/namesgenerator"
 )
 
 // maxSandboxNameLen mirrors the cap enforced by validateSandboxName.

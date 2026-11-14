@@ -1,7 +1,7 @@
 package audit
 
-// Admin actions route to a separate backend channel (operator audit ≠
-// tenant audit).
+// Admin action names distinguish operator operations. Delivery routing is
+// owned by the emitter/shipper, not these metadata definitions.
 const (
 	ActionAdminHostCordon      Action = "admin.host.cordon"
 	ActionAdminHostUncordon    Action = "admin.host.uncordon"

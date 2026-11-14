@@ -5,7 +5,7 @@ import (
 	"flag"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 var poolTestDSN = flag.String("pool-test-dsn", "", "disposable PostgreSQL database for pool ownership regression")

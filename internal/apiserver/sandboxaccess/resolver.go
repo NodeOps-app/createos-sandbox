@@ -3,8 +3,8 @@ package sandboxaccess
 import (
 	"context"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/userapikey"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/userapikey"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type ResolvedToken struct {

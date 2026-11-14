@@ -8,8 +8,8 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	cacli "github.com/NodeOps-app/sandbox/internal/ca/cli"
-	"github.com/NodeOps-app/sandbox/internal/logging"
+	cacli "github.com/NodeOps-app/createos-sandbox/internal/ca/cli"
+	"github.com/NodeOps-app/createos-sandbox/internal/logging"
 )
 
 func main() {

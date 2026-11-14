@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	log "github.com/sirupsen/logrus"
 )
 
 // R2Config are the inputs to NewR2. Same shape works for AWS S3,
@@ -48,23 +52,91 @@ func NewR2(cfg R2Config) (*R2, error) {
 }
 
 func (r *R2) Put(ctx context.Context, key string, body io.Reader, size int64, sha256Hex string) error {
+	start := time.Now()
+	entry := log.WithContext(ctx).WithFields(log.Fields{"object": key, "bytes": size})
+	ctx, cancel := context.WithCancelCause(ctx)
+	progress := &uploadProgress{start: start}
+	done := make(chan struct{})
+	go func(ctx context.Context) {
+		defer close(done)
+		progress.watch(ctx, cancel, entry, 3*time.Minute, 30*time.Second)
+	}(ctx)
+	defer func() { cancel(nil); <-done }()
+	// Trace timings only: HTTP headers and URLs may contain storage credentials.
+	// Each SDK retry emits another request_sent event; multipart parts do too.
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			entry.WithFields(log.Fields{"elapsed": time.Since(start), "write_failed": info.Err != nil}).Info("[storage-upload] request_sent")
+		},
+		GotFirstResponseByte: func() {
+			entry.WithField("elapsed", time.Since(start)).Info("[storage-upload] response_started")
+		},
+	})
 	opts := minio.PutObjectOptions{
-		// Multipart auto-engages when size==-1 OR size > 16MiB. We let
-		// the SDK pick the part count — for our typical 1 GB memfile
-		// this lands at ~10 parts of 100 MiB each.
+		// Preserve the SDK's seekable file/multipart path. Wrapping body itself
+		// in a counting reader would hide ReaderAt and change that path.
 		PartSize: 100 * 1024 * 1024,
+		Progress: progress,
 	}
-	// minio-go computes Content-MD5 itself for non-multipart uploads;
-	// for multipart it uses per-part MD5s. The application-level
-	// sha256 we keep in the manifest is verified independently by
-	// the caller (TeeReader) — we don't push it to the server here
-	// because not every S3-compat backend supports x-amz-checksum-sha256
-	// (R2 does; MinIO old versions don't).
+	// sha256Hex is not sent as a server-side checksum assertion. Callers
+	// maintain and verify the manifest checksum independently; the SDK handles
+	// its own transfer protocol checks.
 	_, err := r.cli.PutObject(ctx, r.bucket, key, body, size, opts)
 	if err != nil {
+		fields := log.Fields{"elapsed": time.Since(start), "source_bytes_read": progress.bytes.Load(), "idle_timeout": errors.Is(context.Cause(ctx), errUploadIdle)}
+		var response minio.ErrorResponse
+		if errors.As(err, &response) {
+			// Never log raw messages, headers, or signed URLs from the backend.
+			fields["http_status"] = response.StatusCode
+		}
+		entry.WithFields(fields).Warn("[storage-upload] failed")
+		if errors.Is(context.Cause(ctx), errUploadIdle) {
+			err = errUploadIdle
+		}
 		return fmt.Errorf("r2 put %s: %w", key, err)
 	}
+	entry.WithField("elapsed", time.Since(start)).Info("[storage-upload] completed")
 	return nil
+}
+
+var errUploadIdle = errors.New("storage upload made no progress before idle timeout")
+
+// The SDK calls Read as it consumes each request body. This measures client
+// activity, not remote durability; retries can count the same bytes again.
+// Atomic counters are required because multipart workers run concurrently.
+type uploadProgress struct {
+	start time.Time
+	bytes atomic.Int64
+	last  atomic.Int64
+}
+
+func (p *uploadProgress) Read(b []byte) (int, error) {
+	if len(b) > 0 {
+		p.bytes.Add(int64(len(b)))
+		p.last.Store(time.Since(p.start).Nanoseconds())
+	}
+	return len(b), nil
+}
+
+func (p *uploadProgress) watch(ctx context.Context, cancel context.CancelCauseFunc, entry *log.Entry, idle, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			elapsed := time.Since(p.start)
+			idleFor := elapsed - time.Duration(p.last.Load())
+			entry.WithFields(log.Fields{"elapsed": elapsed, "source_bytes_read": p.bytes.Load(), "idle_for": idleFor}).Info("[storage-upload] progress")
+			// Also bounds waiting for a response after the final body bytes.
+			// The caller's total deadline still applies even if reads continue.
+			if idleFor >= idle {
+				cancel(errUploadIdle)
+				return
+			}
+		}
+	}
 }
 
 func (r *R2) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
@@ -121,11 +193,8 @@ func (r *R2) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if statErr == nil && stat.Size > maxSingleCopyBytes {
 		return r.copyMultipart(ctx, srcKey, dstKey, stat.Size)
 	}
-	// Server-side CopyObject is faster (zero egress) but minio-go v7.1.0
-	// against MinIO 2024-12+ intermittently returns SignatureDoesNotMatch
-	// — known signing-canonical-form mismatch on the x-amz-copy-source
-	// header. Try server-side first; on any signature/auth error fall
-	// back to stream Get → Put.
+	// Prefer server-side copy. The signature-error fallback below streams
+	// through this client; other errors are returned without that fallback.
 	_, err := r.cli.CopyObject(ctx,
 		minio.CopyDestOptions{Bucket: r.bucket, Object: dstKey},
 		minio.CopySrcOptions{Bucket: r.bucket, Object: srcKey},
@@ -167,8 +236,8 @@ const maxSingleCopyBytes int64 = 5 * 1024 * 1024 * 1024
 //
 // Part size is 256 MiB — well above R2's 5 MiB min-part floor and
 // small enough to keep the per-part API call quick while staying
-// under the 10 000-part composeObject ceiling for up-to-2.5 TiB
-// sources. For a 6 GiB overlay this is 24 parts.
+// under 10,000 parts for sources below roughly 2.44 TiB.
+// For a 6 GiB overlay this is 24 parts.
 func (r *R2) copyMultipart(ctx context.Context, srcKey, dstKey string, size int64) error {
 	const partSize int64 = 256 * 1024 * 1024
 	var srcs []minio.CopySrcOptions

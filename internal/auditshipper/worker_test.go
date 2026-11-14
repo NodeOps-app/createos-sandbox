@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type auditTestTransport func(*http.Request) (*http.Response, error)

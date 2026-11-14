@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 func TestSandboxExecutorRunAndCleanup(t *testing.T) {

@@ -15,10 +15,10 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/hosts/wg"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/wg"
 )
 
 // Relay is the runtime state for `control relay`. In-memory state is
@@ -217,8 +217,8 @@ func ipKeyU32(s string) (uint32, error) {
 	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3]), nil
 }
 
-// reconcileDevicePeers reads active device_sessions bound to this
-// relay and applies the wg-devices peer set to match. Removed sessions
+// reconcileDevicePeers applies the active sessions from the control snapshot
+// to the wg-devices peer set. Removed sessions
 // → peer removed from kernel; new sessions → peer added.
 func (r *Relay) reconcileDevicePeers(state *relayState) error {
 	peers := state.Sessions

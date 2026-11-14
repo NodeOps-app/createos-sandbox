@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 const (

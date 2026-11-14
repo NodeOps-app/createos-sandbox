@@ -2,9 +2,10 @@ package models
 
 import (
 	"context"
+	"errors"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 // Device is one row of the devices table — a registered user machine
@@ -48,30 +49,41 @@ type RelaySessionPeer struct {
 	ExpiresAt time.Time
 }
 
-// AssignDeviceIP allocates the next CGNAT /32 in the user's region.
-// Returns "" if the per-region /18 is exhausted.
-func AssignDeviceIP(ctx context.Context, d *database.Db, region string) (string, error) {
-	q, err := query(d, "assignDeviceIP")
-	if err != nil {
-		return "", err
-	}
-	var ip string
-	return ip, d.Con.QueryRow(ctx, q, region).Scan(&ip)
-}
+var (
+	ErrDeviceIPExhausted  = errors.New("device IP pool exhausted")
+	ErrDeviceIPAllocation = errors.New("device IP allocation failed")
+)
 
-func CreateDevice(ctx context.Context, d *database.Db, rec Device) (*Device, error) {
+// CreateDevice allocates an IP and inserts the device in one transaction.
+// Rejected registrations must not permanently consume allocator capacity.
+func CreateDevice(ctx context.Context, d *database.Db, rec Device, region string) (*Device, error) {
+	alloc, err := query(d, "assignDeviceIP")
+	if err != nil {
+		return nil, errors.Join(ErrDeviceIPAllocation, err)
+	}
 	q, err := query(d, "createDevice")
 	if err != nil {
 		return nil, err
 	}
+	tx, err := d.Con.Begin(ctx)
+	if err != nil {
+		return nil, errors.Join(ErrDeviceIPAllocation, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, alloc, region).Scan(&rec.ClientIP); err != nil {
+		return nil, errors.Join(ErrDeviceIPAllocation, err)
+	}
+	if rec.ClientIP == "" {
+		return nil, ErrDeviceIPExhausted
+	}
 	var out Device
-	err = d.Con.QueryRow(ctx, q,
-		rec.ID, rec.UserID, rec.Name, rec.Pubkey, rec.ClientIP, rec.Hostname, rec.OS,
-	).Scan(
-		&out.ID, &out.UserID, &out.Name, &out.Pubkey, &out.ClientIP,
-		&out.Hostname, &out.OS, &out.CreatedAt, &out.LastSeenAt, &out.RevokedAt,
+	err = tx.QueryRow(ctx, q, rec.ID, rec.UserID, rec.Name, rec.Pubkey, rec.ClientIP, rec.Hostname, rec.OS).Scan(
+		&out.ID, &out.UserID, &out.Name, &out.Pubkey, &out.ClientIP, &out.Hostname, &out.OS, &out.CreatedAt, &out.LastSeenAt, &out.RevokedAt,
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &out, nil

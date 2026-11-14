@@ -1,7 +1,7 @@
 // Package renew implements a background goroutine that watches a leaf
 // cert on disk and, when it gets close to expiring, mints a fresh
-// keypair + CSR, ships the CSR to control, and atomically replaces
-// the on-disk cert + key + CA bundle with the signed reply.
+// keypair + CSR, ships the CSR to control, and replaces the on-disk cert,
+// key, and CA bundle. Each file replacement is atomic; the set of files is not.
 //
 // The renewer is host-only. Callers supply an *http.Client pre-wired
 // with the bootstrap credential required by the host CSR endpoint; the
@@ -25,7 +25,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
 )
 
 // Renewer watches a leaf cert and renews it before it expires.
@@ -45,8 +45,8 @@ type Renewer struct {
 	// `https://<ip>:9090` (without IP SANs the handshake fails with
 	// "doesn't contain any IP SANs"). Always populate ExtraIPs with
 	// the host's own routable IP; ExtraDNS optional. The renewer
-	// also inherits SANs from the current cert as a fallback, but
-	// these explicit values win.
+	// inherits SANs from the current cert only when both explicit lists
+	// are empty; supplying either list suppresses that fallback.
 	ExtraDNS []string
 	ExtraIPs []net.IP
 }

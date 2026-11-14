@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 
 	"github.com/jackc/pgx/v5"
 )

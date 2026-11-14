@@ -1,33 +1,14 @@
 package plugins
 
 import (
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// BalancedAllocScorer scores a host by its post-placement DOMINANT
-// resource utilization (the highest util across cpu/mem/disk).
-// Higher score = lower peak utilization after placing this request.
-//
-// This is Dominant Resource Fairness (DRF) scoring — the same
-// principle Mesos and k8s use for multi-dim bin-packing. The intuition:
-//
-//	placing a request on host H consumes (vcpu, mem, disk) units
-//	the BINDER is whichever dim ends up most utilized
-//	we want to spread placements so no host's binder spikes
-//
-// Without this, the existing LeastUsedPctScorer (memory-only) would
-// happily pile sandboxes onto a host with 90% CPU committed but 30%
-// mem used — eventually the OvercommitFilter starts rejecting at CPU,
-// and meanwhile other hosts' memory sits unused. This scorer picks the
-// host where ALL dimensions stay balanced, draining CPU and memory
-// proportionally.
-//
-// Backward-compat: legacy hosts with CPUCount=0 or DiskTotalMib=0 fall
-// back to memory-only scoring, matching LeastUsedPctScorer behavior.
-//
-// Returns 0..100 like other scorers; framework's weighted sum still
-// works correctly.
+// BalancedAllocScorer favors lower maximum post-placement utilization across
+// the available CPU, memory, and disk commitment limits. Missing dimensions
+// are skipped; the resulting score is clamped to 0..100. This measures
+// resource commitments, not instantaneous CPU or disk activity.
 type BalancedAllocScorer struct{}
 
 func (BalancedAllocScorer) Name() string { return "balanced_alloc" }

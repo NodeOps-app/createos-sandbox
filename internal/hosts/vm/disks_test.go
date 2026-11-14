@@ -3,8 +3,8 @@ package vm
 import (
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func TestAllDiskReportsSettled(t *testing.T) {

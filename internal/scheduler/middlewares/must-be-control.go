@@ -3,19 +3,18 @@ package middlewares
 import (
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
 )
 
-// schedulerAudience is the JWT audience the scheduler accepts. Only the
-// control plane calls the scheduler, and it signs its JWTs aud=scheduler.
+// schedulerAudience is the audience expected by the optional JWT middleware.
+// The current scheduler HTTP server does not install this middleware.
 const schedulerAudience = "scheduler"
 
-// MustBeControl requires the request to come from the control plane,
-// proven by an Ed25519-signed JWT with aud=scheduler. The scheduler
-// service exposes no user-facing routes — control is its only client.
-// On success the JWT's iss and claims are stamped into c.Locals. A nil
-// verifier disables the gated endpoints (503).
+// MustBeControl verifies a JWT with aud=scheduler when installed on a route.
+// It stores verified issuer/claims in c.Locals and rejects requests with 503
+// when no verifier is configured. The current server uses listener mTLS
+// instead of this application-level middleware.
 func (m *Middleware) MustBeControl() fiber.Handler {
 	if m.JWTVerifier == nil {
 		return func(c *fiber.Ctx) error {

@@ -1,14 +1,6 @@
-// Package billingemit implements the BillingEmitter interface declared
-// in models. Lifted out of the handlers package so every Mark* model
-// function can record a billing_events row in the SAME transaction as
-// the status mutation, without the models package taking a dependency
-// on handlers / shapes / clickhouse / etc.
-//
-// The emitter owns the payload-shaping logic that used to live in
-// Handler.emitBillingEvent. Sweep, the host db-proxy paths, and the
-// user-facing control handlers all share the same Emitter so a status
-// change emits a billing event exactly once per Mark*, regardless of
-// which actor triggered it.
+// Package billingemit records lifecycle billing events in the transaction
+// supplied by model status updates. Atomicity and duplicate prevention depend
+// on the caller's guarded state transition; delivery is handled separately.
 package billingemit
 
 import (
@@ -23,10 +15,10 @@ import (
 	"github.com/oklog/ulid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // ShapesProvider is the narrow interface needed to bill burstable
@@ -37,18 +29,17 @@ type ShapesProvider interface {
 	Shapes(ctx context.Context) []proto.Shape
 }
 
-// Emitter records billing_events rows atomically with the caller's
-// status-mutation transaction. Always emits when non-nil; internal
-// users get an internal_skip stamp inside the same tx so the worker
-// skips delivery (audit row remains). Construct one at process start
-// and share — methods are safe for concurrent use (no internal state).
+// Emitter records billing events in the caller's transaction. Internal request
+// contexts and pool rows are skipped. For other contexts, a database check can
+// mark the inserted event internal_skip so delivery is suppressed. Construct
+// once and share without mutating DB or Shapes.
 type Emitter struct {
 	DB     *database.Db
 	Shapes ShapesProvider
 }
 
-// New constructs an Emitter. Pass nil at call sites (e.g. tests) to
-// disable emission entirely — EmitInTx no-ops on a nil receiver.
+// New constructs an Emitter. A nil Shapes provider uses vCPU-based billing.
+// To disable emission, pass a nil *Emitter to model callers instead.
 func New(db *database.Db, shapes ShapesProvider) *Emitter {
 	return &Emitter{DB: db, Shapes: shapes}
 }
@@ -84,26 +75,15 @@ type billingSandbox struct {
 	ForkedFrom          string     `json:"forked_from,omitempty"`
 }
 
-// EmitInTx satisfies models.BillingEmitter. Called by the Mark*
-// functions inside their own status-mutation transaction so the
-// billing_events insert + the status flip share atomicity. Always
-// emits when the receiver is non-nil; internal users get an
-// internal_skip stamp inside the same tx so the worker skips delivery.
-//
-// On error, the caller MUST roll back the tx — emit failure means the
-// status mutation must not commit. This is the atomicity guarantee.
-//
-// nil receiver (tests), missing sandbox row → no-op (returns nil).
+// EmitInTx inserts an event in the caller's status-mutation transaction.
+// Callers must roll back on error. Nil receivers, internal request contexts,
+// missing sandbox rows, and unclaimed pool rows are no-ops. Database-identified
+// internal users retain an event stamped internal_skip.
 func (e *Emitter) EmitInTx(ctx context.Context, tx pgx.Tx, sandboxID, eventType, prevStatus string) error {
 	if e == nil {
 		return nil
 	}
-	// Internal users (is_internal=true API key) bypass the billing
-	// pipeline entirely — no billing_events row, no is_internal DB
-	// lookup, no internal-skip UPDATE. The downstream billing service
-	// would drop these anyway; skipping in-tx removes ~50 ms per claim
-	// under contention. Async re-emission for internal audit history
-	// is a follow-up; for now the row simply doesn't exist.
+	// Internal request contexts bypass both the row lookup and event insert.
 	if utils.IsInternalFromContext(ctx) {
 		return nil
 	}
@@ -185,7 +165,7 @@ func (e *Emitter) EmitInTx(ctx context.Context, tx pgx.Tx, sandboxID, eventType,
 // millicores. Burstable shapes (CPUQuotaPct > 0) bill the fractional
 // quota; dedicated shapes bill VCPU * 1000. Falls back to VCPU * 1000
 // for unknown shape strings (or when the shapes provider hasn't been
-// wired) so we never emit zero.
+// wired); the fallback is zero if the supplied vcpu is zero.
 func (e *Emitter) shapeMillicores(ctx context.Context, shape string, vcpu int) int {
 	if e.Shapes != nil {
 		for _, s := range e.Shapes.Shapes(ctx) {
@@ -201,7 +181,8 @@ func (e *Emitter) shapeMillicores(ctx context.Context, shape string, vcpu int) i
 }
 
 // newBillingEventID mints `evt_<26-char crockford base32 ulid>` —
-// monotonic w.r.t. the supplied timestamp so receivers can sort.
+// time-sortable by the supplied millisecond timestamp. Random suffixes do not
+// preserve generation order within the same millisecond.
 func newBillingEventID(t time.Time) (string, error) {
 	id, err := ulid.New(ulid.Timestamp(t), rand.Reader)
 	if err != nil {

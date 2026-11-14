@@ -9,7 +9,7 @@ import (
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // ErrSandboxNotFound is returned by AttachDiskLive / DetachDiskLive when

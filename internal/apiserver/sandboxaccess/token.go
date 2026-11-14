@@ -9,7 +9,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/userapikey"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/userapikey"
 )
 
 const (

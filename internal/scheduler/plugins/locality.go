@@ -1,12 +1,12 @@
 package plugins
 
 import (
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // LocalityBaseWeight is the contribution-at-zero-utilization for a
-// cached host. Configurable globally so operators can tune via env.
+// cached host. It is a package variable, not an environment setting.
 // Default 50 = at idle, locality contributes 50 score points; at
 // 50% loaded → 25; at 90% loaded → 5; at full → 0. The taper is
 // what avoids hot-spotting cached hosts under burst.
@@ -45,7 +45,8 @@ func (LocalityScorer) Score(req *framework.Request, h *models.Host) int {
 
 // ExcludeHostsFilter drops candidates that previously failed to
 // resume this bundle. Used by the resume host-rotation logic so the
-// scheduler doesn't keep picking the same broken host.
+// scheduler prefers other eligible hosts. The pipeline retries without this
+// exclusion if the full filter pass finds no candidates.
 type ExcludeHostsFilter struct{}
 
 func (ExcludeHostsFilter) Name() string { return "exclude_hosts" }

@@ -14,8 +14,8 @@ import (
 )
 
 // Sign returns "sha256=<hex>" — the canonical X-CreateOS-Signature
-// header value. Including the timestamp prevents replay; receivers
-// reject deliveries whose timestamp skew exceeds their tolerance.
+// header value. The timestamp is authenticated but this function enforces no
+// replay policy: receivers must check freshness and deduplicate as needed.
 func Sign(secret, body []byte, ts time.Time) string {
 	mac := hmac.New(sha256.New, secret)
 	fmt.Fprintf(mac, "%d.", ts.Unix())

@@ -13,18 +13,26 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
-const agentProcessPort = 1028
+const (
+	agentProcessPort = 1028
+	// Guest wait requests permit up to 30 seconds; allow time for transport.
+	processRequestTimeout     = 45 * time.Second
+	maxSandboxProcessRequests = 16
+	maxHostProcessRequests    = 64
+)
 
 type processCreateReq struct {
 	Cmd  string             `json:"cmd"`
@@ -55,17 +63,19 @@ func processAgentClient(token string) *http.Client {
 			if err != nil {
 				return nil, err
 			}
+			_ = connection.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := proto.WriteAuthLine(connection, token); err != nil {
 				_ = connection.Close()
 				return nil, fmt.Errorf("write auth line: %w", err)
 			}
+			_ = connection.SetWriteDeadline(time.Time{})
 			return connection, nil
 		},
-		DisableKeepAlives: true,
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: processRequestTimeout,
 	}
-	// Managed processes may outlive an ordinary request. Wait and connect own
-	// their lifetime through request cancellation and therefore must not inherit
-	// a client-wide deadline.
+	// Streams can remain open after headers. Buffered routes add a total
+	// request deadline; all routes observe downstream socket cancellation.
 	return &http.Client{Transport: transport}
 }
 
@@ -117,6 +127,13 @@ func processGuestURL(target processAgentTarget, path, query string) string {
 }
 
 func (s *Server) handleProcessProxy(c *fiber.Ctx) error {
+	ctx, stop, ok := s.beginProcessRequest(c, false)
+	if !ok {
+		c.Set(fiber.HeaderRetryAfter, "1")
+		return httpx.Fail(c, fiber.StatusTooManyRequests, "process capacity busy")
+	}
+	defer stop()
+	c.SetUserContext(ctx)
 	target, err := s.processTarget(c)
 	if err != nil {
 		return writeProcessTargetError(c, err)
@@ -217,20 +234,32 @@ func writeProcessAgentResponse(c *fiber.Ctx, status int, body []byte) error {
 }
 
 func (s *Server) handleProcessConnect(c *fiber.Ctx) error {
+	ctx, stop, ok := s.beginProcessRequest(c, true)
+	if !ok {
+		c.Set(fiber.HeaderRetryAfter, "1")
+		return httpx.Fail(c, fiber.StatusTooManyRequests, "process capacity busy")
+	}
+	c.SetUserContext(ctx)
+	streaming := false
+	defer func() {
+		if !streaming {
+			stop()
+		}
+	}()
 	target, err := s.processTarget(c)
 	if err != nil {
 		return writeProcessTargetError(c, err)
 	}
 
 	// Fiber recycles its request context after the handler returns. The stream
-	// owns the upstream connection and closes it when copying finishes or the
-	// downstream writer fails.
+	// owns the cancellation watcher and upstream connection until copying ends.
+	// Socket cancellation also interrupts a silent upstream response.
 	guestPath := processGuestPath(c)
 	if guestPath == "" {
 		return httpx.Fail(c, fiber.StatusBadRequest, "invalid process id")
 	}
 	request, err := http.NewRequestWithContext(
-		context.WithoutCancel(c.UserContext()),
+		ctx,
 		http.MethodGet,
 		processGuestURL(target, guestPath, string(c.Request().URI().QueryString())),
 		nil,
@@ -254,7 +283,9 @@ func (s *Server) handleProcessConnect(c *fiber.Ctx) error {
 
 	copyProcessResponseHeaders(c, response)
 	c.Status(response.StatusCode)
+	streaming = true
 	c.Response().SetBodyStreamWriter(fasthttp.StreamWriter(func(writer *bufio.Writer) {
+		defer stop()
 		defer response.Body.Close()
 		buffer := make([]byte, 32<<10)
 		for {
@@ -296,4 +327,47 @@ func copyProcessResponseHeaders(c *fiber.Ctx, response *http.Response) {
 			c.Set(header, value)
 		}
 	}
+}
+
+// Admission is shared by process and computer requests, including streams.
+// Cancellation stops the HTTP observation, not the managed guest process.
+func (s *Server) beginProcessRequest(c *fiber.Ctx, streaming bool) (context.Context, func(), bool) {
+	id := strings.Clone(c.Params("id"))
+	s.processMu.Lock()
+	if s.processCount >= maxHostProcessRequests || s.processRequests[id] >= maxSandboxProcessRequests {
+		s.processMu.Unlock()
+		return nil, nil, false
+	}
+	if s.processRequests == nil {
+		s.processRequests = make(map[string]int)
+	}
+	s.processCount++
+	s.processRequests[id]++
+	s.processMu.Unlock()
+
+	parent := c.UserContext()
+	if streaming {
+		// The writer outlives Fiber's handler context. Retain values but use
+		// the actual socket to detect disconnects throughout the stream.
+		parent = context.WithoutCancel(parent)
+	}
+	ctx, stopDisconnect := requestctx.WithDisconnect(parent, c.Context().Conn())
+	cancel := func() {}
+	if !streaming {
+		ctx, cancel = context.WithTimeout(ctx, processRequestTimeout)
+	}
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			cancel()
+			stopDisconnect()
+			s.processMu.Lock()
+			defer s.processMu.Unlock()
+			s.processCount--
+			s.processRequests[id]--
+			if s.processRequests[id] == 0 {
+				delete(s.processRequests, id)
+			}
+		})
+	}, true
 }

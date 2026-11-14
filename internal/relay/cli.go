@@ -24,7 +24,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/config"
 )
 
 // Cli is the urfave/cli Action for `control relay`.

@@ -3,7 +3,7 @@ package handlers
 import (
 	"context"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // ShapesProvider is the narrow interface the handlers use to read the

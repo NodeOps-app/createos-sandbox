@@ -40,7 +40,7 @@ func Run(image, outputPath string, sizeMB int64, agentBinary string) error {
 	// `image` may be either a registry ref (`python:3.12-slim` →
 	// `docker://...`) OR a full skopeo URI (`docker-daemon:foo:bar`,
 	// `docker-archive:/path`, etc.). We detect the latter by the
-	// presence of a `xxx:yyy:zzz` pattern with a known transport prefix,
+	// presence of a recognized transport prefix,
 	// to let operators bake locally-built images without pushing.
 	fmt.Printf("[1/4] Pulling %s ...\n", image)
 	src := image

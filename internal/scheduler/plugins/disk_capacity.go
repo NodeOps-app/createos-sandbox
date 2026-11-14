@@ -1,6 +1,6 @@
 package plugins
 
-import "github.com/NodeOps-app/sandbox/models"
+import "github.com/NodeOps-app/createos-sandbox/models"
 
 // DiskCommitLimitMiB returns the maximum logical VM disk commitment after
 // sparse-disk overcommit, with physical operational headroom subtracted once.

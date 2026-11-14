@@ -6,7 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type passFilter struct{ name string }
@@ -71,7 +72,7 @@ func (r *recordingReserver) Release(_ context.Context, sbID string) error {
 	delete(r.reserved, sbID)
 	return nil
 }
-func (r *recordingReserver) Reconcile(_, _ map[string]bool, _ time.Time) {}
+func (r *recordingReserver) Reconcile(_ map[string]models.Host, _, _ map[string]bool, _ time.Time) {}
 func (r *recordingReserver) PendingIDs() []string {
 	out := make([]string, 0, len(r.reserved))
 	for id := range r.reserved {
@@ -215,5 +216,46 @@ func TestRegistry_UnknownPlugin(t *testing.T) {
 	_, err := reg.BuildPipeline(PipelineSpec{Filters: []string{"nope"}})
 	if !errors.Is(err, ErrUnknownPlugin) {
 		t.Errorf("err = %v, want ErrUnknownPlugin", err)
+	}
+}
+
+func TestSnapshotCacheLocalityFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name                                string
+		filtered, conflict, expired, policy bool
+		want                                string
+	}{
+		{name: "cached beats score", want: "cached"},
+		{name: "filtered cache", filtered: true, want: "other"},
+		{name: "reservation conflict", conflict: true, want: "other"},
+		{name: "expired hint", expired: true, want: "other"},
+		{name: "operator policy wins", policy: true, want: "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hosts := mkHosts("cached", "other")
+			expiry := time.Now().Add(time.Minute)
+			if tc.expired {
+				expiry = time.Now().Add(-time.Second)
+			}
+			hosts[0].CachedSnapshots = []proto.CachedSnapshot{{ID: "snapshot", ExpiresAt: expiry}}
+			req := &Request{SnapshotID: "snapshot"}
+			p := &Pipeline{Scorers: []Scorer{&idScorer{winner: "other"}}}
+			if tc.filtered {
+				p.Filters = []Filter{&rejectFilter{rejectID: "cached"}}
+			}
+			if tc.conflict {
+				p.Reserver = &recordingReserver{failOn: "cached", conflict: true}
+			}
+			if tc.policy {
+				req.PreferredHostIDs = []string{"other"}
+			}
+			d, err := p.Schedule(context.Background(), "test", req, hosts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.HostID != tc.want {
+				t.Fatalf("host=%s want=%s", d.HostID, tc.want)
+			}
+		})
 	}
 }

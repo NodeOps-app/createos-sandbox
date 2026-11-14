@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/agent/computer"
-	agentprocess "github.com/NodeOps-app/sandbox/internal/agent/process"
+	"github.com/NodeOps-app/createos-sandbox/internal/agent/computer"
+	agentprocess "github.com/NodeOps-app/createos-sandbox/internal/agent/process"
 )
 
 // processPort is the guest-internal HTTP API for managed pipe and PTY

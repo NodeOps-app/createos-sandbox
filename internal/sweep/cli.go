@@ -9,12 +9,14 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
-	"github.com/NodeOps-app/sandbox/internal/placementpolicy"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/diskcrypto"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/placementpolicy"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Cli is the urfave/cli Action for `control sweep`. Reads its own
@@ -26,8 +28,21 @@ func Cli(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	// Sandbox row decoding needs the same environment cipher as control.
+	// Without it, encrypted envelopes abort the entire drain-host query.
+	if scfg.DiskCredentialKeyPath != "" {
+		key, err := diskcrypto.LoadKeyFromFile(scfg.DiskCredentialKeyPath)
+		if err != nil {
+			return fmt.Errorf("sweep disk credential key: %w", err)
+		}
+		cipher, err := diskcrypto.New(key)
+		if err != nil {
+			return fmt.Errorf("sweep disk credential key: %w", err)
+		}
+		models.SetEnvCipher(cipher)
+	}
 	// Sweep runs separately from the API server, so it must load placement
-	// policies itself to preserve user host restrictions during drain resumes.
+	// policies itself to apply user placement rules during drain resumes.
 	configuredPolicies := make(map[string]placementpolicy.Policy, len(scfg.PlacementPolicies))
 	for userID, policy := range scfg.PlacementPolicies {
 		configuredPolicies[userID] = placementpolicy.Policy{
@@ -46,7 +61,7 @@ func Cli(c *cli.Context) error {
 		StuckTransitionAge: scfg.StuckTransitionAge,
 	}
 	// Hosts run mTLS-only when TLS is configured. The sweep dials hosts
-	// directly (drain pass) using hostrpc.Pause / Destroy,
+	// directly during drain for pause and resume,
 	// so flip the package-level scheme to https when the internal TLS
 	// bundle is wired — otherwise plain http hits the host's TLS listener
 	// and fails.
@@ -74,7 +89,7 @@ func Cli(c *cli.Context) error {
 	if scfg.SchedulerURL != "" {
 		var hostTr *http.Transport
 		if scfg.InternalTLSCertPath != "" {
-			// Drain calls hosts directly for pause, resume, and destroy; those
+			// Drain calls hosts directly for pause and resume; those
 			// endpoints require a control-role client certificate. Configure the
 			// control leaf certificate here; this loads it without issuing a
 			// separate sweeper certificate. Database-only
@@ -98,8 +113,8 @@ func Cli(c *cli.Context) error {
 		})
 		// Sweep is short-lived so wait synchronously for the first probe
 		// instead of relying on control's background ticker. If it fails
-		// the drain pass sees ErrSchedulerUnavailable and skips — the
-		// other sweep passes still run.
+		// resume scheduling sees ErrSchedulerUnavailable. Drain may still
+		// trigger pauses, and the other sweep passes still run.
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		ok := cfg.SchedulerClient.ProbeSync(probeCtx)
 		probeCancel()

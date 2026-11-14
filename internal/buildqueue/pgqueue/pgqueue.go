@@ -9,8 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/NodeOps-app/sandbox/internal/buildqueue"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/buildqueue"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // New returns a buildqueue.Queue backed by the templates table.
@@ -74,15 +74,15 @@ func (q *pgQueue) Complete(ctx context.Context, tplID string, o buildqueue.Outco
 		return err
 	}
 	if id == "" {
-		// CAS missed — runner already PATCHed the row past 'building'.
-		// Treat as success: the terminal state is recorded.
+		// CAS missed: the row no longer matched the building-state update.
+		// Treat this as an idempotent no-op; it does not prove a successful build.
 		return nil
 	}
 	return nil
 }
 
 // Reap marks every `building` row older than maxAge as failed. No
-// retries — see buildqueue.Queue.Reap for rationale.
+// retries are enqueued by this method.
 func (q *pgQueue) Reap(ctx context.Context, maxAge time.Duration) (failed []string, err error) {
 	cutoff := time.Now().UTC().Add(-maxAge)
 	return q.repo.ReapStuckBuilds(ctx, cutoff)

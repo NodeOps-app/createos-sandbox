@@ -74,6 +74,16 @@ var HostCreatePhaseSeconds = prometheus.NewHistogramVec(
 	[]string{"phase"},
 )
 
+// SnapshotCapturePhaseSeconds uses fixed worker phases, never sandbox IDs.
+var SnapshotCapturePhaseSeconds = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "createos_snapshot_capture_phase_seconds",
+		Help:    "Snapshot capture and upload phase wall-clock duration, including failed phases.",
+		Buckets: prometheus.ExponentialBuckets(0.001, 2, 22),
+	},
+	[]string{"operation", "phase"},
+)
+
 // ── Resource pools ───────────────────────────────────────────────────
 
 // NetPoolDepth tracks the NetPool's free-slot count. Falling near 0
@@ -248,6 +258,7 @@ func init() {
 		SandboxRunning,
 		SpawnPhaseSeconds,
 		HostCreatePhaseSeconds,
+		SnapshotCapturePhaseSeconds,
 		NetPoolDepth,
 		SnapshotReady,
 		FirecrackerConcurrent,
@@ -332,9 +343,9 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 
 	mux.Handle("/metrics", requireToken(handler))
 
-	// /debug/pprof/* — token-gated runtime introspection. Lets operators
-	// fetch a goroutine dump live to diagnose leaks. Token gate is the same as /metrics so we don't
-	// expose stack traces or heap profiles to the public internet.
+	// /debug/pprof/* exposes runtime diagnostics through the same optional
+	// bearer-token gate as /metrics. With an empty token these routes are
+	// unauthenticated; deployments must configure the token and restrict access.
 	//
 	// Common probes:
 	//   curl -H "Authorization: Bearer $TOKEN" http://host:9091/debug/pprof/goroutine?debug=1

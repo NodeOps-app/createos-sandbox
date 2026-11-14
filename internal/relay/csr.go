@@ -20,8 +20,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // csrConfig is the input for firstIssueCert. Stripped to first-time

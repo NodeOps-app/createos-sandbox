@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 func TestForwardBuildsSanitizedHostRequest(t *testing.T) {

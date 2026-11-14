@@ -11,10 +11,10 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
 )
 
 // hostScopedRole reports whether the caller's role must be scoped to

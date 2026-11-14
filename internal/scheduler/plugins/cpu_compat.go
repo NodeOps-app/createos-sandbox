@@ -1,27 +1,14 @@
 package plugins
 
 import (
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// CPUCompatFilter rejects candidate hosts whose CPU vendor differs from
-// the source host's (the host that paused the sandbox). Cold-create
-// requests have an empty SourceCPUVendor and pass through transparently.
-//
-// Why: firecracker bakes the source host's CPUID into vmstate at
-// snapshot time. Resuming on a different vendor (AMD → Intel, e.g.)
-// SIGILLs the guest the moment it touches an instruction the target
-// CPU doesn't advertise (SHA-NI fast paths in curl, AVX-512 in numpy,
-// etc.). Pinning the resume to the source vendor is the cleanest fix
-// short of using a CPU template at create time — and our firecracker
-// SDK (v1.0.0) only exposes Intel templates, so vendor pinning is the
-// only working option for a mixed AMD+Intel fleet.
-//
-// Status: wired into plugins.DefaultPipelineSpec().Filters. Control
-// populates framework.Request.SourceCPUVendor at resume-request build
-// time (placementpolicy.BuildResumeScheduleRequest) from the row's cpu_vendor
-// lineage, with the origin host's live vendor as a fallback.
+// CPUCompatFilter requires a matching destination CPU vendor when the
+// request carries the source snapshot's vendor. Empty source vendors impose
+// no constraint. Matching vendors alone do not prove restore compatibility:
+// CPU features, TSC scaling, KVM state, and the snapshot runtime still matter.
 type CPUCompatFilter struct{}
 
 func (CPUCompatFilter) Name() string { return "cpu_compat" }
@@ -32,10 +19,7 @@ func (CPUCompatFilter) Filter(req *framework.Request, h *models.Host) (bool, str
 		return true, ""
 	}
 	if h.CPUVendor == "" {
-		// Candidate host hasn't reported its vendor yet (just registered,
-		// running pre-2026-05-22 code, etc.). Conservative: refuse —
-		// better a clear "no compatible host" 503 than a silent SIGILL
-		// after resume.
+		// Fail closed when the destination has not reported its vendor.
 		return false, "candidate host has no cpu_vendor recorded"
 	}
 	if h.CPUVendor != req.SourceCPUVendor {
@@ -44,17 +28,11 @@ func (CPUCompatFilter) Filter(req *framework.Request, h *models.Host) (bool, str
 	return true, ""
 }
 
-// CPUCompatScorer is a SOFT preference for same-vendor hosts on
-// non-resume schedules. Returns a fixed bonus when source and candidate
-// vendors match; zero otherwise. Useful as a tie-breaker so that even
-// fresh creates land on hosts whose vendor matches the user's other
-// sandboxes (locality of future pause/resume options).
-//
-// Status: NOT YET in the default pipeline; see CPUCompatFilter.
+// CPUCompatScorer adds a soft preference for a matching SourceCPUVendor.
+// It returns zero when the request omits the vendor and does not inspect the
+// user's other sandboxes. It is not part of the default pipeline.
 type CPUCompatScorer struct {
-	// Wt controls how much a vendor match contributes. Default 1 keeps
-	// it as a tie-breaker; raise to outrank locality if you want fresh
-	// creates to actively avoid mixed-vendor scenarios.
+	// Wt scales the vendor-match score; nonpositive values use weight 1.
 	Wt int
 }
 

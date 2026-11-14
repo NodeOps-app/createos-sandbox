@@ -56,8 +56,8 @@ func SSHKeyComment(authorizedKey string) string {
 	return comment
 }
 
-// First line only, capped — multi-line errors and stack traces have
-// historically leaked secrets (paths in panics, env-var dumps in stderr).
+// TruncateError keeps only the first line and caps its length. It does not
+// redact secrets within that line; callers must supply safe error text.
 func TruncateError(s string) string {
 	if s == "" {
 		return ""

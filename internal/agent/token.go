@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // authReadDeadline bounds how long a connection has to deliver its
@@ -22,20 +22,20 @@ var (
 	tokenReady  = make(chan struct{})
 )
 
-// setToken stores the per-VM secret on first delivery via MMDS. First
-// non-empty token wins; later pushes are ignored (token never rotates
-// within a VM lifetime).
+// setToken applies the host's MMDS secret. A full snapshot restored as a new
+// VM must replace the captured source token. Ordinary pushes are idempotent;
+// tokenReady closes only on the first delivery.
 func setToken(t string) {
 	if t == "" {
 		return
 	}
 	tokenMu.Lock()
 	defer tokenMu.Unlock()
-	if secretToken != "" {
-		return
-	}
+	first := secretToken == ""
 	secretToken = t
-	close(tokenReady)
+	if first {
+		close(tokenReady)
+	}
 }
 
 // checkToken constant-time compares against the stored secret. Returns
@@ -56,8 +56,8 @@ func checkToken(got string) bool {
 //
 // Blocks on tokenReady so a connection that arrives between accept and
 // the first MMDS push waits up to authReadDeadline for the token to
-// land. In normal operation the agent's 2 ms MMDS poll has already
-// stored the token long before any host-side dial.
+// land. Once the MMDS watcher stores the first token, later connections
+// pass this readiness gate immediately.
 func authenticateConn(c net.Conn) *bufio.Reader {
 	deadline := time.Now().Add(authReadDeadline)
 	_ = c.SetReadDeadline(deadline)

@@ -1,8 +1,7 @@
-// Package auditshipper drains audit_events and POSTs each pending row
-// to the backend audit-log endpoint. Direct clone of internal/billing.Worker
-// — same claim/mark/bump state machine, exponential backoff, multi-
-// replica safety via FOR UPDATE SKIP LOCKED. No external cursor; the
-// table itself is the queue.
+// Package auditshipper delivers pending audit_events with retry backoff.
+// FOR UPDATE SKIP LOCKED coordinates workers sharing one database, not
+// separate regional databases. A successful POST followed by a failed commit
+// can be delivered again; the receiver must deduplicate by event ID.
 package auditshipper
 
 import (
@@ -18,9 +17,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/internal/hmacsign"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/internal/hmacsign"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type Worker struct {

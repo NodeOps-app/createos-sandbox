@@ -1,15 +1,14 @@
-// Package plugins contains the in-tree scheduler plugins that ship with
-// createos. Filters and scorers preserve the exact behaviour of the
-// previous monolithic Pick in internal/apiserver/scheduler.go; the InMem
-// reserver replaces the in-memory delta map that used to live on Server.
+// Package plugins provides the scheduler's built-in admission filters,
+// placement scorers, and in-memory capacity reservations.
 package plugins
 
 import (
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // PendingCapFilter hard-rejects hosts that already have too many
@@ -54,13 +53,21 @@ func (CapacityFilter) Filter(req *framework.Request, h *models.Host) (bool, stri
 	return true, ""
 }
 
-// StatusFilter accepts only hosts whose status is models.HostStatusActive.
+// StatusFilter requires an active host with a recent heartbeat. Check time on
+// every scheduling attempt: an active row or cached host can outlive its last
+// heartbeat until the sweeper runs. Missing heartbeats fail closed.
 type StatusFilter struct{}
 
 func (StatusFilter) Name() string { return "status" }
 func (StatusFilter) Filter(_ *framework.Request, h *models.Host) (bool, string) {
 	if h.Status != models.HostStatusActive {
 		return false, "status=" + h.Status
+	}
+	if h.LastSeen.IsZero() {
+		return false, "heartbeat missing"
+	}
+	if age := time.Since(h.LastSeen); age > models.HostHeartbeatStaleAfter {
+		return false, fmt.Sprintf("heartbeat stale: age=%s limit=%s", age.Round(time.Second), models.HostHeartbeatStaleAfter)
 	}
 	return true, ""
 }
@@ -93,7 +100,7 @@ func (MaxVMsFilter) Filter(_ *framework.Request, h *models.Host) (bool, string) 
 
 // RootfsFilter rejects hosts that don't advertise the requested rootfs.
 // Empty req.Rootfs matches any host. Hosts with an empty Rootfses list
-// are legacy registrations and match every rootfs (HostRecord.HasRootfs
+// are legacy registrations and match every rootfs (Host.HasRootfs
 // already encodes this).
 type RootfsFilter struct{}
 
@@ -103,9 +110,9 @@ func (RootfsFilter) Filter(req *framework.Request, h *models.Host) (bool, string
 		return true, ""
 	}
 	// Templates (tpl_<ulid>) are lazy-fetched: every host can fetch the
-	// ext4 from R2 on first use. Don't reject hosts that don't yet have
+	// ext4 from configured object storage on first use. Don't reject hosts that don't yet have
 	// the template cached — TemplateAvailability scorer biases placement
-	// toward warm hosts but cold hosts remain eligible. See DESIGN/templates.md.
+	// toward warm hosts but cold hosts remain eligible.
 	if strings.HasPrefix(req.Rootfs, models.TemplateIDPrefix) {
 		return true, ""
 	}

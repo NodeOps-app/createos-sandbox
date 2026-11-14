@@ -18,7 +18,7 @@ import (
 //
 // authType tells the validator which header the user sent under, so the
 // outbound call to upstream can forward the same header verbatim — the
-// upstream auth service treats the four token types (api_key /
+// NodeOps auth service treats the four token types (api_key /
 // access_token / auth_token) as separate populations.
 type ExternalValidator interface {
 	Validate(ctx context.Context, authType, token string, extraHeaders map[string]string) (*ExternalKey, error)

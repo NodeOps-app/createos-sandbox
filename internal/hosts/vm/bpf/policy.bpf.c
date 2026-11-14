@@ -214,11 +214,11 @@ int fc_veth_policy(struct __sk_buff *skb) {
         return TC_ACT_OK;
 
     // 1. Anti-spoof: src_ip must match the IP we expect from this veth.
-    //    Allow lookup miss — the iface may not be a managed VM (host
-    //    sidecar process, dev box). Strict drop only when there's a
-    //    binding AND it disagrees.
+    //    This program is attached only to managed VM host-veths. Missing
+    //    identity means lifecycle setup is incomplete: fail closed until
+    //    the host binds the slot, rather than treating its traffic as external.
     __u32 *expected = bpf_map_lookup_elem(&fc_iface_to_ip, &ifidx);
-    if (expected && *expected != src_ip)
+    if (!expected || *expected != src_ip)
         return TC_ACT_SHOT;
 
     // 2. Is destination a managed VM?

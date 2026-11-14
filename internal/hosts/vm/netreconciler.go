@@ -20,7 +20,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm/dns"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm/dns"
 )
 
 // NetReconcilerConfig configures the network reconciler loop.
@@ -231,6 +231,14 @@ func reconcileOnce(ctx context.Context, cfg NetReconcilerConfig) error {
 		if v.isLocal && v.ifindex != 0 {
 			desiredIfaceToIP[v.ifindex] = v.ipNet
 		}
+	}
+
+	// Borrowed slots can carry traffic before Manager registers the sandbox.
+	// Preserve their identities, but never infer network membership from them.
+	// Slot cleanup removes these entries under the same reconcile lock.
+	for ifindex, ip := range o.boundIfaces {
+		desiredKnownVMIPs[ip] = struct{}{}
+		desiredIfaceToIP[ifindex] = ip
 	}
 
 	// For every ordered pair (a, b) of VMs visible to this host:

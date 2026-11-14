@@ -6,8 +6,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/createos"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/createos"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // maybeAutoTopup checks whether the sandbox's remaining egress quota

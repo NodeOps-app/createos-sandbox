@@ -11,10 +11,10 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/placementpolicy"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/placementpolicy"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type ResumeDeps struct {
@@ -24,8 +24,11 @@ type ResumeDeps struct {
 	Region   string
 }
 
-// KickoffResume owns background resume orchestration: claim the paused row,
-// ask the scheduler for a host ID, then pass that ID to hostrpc.Resume.
+// KickoffResume claims a paused row, schedules a destination, and requests
+// host resume synchronously. It does not wait for the VM to become running.
+// A nil result can also mean the state claim was rejected and no RPC was sent.
+// Placement failures attempt to restore paused state; host RPC failures leave
+// resuming state for subsequent lifecycle reconciliation.
 func KickoffResume(ctx context.Context, d ResumeDeps, id string) error {
 	if d.Client == nil {
 		return errors.New("scheduler not configured")

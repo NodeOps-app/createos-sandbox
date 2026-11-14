@@ -25,32 +25,32 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/cache"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/diskcrypto"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/handlers"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/hostwarm"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/inframonitor"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/routes"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/sandboxaccess"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/userapikey"
-	"github.com/NodeOps-app/sandbox/internal/auditemit"
-	"github.com/NodeOps-app/sandbox/internal/billingemit"
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
-	"github.com/NodeOps-app/sandbox/internal/clickhouse"
-	"github.com/NodeOps-app/sandbox/internal/createos"
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/internal/logging"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
-	"github.com/NodeOps-app/sandbox/internal/pool"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/cache"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/diskcrypto"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/handlers"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/hostwarm"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/inframonitor"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/routes"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/sandboxaccess"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/userapikey"
+	"github.com/NodeOps-app/createos-sandbox/internal/auditemit"
+	"github.com/NodeOps-app/createos-sandbox/internal/billingemit"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/clickhouse"
+	"github.com/NodeOps-app/createos-sandbox/internal/createos"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/logging"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/pool"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Deps is the dependency bundle used to construct a control-plane Server.
@@ -63,17 +63,15 @@ type Deps struct {
 	DisableDeviceRegistration bool
 	Client                    *http.Client
 	Resolver                  *userapikey.Cache // user-key resolver; nil makes protected routes return 503
-	AdminToken                string            // shared secret for host operations and pprof; empty disables these routes
-	PromSDToken               string            // static bearer protecting /v1/internal/sd/hosts; "" disables endpoint
-	// HostPubkeys is the per-host Ed25519 verify-key cache used by
-	// InternalJWTMiddleware. Populated by the wiring layer with a
-	// HostPubkeys cache that reads from hosts.public_key. Internal routes
-	// are mTLS-authenticated; the JWT path remains in place for the
-	// few live callers that still bear JWTs (builder, billing webhooks).
+	MetricsToken              string
+	AdminToken                string // shared secret for host operations and pprof; empty disables these routes
+	PromSDToken               string // static bearer protecting /v1/internal/sd/hosts; "" disables endpoint
+	// HostPubkeys retains the host-key cache invalidated on registration.
+	// It is not consulted by the inbound JWT verifier; host RPCs use mTLS.
 	HostPubkeys *cache.HostPubkeys
 
-	// StaticActors holds gateway/ingress pubkeys loaded from operator
-	// config. Used by the JWT verifier resolver to verify their JWTs.
+	// StaticActors holds builder and billing public keys loaded from
+	// operator config for the remaining JWT-authenticated routes.
 	StaticActors *authjwt.PubkeyMap
 
 	// BootstrapToken is the X-Bootstrap-Token shared secret accepted on
@@ -95,7 +93,7 @@ type Deps struct {
 	// RelayCrossRegionFallback: when this control's region has no active
 	// relay, allow the device session-create picker to fall back to any
 	// region (preferring same). ON by default because not every active
-	// region hosts a relay (devices may ride another region's relay).
+	// region hosts a relay (e.g. US devices ride the EU relay).
 	RelayCrossRegionFallback bool
 
 	// SchedulerClient delegates placement to the standalone createos
@@ -103,13 +101,13 @@ type Deps struct {
 	SchedulerClient *schedclient.Client
 
 	// Storage is the blob backend used by the fork orchestration
-	// path (R2 server-side CopyObject). Pause and resume happen on
+	// path (S3-compatible server-side CopyObject). Pause and resume happen on
 	// the host side and use the host's own Storage; control only
 	// touches storage for fork. Nil = fork returns 501.
 	Storage storage.Storage
 
 	// HostStorage is the raw S3 config relayed to hosts in the
-	// register response so each host can construct its own R2 client
+	// register response so each host can construct its own object-storage client
 	// for pause/resume without persisting credentials on disk. Same
 	// values as control uses for its own `Storage` client.
 	HostStorage config.StorageConfig
@@ -205,6 +203,7 @@ type Server struct {
 	disableDeviceRegistration bool
 	http                      *http.Client
 	resolver                  *userapikey.Cache
+	metricsToken              string
 	adminToken                string
 	promSDToken               string
 	hostPubkeys               *cache.HostPubkeys
@@ -235,7 +234,7 @@ type Server struct {
 	// control scheduler service over HTTP.
 	schedulerClient *schedclient.Client
 
-	// storage is the blob backend used by fork's R2 server-side copy.
+	// storage is the blob backend used by fork's S3-compatible server-side copy.
 	// Nil disables /v1/sandboxes/:id/fork (returns 501).
 	storage storage.Storage
 	// hostStorage is the raw S3 config relayed to hosts in the register
@@ -348,6 +347,7 @@ func New(d Deps) *Server {
 		disableDeviceRegistration: d.DisableDeviceRegistration,
 		http:                      c,
 		resolver:                  d.Resolver,
+		metricsToken:              d.MetricsToken,
 		adminToken:                d.AdminToken,
 		promSDToken:               d.PromSDToken,
 		hostPubkeys:               d.HostPubkeys,
@@ -468,6 +468,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return "", true, nil
 	}
 	mw := middlewares.NewMiddleware(s.resolver, jwtVerifier, s.adminToken, s.bootstrapToken, s.relayBootstrapToken, sandboxOwner)
+	mw.MetricsToken = s.metricsToken
 	mw.SetSandboxTokenResolver(sandboxaccess.NewResolver(s.repo, s.apiKeyHasher))
 
 	app.Use(recover.New())

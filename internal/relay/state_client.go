@@ -12,7 +12,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // sessionPeer is one wg-devices peer entry the reconciler needs in raw
@@ -38,8 +38,7 @@ type relayState struct {
 // toLocalState projects the on-the-wire RelayStateResp (which uses
 // base64 pubkeys to stay JSON-clean) into the relay's internal form
 // (raw 32-byte pubkeys ready for wgctrl). Drops any session whose
-// pubkey fails to decode — one bad row should not tank the whole
-// reconcile tick.
+// pubkey is malformed or not 32 bytes, or whose client IP is not IPv4.
 func toLocalState(w *proto.RelayStateResp) *relayState {
 	out := &relayState{
 		Sessions:      make([]sessionPeer, 0, len(w.Sessions)),

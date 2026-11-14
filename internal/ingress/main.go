@@ -1,7 +1,7 @@
 // Package ingress implements the createos HTTP ingress: a stateless
 // reverse proxy that routes <ulid>-<port>.<DomainSuffix> to the
-// corresponding sandbox VM. Cloudflare terminates TLS at the wildcard
-// edge; this server only sees plaintext HTTP from Cloudflare.
+// corresponding sandbox VM. Its inbound listener uses HTTP behind the trusted
+// edge proxy; outbound control lookups and host tunnels require mTLS.
 package ingress
 
 import (
@@ -24,8 +24,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
 )
 
 const (
@@ -41,15 +41,15 @@ type Config struct {
 	MaxConcurrent int
 	PositiveTTL   time.Duration
 	NegativeTTL   time.Duration
-	// TLS server config — listener wraps in TLS 1.3 + RequireAndVerifyClientCert
-	// when all three paths are set; empty paths leave it plain (dev only).
+	// Required outbound mTLS material for control requests and host tunnels.
+	// These paths do not configure TLS on the inbound HTTP listener.
 	TLSCertPath string
 	TLSKeyPath  string
 	TLSCAPath   string
 	// ControlURLs maps region → that region's control internal mTLS base
 	// URL. Enables wake-on-request: a hit on a paused sandbox's public URL
-	// POSTs a wake to the control for the sandbox's OWN region. Empty
-	// disables the feature (paused sandboxes 503 as before).
+	// POSTs a wake to the control for the sandbox's own region. At least
+	// one nonempty endpoint is required for route lookup at construction.
 	ControlURLs map[string]string
 }
 
@@ -63,13 +63,12 @@ type Server struct {
 	// sf collapses concurrent cache-miss control lookups for the same
 	// sandbox into one request (cache stampede guard).
 	sf singleflight.Group
-	// waker fires wake-on-request resumes at control. nil = feature off
-	// (no control URL, or outbound mTLS not configured).
+	// waker fires wake-on-request resumes at control. New always wires it;
+	// a nil value is handled defensively by serveWake.
 	waker *waker
 	// outboundTLS is the client-side mTLS config used when dialing
-	// hosts via OpenIngressTunnel. nil = plaintext (any TLS path
-	// empty). Built once at New() time so per-request dials don't
-	// re-read disk.
+	// hosts via OpenIngressTunnel. New requires this configuration. Client
+	// certificates can reload during handshakes; the CA bundle is loaded once.
 	outboundTLS *tls.Config
 	// crlFetcher is the control-backed revocation cache; its
 	// VerifyPeerCertificate is wired into outboundTLS so dials to a
@@ -77,13 +76,9 @@ type Server struct {
 	crlFetcher *crl.Fetcher
 }
 
-// New constructs an ingress server. The DomainSuffix is escaped into a
-// strict regex anchored to the start/end of the hostname.
-//
-// Region is informational only — used for logging + locality hints, NOT
-// as an access gate. Any ingress can serve a sandbox in any region; the
-// WireGuard mesh spans regions so the outbound mTLS dial to the host
-// reaches across. Set empty to disable the locality log line.
+// New constructs an ingress server with required control endpoints and mTLS.
+// It validates the domain suffix and fetches the initial revocation set before
+// returning. Routing is not restricted to the ingress process's own region.
 func New(cfg Config) (*Server, error) {
 	if strings.TrimSpace(cfg.DomainSuffix) == "" {
 		return nil, errors.New("domain-suffix must be set")
@@ -112,9 +107,7 @@ func New(cfg Config) (*Server, error) {
 		cap:    newConcurrencyCap(cfg.MaxConcurrent),
 		hostRE: re,
 	}
-	// Outbound mTLS to host /v1/internal/tunnel/*. Skipped when any
-	// TLS path is empty — keeps plaintext-on-the-wire dev deploys
-	// compatible.
+	// Require outbound mTLS for control lookups and host tunnels.
 	tlsCfg, err := mtlsclient.NewTLSConfig(cfg.TLSCertPath, cfg.TLSKeyPath, cfg.TLSCAPath)
 	if err != nil {
 		return nil, fmt.Errorf("ingress outbound tls: %w", err)
@@ -148,10 +141,8 @@ func New(cfg Config) (*Server, error) {
 	controlClient := &http.Client{Timeout: 10 * time.Second, Transport: controlTransport}
 	s.routes = newControlRouteClient(controlBases, controlClient)
 
-	// Wake-on-request: reuse the outbound mTLS material (role=ingress) to
-	// call the owning region's control internal wake endpoint. Requires
-	// both a region→URL map and configured mTLS — otherwise the feature
-	// stays off and paused sandboxes 503 as before.
+	// Reuse the ingress-role mTLS client to wake sandboxes through their
+	// owning region's control endpoint.
 	s.waker = newWaker(cfg.ControlURLs, controlClient)
 	log.Infof("[ingress] control-backed routing and wake enabled for regions %v", regionKeys(cfg.ControlURLs))
 	return s, nil
@@ -200,8 +191,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Ingress is fronted by nginx-ingress (plain HTTP inside the cluster),
 	// so the inbound listener stays plain HTTP. The TLS keypair is used
-	// only for OUTBOUND mTLS to the host's /v1/internal/tunnel/:id/:port
-	// endpoint (see s.outboundTLS wired in New()).
+	// only for outbound mTLS to control and host tunnel endpoints.
 	log.WithContext(ctx).Infof("[ingress] listening on %s suffix=%s outbound_mtls=%v",
 		s.cfg.Addr, s.cfg.DomainSuffix, s.outboundTLS != nil)
 
@@ -300,7 +290,7 @@ func (s *Server) resolve(hostHeader string) (*resolved, int, string) {
 		return nil, http.StatusNotFound, "No sandbox matches this URL."
 	}
 	if status, msg := s.validate(route); status != 0 {
-		// Negative-cache for region/disabled mismatches.
+		// Negative-cache disabled ingress and terminal sandbox states.
 		if status == http.StatusNotFound {
 			s.cache.putNegative(sbID)
 		}
@@ -343,11 +333,9 @@ func (s *Server) validate(route ingressRoute) (int, string) {
 	}
 }
 
-// upstreamErrorMessage explains a reverse-proxy failure to the user
-// in language that points at the in-VM service rather than at any
-// createos internals. Called only after validate() accepted the route,
-// so the sandbox is known to be running + reachable from us; failure
-// here means the user's own service isn't responding on `port`.
+// upstreamErrorMessage describes common application-level causes of a proxy
+// failure. A validated route is cached metadata, not proof of reachability;
+// tunnel, host, or network failures can also reach this error path.
 func upstreamErrorMessage(port int) string {
 	return fmt.Sprintf(
 		"Couldn't reach a service on port %d inside the sandbox.\n\n"+
@@ -479,7 +467,7 @@ func sanitizeResponse(resp *http.Response) error {
 }
 
 // sanitizeRequest applies the request-side header policy. Called BEFORE
-// proxy.Director so the cleaning lands on the cloned request the proxy
+// proxy.Rewrite so the cleaning lands on the cloned request the proxy
 // transports — never on the original client request.
 // IMPORTANT: Cf-Connecting-Ip is taken at face value. control ingress
 // MUST be deployed behind Cloudflare (or another trusted L7 LB) such
@@ -523,15 +511,9 @@ func sanitizeRequest(req *http.Request, port int) {
 			hl == "proxy-authorization" {
 			req.Header.Del(h)
 		}
-		// NOTE: `Authorization` is intentionally NOT stripped here.
-		// The ingress→host JWT rides the hand-written Upgrade frame in
-		// tunnel.go (Authorization line constructed there); once the 101
-		// lands, the conn is a raw byte pipe and the proxied HTTP request
-		// is the FIRST thing the in-VM service sees on it. The client's
-		// Authorization header therefore can never collide with or shadow
-		// the JWT. Per-sandbox public services commonly gate on
-		// Authorization (Basic / Bearer) — stripping it broke every such
-		// service silently. Fixes #64.
+		// Preserve application Authorization headers (Basic/Bearer). Tunnel
+		// authentication uses the ingress client certificate, separately from
+		// the HTTP request delivered to the sandbox application.
 	}
 
 	if xff != "" {

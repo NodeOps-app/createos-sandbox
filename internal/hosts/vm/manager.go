@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/oklog/ulid"
@@ -21,11 +20,11 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm/dns"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm/dns"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // newSandboxID returns a new sandbox identifier of the form "sb-<ulid>".
@@ -61,15 +60,18 @@ func (k shapeKey) String() string { return fmt.Sprintf("%s-%d-%d", k.Rootfs, k.V
 
 // snapshotFiles holds the on-disk artifacts for a single (vcpu, mem) snapshot.
 type snapshotFiles struct {
-	VmStatePath string
-	MemFilePath string
-	BaseOverlay string
-	Ready       bool
-	GuestMAC    string
+	FirecrackerBuild string
+	VmStatePath      string
+	MemFilePath      string
+	BaseOverlay      string
+	Ready            bool
+	GuestMAC         string
 }
 
 // Manager owns the network/overlay pools and the map of running sandboxes.
 type Manager struct {
+	firecrackerRuntime firecrackerRuntime
+
 	Pool        *NetPool
 	OverlayPool *OverlayPools
 	Sandboxes   map[string]*Sandbox
@@ -154,9 +156,6 @@ type Manager struct {
 	// unprivileged UID. 0 keeps today's root-mode behaviour. See
 	// firecracker_uid.go.
 	firecrackerUIDBase int
-	// seccompFilterPath, when non-empty, passes --seccomp-filter to
-	// every firecracker child. Points at a seccomp filter JSON.
-	seccompFilterPath string
 	// kvmGID is the gid of the kvm group; firecracker (post-drop) needs
 	// it as a supplementary group to open /dev/kvm. Resolved once at
 	// startup; 0 means "not configured" → caller falls back to root mode.
@@ -301,15 +300,11 @@ type ManagerConfig struct {
 	// internal mTLS endpoint; otherwise the gate 401s.
 	ControlHTTPClient *http.Client
 
-	// AgentLivenessProbe enables a per-VM watcher that destroys the VM if
-	// its guest agent stops answering on the exec port while firecracker
-	// is still alive. This is the host-side half of "guest self-destruct":
-	// the guest halts/panics/wedges, freezing the TCP stack; the host
-	// notices the dead port and SIGKILLs firecracker. ON by default —
-	// firecracker microVMs can't terminate themselves (no ACPI), and
-	// WatchDeath only sees the fc *process* exiting, not a wedged guest,
-	// so without this a killed agent leaks a live VMM until the next
-	// reconcile.
+	// AgentLivenessProbe enables guest connectivity probes. Five continuous
+	// minutes of failed probes trigger VM cleanup; recovery, snapshot freezing,
+	// or bandwidth capping resets the timer. This bounds hung-guest resource
+	// usage, but a timeout does not prove the guest halted. WatchDeath separately
+	// handles an actual Firecracker process exit. Enabled by default.
 	AgentLivenessProbe bool
 
 	// Shapes is the Manager's initial catalog, installed by the host
@@ -326,6 +321,10 @@ type ManagerConfig struct {
 
 // CreateRequest describes the shape of a sandbox to create.
 type CreateRequest struct {
+	// RestoreOverlay is a private, verified disk copy prepared by the host
+	// service. Never decoded from a public request or shared between VMs.
+	RestoreOverlay string
+
 	// ID is optional. When supplied (typically by the control plane after
 	// it has INSERTed the durable row and reserved capacity), the manager
 	// uses it verbatim. When empty, the manager generates a fresh ULID-
@@ -409,6 +408,12 @@ type CreateResult struct {
 
 // NewManager constructs a Manager and pre-creates the network and overlay pools.
 func NewManager(cfg ManagerConfig) (*Manager, error) {
+	runtime, err := currentFirecrackerRuntime(cfg.SeccompFilterPath)
+	if err != nil {
+		return nil, fmt.Errorf("Firecracker runtime: %w", err)
+	}
+	log.WithField("firecracker_build", runtime.Build).WithField("seccomp", runtime.Seccomp).Info("[runtime] pinned default Firecracker")
+
 	if len(cfg.Rootfses) == 0 {
 		return nil, fmt.Errorf("rootfs catalog is empty")
 	}
@@ -463,6 +468,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	ReapOrphanedPrewarmTemplates()
 
 	m := &Manager{
+		firecrackerRuntime:  runtime,
 		Pool:                pool,
 		OverlayPool:         overlayPool,
 		Sandboxes:           make(map[string]*Sandbox),
@@ -485,7 +491,6 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		agentProbeTransport: cfg.AgentProbeTransport,
 		prewarmDone:         make(chan struct{}),
 		firecrackerUIDBase:  cfg.FirecrackerUIDBase,
-		seccompFilterPath:   cfg.SeccompFilterPath,
 	}
 	// Resolve kvm group GID once so the Credential drop can include it
 	// as a supplementary group. Required for /dev/kvm access post-drop.
@@ -596,6 +601,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 			ipam:        m.Pool.ipam,
 			permanent:   false, // tear down on Release, do not recycle
 		}
+		pn.trackExistingProcess(r.FCPid)
 		m.pendingRelease[r.ID] = pn
 	}
 	if len(m.pendingRelease) > 0 {
@@ -759,7 +765,10 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*CreateResult,
 
 	// Grab overlay (from pool if sized like the pool, else on-demand)
 	t0 = time.Now()
-	overlayPath, err := m.getOverlay(req.DiskMib)
+	overlayPath := req.RestoreOverlay
+	if overlayPath == "" {
+		overlayPath, err = m.getOverlay(req.DiskMib)
+	}
 	tOverlay = time.Since(t0)
 	if err != nil {
 		m.Pool.Return(pn)
@@ -929,12 +938,6 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*CreateResult,
 
 	if pid, err := sb.Machine.PID(); err == nil {
 		sb.FCPid = pid
-		// Boot done — move firecracker out of the boot lane so the
-		// next spawn finds it free. Async because the affinity-update
-		// has to walk /proc/<pid>/task and call SchedSetaffinity per
-		// thread; ~µs per thread but keeps spawn return tight. No-op
-		// when lane carving is disabled.
-		go func() { _ = PinPidToTenantLane(pid) }()
 		// CPU throttle for fractional-vCPU shapes. Async: cgroup mkdir +
 		// kernel thread-walk on cgroup.procs write costs 21–28ms per VM
 		// on prod, which would dominate the post-tNet spawn tail. Doing
@@ -949,7 +952,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*CreateResult,
 		// req.MemMib so cgroup-scoped OOM (CONSTRAINT_MEMCG) fires
 		// INSIDE the VM's cgroup, not globally. cpu.max stays opt-in
 		// per shape via CPUQuotaPct.
-		if req.CPUQuotaPct > 0 || req.MemMib > 0 {
+		if req.CPUQuotaPct > 0 || req.MemMib > 0 || CPULanesActive() {
 			go EnsureVMCgroup(id, req.Shape, pid, req.CPUQuotaPct, req.MemMib)
 		}
 		// Per-process rlimits (NOFILE, NPROC, FSIZE). Belt-and-braces with
@@ -1094,6 +1097,7 @@ func (m *Manager) BeginTeardown(sb *Sandbox) (unlock func(), ok bool) {
 		sb.egressMu.Unlock()
 		return nil, false
 	}
+	sb.cancelFileTransfers()
 	return sb.egressMu.Unlock, true
 }
 
@@ -1376,13 +1380,10 @@ func (m *Manager) pollPID(sb *Sandbox) {
 	}
 }
 
-// WatchLiveness is the host-side half of guest self-destruct. firecracker
-// microVMs have no ACPI, so a guest can't power off its own VMM — `halt`
-// just freezes the vCPU and the firecracker process lingers. This watcher
-// probes the agent's exec port; if the port stops answering while the
-// firecracker process is still alive (i.e. the guest deliberately halted,
-// kernel-panicked, or wedged), it SIGKILLs firecracker and runs the normal
-// death cleanup. No-op unless ManagerConfig.AgentLivenessProbe is set.
+// WatchLiveness bounds how long an unreachable guest can retain VM resources.
+// It allows five continuous minutes of failed probes before cleanup, since
+// transient load or networking failures do not establish that the guest halted.
+// No-op unless ManagerConfig.AgentLivenessProbe is set.
 func (m *Manager) WatchLiveness(sb *Sandbox) {
 	if sb == nil || !m.overlayConfig.AgentLivenessProbe || sb.IP == "" {
 		return
@@ -1392,10 +1393,10 @@ func (m *Manager) WatchLiveness(sb *Sandbox) {
 
 func (m *Manager) pollLiveness(sb *Sandbox) {
 	const (
-		bootGrace  = 30 * time.Second // suppress probes for this long after boot
-		interval   = 5 * time.Second
-		dialBudget = 1 * time.Second
-		maxFails   = 3 // ~15s of consecutive failure before we act
+		bootGrace    = 30 * time.Second // suppress probes for this long after boot
+		interval     = 5 * time.Second
+		dialBudget   = 1 * time.Second
+		failureGrace = 5 * time.Minute // measured from the first failed probe
 	)
 	// Boot-grace: during a host-wide burst (e.g. 100+ VMs spawning at
 	// once), the agent process inside each guest may not get a CPU
@@ -1411,7 +1412,7 @@ func (m *Manager) pollLiveness(sb *Sandbox) {
 	addr := net.JoinHostPort(sb.IP, strconv.Itoa(agentPort))
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	fails := 0
+	var failedSince time.Time
 	for range t.C {
 		if sb.Destroyed.Load() {
 			return
@@ -1421,7 +1422,7 @@ func (m *Manager) pollLiveness(sb *Sandbox) {
 		// Stand down until pause either completes (teardown removes the
 		// sandbox) or fails (resume + clearing of Freezing).
 		if sb.Freezing.Load() {
-			fails = 0
+			failedSince = time.Time{}
 			continue
 		}
 		// When the bandwidth cap is engaged, the BPF program drops every
@@ -1438,7 +1439,7 @@ func (m *Manager) pollLiveness(sb *Sandbox) {
 		}
 		m.Mu.RUnlock()
 		if capped {
-			fails = 0
+			failedSince = time.Time{}
 			continue
 		}
 		// A live firecracker PID is the gate: if the process is already
@@ -1451,12 +1452,17 @@ func (m *Manager) pollLiveness(sb *Sandbox) {
 		conn, err := d.Dial("tcp", addr)
 		if err == nil {
 			_ = conn.Close()
-			fails = 0
+			failedSince = time.Time{}
 			continue
 		}
-		fails++
-		if fails >= maxFails {
-			m.handleDeath(sb, fmt.Sprintf("guest agent unresponsive on %s for %d probes — assuming self-halt", addr, fails))
+		// Measure the recovery window from the first failure rather than a
+		// probe count; any successful probe clears the accumulated failure time.
+		now := time.Now()
+		if failedSince.IsZero() {
+			failedSince = now
+		}
+		if elapsed := now.Sub(failedSince); elapsed >= failureGrace {
+			m.handleDeath(sb, fmt.Sprintf("guest agent unresponsive on %s for %s — liveness timeout", addr, elapsed.Round(time.Second)))
 			return
 		}
 	}
@@ -1870,12 +1876,10 @@ func (m *Manager) ReapOrphanTenantFirecrackers() int {
 	return killed
 }
 
-// KillFirecrackerFast SIGKILLs the given PID and returns. No polling — the
-// kernel handles SIGKILL synchronously as far as process state goes (vcpus
-// stop, fds released), and the remaining zombie slot doesn't affect us:
-// the SDK goroutine that spawned it will reap it shortly. Waiting for the
-// zombie to disappear is pure wait time; it can't influence veth/iptables/
-// overlay reclaim which have already been done by kernel-side teardown.
+// KillFirecrackerFast SIGKILLs the given PID and returns without polling.
+// Sending SIGKILL requests exit; it does not confirm that the process has
+// released its resources. Newly launched slot borrowers are tracked by pidfd,
+// and NetPool.Return / fallback startup enforce exit before reuse.
 func KillFirecrackerFast(pid int) {
 	if pid <= 0 {
 		return
@@ -1885,46 +1889,10 @@ func KillFirecrackerFast(pid int) {
 	}
 }
 
-// stopFirecrackerByPID sends SIGTERM to the given PID, waits up to 3s for
-// exit, then falls back to SIGKILL. Used by Destroy for rehydrated VMs
-// where we don't carry a firecracker-go-sdk Machine handle (the handle
-// can't survive across a serve restart).
-func stopFirecrackerByPID(pid int) {
-	if pid <= 0 {
-		return
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-	// Best-effort verify that the PID is still a firecracker (not reused
-	// after the previous serve exited but before we restarted).
-	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil {
-		if name := string(b); len(name) > 0 && name[:len(name)-1] != "firecracker" {
-			log.Warnf("[sandbox] pid %d is not firecracker (%q); skipping kill", pid, name)
-			return
-		}
-	}
-	_ = p.Signal(os.Interrupt)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := p.Signal(nilSignal); err != nil {
-			return // process gone
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	_ = p.Kill()
-	_, _ = p.Wait()
-}
-
-// nilSignal (signal 0) is the standard Unix probe that checks if a PID is
-// still alive without actually signalling it. Kept as a package-level var
-// so stopFirecrackerByPID stays testable.
-var nilSignal = syscall.Signal(0)
-
-// Shutdown is a *drain* — it stops accepting new work but leaves every
+// Shutdown stops host background work but leaves every
 // running firecracker VM, netns, overlay, and iptables chain in place so
-// the next serve process can rehydrate them (see main_server.go::rehydrate).
+// the next host process can rehydrate them (see Rehydrate). This is service
+// shutdown, not the sweeper's sandbox migration/drain operation.
 //
 // This is the behaviour you want for a rolling code deploy: users' VMs
 // survive the restart.

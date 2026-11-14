@@ -23,22 +23,25 @@ const (
 )
 
 // BundlePrefix returns the canonical bucket prefix for a sandbox's
-// snapshot bundle: "snapshots/<id>/". Use this everywhere we read,
+// pause or reusable-snapshot bundle: "snapshots/<id>/". Use this everywhere we read,
 // write, copy, or delete bundle objects so the layout stays in one
 // place.
 func BundlePrefix(id string) string {
 	return "snapshots/" + id + "/"
 }
 
-// Manifest is a pure integrity descriptor. No fields that duplicate
-// the sandbox row (sandbox_id, shape, rootfs, region, paused_at all
-// live on the row), with one exception: OriginalOverlayPath. Firecracker
-// bakes the overlay drive's host path into vmstate at CreateSnapshot
-// time. On resume the host needs to know that path to ensure the
-// decompressed overlay lives where firecracker expects to find it
-// (typically via a symlink). It's not row metadata; it's per-bundle
-// runtime detail that travels with the bytes.
+// Manifest describes artifact integrity and the runtime needed to restore the
+// captured state. Sandbox identity, shape, rootfs, region, and pause time remain
+// on the database row. Paths and producer build travel with the captured bytes.
 type Manifest struct {
+	// Exact producer binary SHA256. Missing on legacy bundles; never inferred from time.
+	FirecrackerBuild string `json:"firecracker_build,omitempty"`
+
+	// Reusable full snapshots retain source CPU lineage after source deletion.
+	// Existing pause bundles may omit it because their sandbox row carries it.
+	CPUVendor string `json:"cpu_vendor,omitempty"`
+	CPUFamily string `json:"cpu_family,omitempty"`
+
 	Version             int                           `json:"version"`
 	Encryption          EncryptionMeta                `json:"encryption"`
 	Artifacts           map[string]ArtifactDescriptor `json:"artifacts"`
@@ -61,8 +64,7 @@ type EncryptionMeta struct {
 }
 
 // ArtifactDescriptor records integrity + size for one file in the
-// bundle. Size is informational (matches Content-Length); SHA256 is
-// the authoritative integrity check.
+// bundle. VerifyArtifact compares both Size and SHA256 against observed values.
 type ArtifactDescriptor struct {
 	SHA256 string `json:"sha256"` // lowercase hex
 	Size   int64  `json:"size"`
@@ -120,7 +122,7 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	return &m, nil
 }
 
-// VerifyArtifact returns nil if the given (path, sha256, size)
+// VerifyArtifact returns nil if the given artifact name, sha256, and size
 // matches the manifest's record for the named artifact, else a
 // descriptive error. Used by resume to validate on-disk locality
 // cache files against the row's manifest.
@@ -138,4 +140,35 @@ func (m *Manifest) VerifyArtifact(name, gotSHA256 string, gotSize int64) error {
 			name, want.Size, gotSize)
 	}
 	return nil
+}
+
+// ParseCaptureManifest validates reusable disk/full artifacts without changing
+// the full-bundle contract used by existing pause/resume callers.
+func ParseCaptureManifest(data []byte, full bool) (*Manifest, error) {
+	var m Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	if m.Version != ManifestVersion || m.Encryption.Mode != "none" {
+		return nil, fmt.Errorf("unsupported capture manifest")
+	}
+	names := []string{ArtifactOverlay}
+	if full {
+		names = append(names, ArtifactMemfile, ArtifactVMState)
+	}
+	if len(m.Artifacts) != len(names) {
+		return nil, fmt.Errorf("unexpected capture artifacts")
+	}
+	for _, name := range names {
+		a, ok := m.Artifacts[name]
+		if !ok || a.Size <= 0 || len(a.SHA256) != 64 {
+			return nil, fmt.Errorf("invalid artifact %s", name)
+		}
+		for _, c := range a.SHA256 {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return nil, fmt.Errorf("invalid artifact checksum")
+			}
+		}
+	}
+	return &m, nil
 }

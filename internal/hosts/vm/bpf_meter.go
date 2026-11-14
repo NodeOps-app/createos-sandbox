@@ -227,10 +227,14 @@ func AttachBPFMeterToVeth(hostVeth string) error {
 
 	att := &meterAttach{ifindex: ifindex}
 
+	// Policy links survive restarts and return TC_ACT_OK for allowed traffic,
+	// ending the TCX chain. Always insert meters before those pinned links;
+	// meters return TC_ACT_UNSPEC so policy still runs after accounting/caps.
 	egressLink, err := link.AttachTCX(link.TCXOptions{
 		Interface: link0.Attrs().Index,
 		Program:   m.progEgress,
 		Attach:    ebpf.AttachTCXIngress,
+		Anchor:    link.Head(),
 	})
 	if err == nil {
 		att.egressLink = egressLink
@@ -246,6 +250,7 @@ func AttachBPFMeterToVeth(hostVeth string) error {
 		Interface: link0.Attrs().Index,
 		Program:   m.progIngress,
 		Attach:    ebpf.AttachTCXEgress,
+		Anchor:    link.Head(),
 	})
 	if err == nil {
 		att.ingressLink = ingressLink

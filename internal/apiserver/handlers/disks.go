@@ -22,14 +22,14 @@ import (
 	"github.com/oklog/ulid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/cryptobox"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/cryptobox"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type diskCreateReq struct {
@@ -150,10 +150,10 @@ func (h *Handler) DbResetSandboxDiskStatus(c *fiber.Ctx) error {
 
 // DbResolveSandboxDisks returns the decrypted MMDS-shaped disks bundle
 // for a sandbox the calling host owns. The route layer enforces
-// (a) host-issued JWT, (b) `iss` host id matches sandboxes.host_id.
+// (a) host-role mTLS, (b) the certificate host id matches sandboxes.host_id.
 //
 // Credentials in the response are PLAINTEXT — only ever emitted on the
-// in-cluster internal endpoint, behind owner+host JWT auth.
+// internal endpoint over mTLS, behind the host ownership gate.
 func (h *Handler) DbResolveSandboxDisks(c *fiber.Ctx) error {
 	if h.diskCipher == nil {
 		return httpx.Error(c, fiber.StatusServiceUnavailable, "disks API not configured")
@@ -747,6 +747,10 @@ func (h *Handler) HandleSandboxDiskAttach(c *fiber.Ctx) error {
 	// so resume tries to mount a disk the agent has no MMDS entry for and
 	// the VM is unrecoverable. Issue #67.
 	running, _, diskExists, err := h.repo.AttachDiskIfRunning(c.UserContext(), sbID, disk.ID, req.MountPath, subPath)
+	if errors.Is(err, models.ErrSnapshotCaptureConflict) {
+		return httpx.Fail(c, fiber.StatusConflict, "sandbox state changed or snapshot capture in progress")
+	}
+
 	if err != nil {
 		// Unique violation (SQLState 23505) on (sandbox_id, mount_path)
 		// means another disk is already at this path. Friendly 409.
@@ -838,6 +842,15 @@ func (h *Handler) HandleSandboxDiskDetach(c *fiber.Ctx) error {
 	if rec.Region != "" && rec.Region != h.region {
 		return h.forwardToPeerControl(c, rec.Region, c.Method(), c.Path())
 	}
+	// The durable attachment remains until the host confirms removal. Capture
+	// rejects any attachment, so it cannot start between this preflight and the
+	// host response. The final row removal also takes the capture operation lock.
+	if active, err := h.repo.HasActiveSnapshotCapture(c.UserContext(), sbID); err != nil {
+		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
+	} else if active {
+		return httpx.Fail(c, fiber.StatusConflict, "snapshot capture in progress")
+	}
+
 	// Accept either a `disk_<ulid>` id or a user-scoped disk name in the
 	// URL — matches attach (req.DiskID via GetDisk) and the SDK docs.
 	// Without this lookup, only the literal id worked; a name in the path
@@ -1161,7 +1174,7 @@ func newSSRFGuardedTransport() *http.Transport {
 // envelope sealed to the destination host's Ed25519 pubkey. Hosts
 // already publish that pubkey at registration (hosts.public_key), so
 // we don't need any new key distribution: only the matching host can
-// decrypt. JWT auth still authenticates the call; this protects the
+// decrypt. mTLS authenticates the call; this additionally protects the
 // payload's confidentiality on the control→host channel.
 //
 // Returns the marshalled envelope (json.RawMessage) ready to drop into

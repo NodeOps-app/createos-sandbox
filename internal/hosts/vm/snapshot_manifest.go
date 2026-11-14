@@ -20,9 +20,10 @@ const snapshotGenerationRetention = 30 * time.Hour
 // generation. The three artifacts are immutable once published. Running VMs
 // may therefore keep mapping an older generation while a replacement is built.
 type snapshotManifest struct {
-	VMState  string `json:"vmstate"`
-	Memory   string `json:"memory"`
-	BaseExt4 string `json:"base_ext4"`
+	FirecrackerBuild string `json:"firecracker_build,omitempty"`
+	VMState          string `json:"vmstate"`
+	Memory           string `json:"memory"`
+	BaseExt4         string `json:"base_ext4"`
 }
 
 func readSnapshotManifest(dir string) (*snapshotFiles, error) {
@@ -45,18 +46,20 @@ func readSnapshotManifest(dir string) (*snapshotFiles, error) {
 		}
 	}
 	return &snapshotFiles{
-		VmStatePath: filepath.Join(dir, manifest.VMState),
-		MemFilePath: filepath.Join(dir, manifest.Memory),
-		BaseOverlay: filepath.Join(dir, manifest.BaseExt4),
-		Ready:       true,
+		FirecrackerBuild: manifest.FirecrackerBuild,
+		VmStatePath:      filepath.Join(dir, manifest.VMState),
+		MemFilePath:      filepath.Join(dir, manifest.Memory),
+		BaseOverlay:      filepath.Join(dir, manifest.BaseExt4),
+		Ready:            true,
 	}, nil
 }
 
 func publishSnapshotManifest(dir string, files *snapshotFiles) error {
 	manifest := snapshotManifest{
-		VMState:  filepath.Base(files.VmStatePath),
-		Memory:   filepath.Base(files.MemFilePath),
-		BaseExt4: filepath.Base(files.BaseOverlay),
+		FirecrackerBuild: files.FirecrackerBuild,
+		VMState:          filepath.Base(files.VmStatePath),
+		Memory:           filepath.Base(files.MemFilePath),
+		BaseExt4:         filepath.Base(files.BaseOverlay),
 	}
 	body, err := json.Marshal(manifest)
 	if err != nil {

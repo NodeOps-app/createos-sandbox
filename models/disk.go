@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -152,10 +152,9 @@ func CountUserDisks(ctx context.Context, d *database.Db, userID string) (int, er
 
 // DeleteDisk soft-deletes the row. Returns ErrDiskAttached if any
 // non-destroyed sandbox still holds an attachment — caller should 409.
-// The count + soft-delete run in a single CTE under a row lock on the
-// disk; this serializes against concurrent attachDiskIfRunning (which
-// takes FOR KEY SHARE on the same row) so a slip-through can't orphan
-// a fresh attachment.
+// Lock the disk first, then count attachments using a fresh READ COMMITTED
+// statement snapshot. A single locking CTE can miss an attach committed while
+// the delete statement waited for the disk lock.
 func DeleteDisk(ctx context.Context, d *database.Db, userID, idOrName string) error {
 	disk, err := GetDisk(ctx, d, userID, idOrName)
 	if err != nil {
@@ -164,13 +163,26 @@ func DeleteDisk(ctx context.Context, d *database.Db, userID, idOrName string) er
 	if disk == nil {
 		return pgx.ErrNoRows
 	}
+	lock, err := query(d, "lockDiskForDelete")
+	if err != nil {
+		return err
+	}
 	q, err := query(d, "deleteDiskIfUnattached")
 	if err != nil {
 		return err
 	}
+	tx, err := d.Con.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var lockedID string
+	if err := tx.QueryRow(ctx, lock, disk.ID, userID).Scan(&lockedID); err != nil {
+		return err
+	}
 	var existsRow, deleted bool
 	var attachedCnt int
-	if err := d.Con.QueryRow(ctx, q, disk.ID, userID).Scan(&existsRow, &attachedCnt, &deleted); err != nil {
+	if err := tx.QueryRow(ctx, q, disk.ID, userID).Scan(&existsRow, &attachedCnt, &deleted); err != nil {
 		return err
 	}
 	if !existsRow {
@@ -183,7 +195,7 @@ func DeleteDisk(ctx context.Context, d *database.Db, userID, idOrName string) er
 		// Lock held but neither attached nor deleted — shouldn't happen.
 		return fmt.Errorf("delete-disk: unexpected non-update")
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // UpdateDiskCredentials rewrites the AES-GCM envelope on an existing
@@ -264,10 +276,21 @@ func AttachDiskIfRunning(ctx context.Context, d *database.Db, sandboxID, diskID,
 	if err != nil {
 		return false, false, false, err
 	}
-	err = d.Con.QueryRow(ctx, q, sandboxID, diskID, mountPath, subPath).Scan(&running, &inserted, &diskExists)
+	tx, ok, err := beginCaptureOperation(ctx, d, sandboxID)
+	if err != nil {
+		return false, false, false, err
+	}
+	if !ok {
+		return false, false, false, ErrSnapshotCaptureConflict
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	err = tx.QueryRow(ctx, q, sandboxID, diskID, mountPath, subPath).Scan(&running, &inserted, &diskExists)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// sandboxes row not found.
 		return false, false, false, pgx.ErrNoRows
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
 	}
 	return running, inserted, diskExists, err
 }
@@ -280,12 +303,19 @@ func DetachDisk(ctx context.Context, d *database.Db, sandboxID, diskID, mountPat
 	if err != nil {
 		return err
 	}
-	var gotID string
-	err = d.Con.QueryRow(ctx, q, sandboxID, diskID, mountPath).Scan(&gotID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return pgx.ErrNoRows
+	tx, ok, err := beginCaptureOperation(ctx, d, sandboxID)
+	if err != nil {
+		return err
 	}
-	return err
+	if !ok {
+		return ErrSnapshotCaptureConflict
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var gotID string
+	if err = tx.QueryRow(ctx, q, sandboxID, diskID, mountPath).Scan(&gotID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func ListSandboxDisks(ctx context.Context, d *database.Db, sandboxID string) ([]SandboxDisk, error) {

@@ -2,8 +2,8 @@
 //
 // Users SSH into this gateway with `-L` flags, authenticate via SSH public
 // keys registered at sandbox-create time, and the gateway splices TCP
-// traffic through the control plane's tunnel endpoint to the sandbox on
-// its owning host.
+// traffic directly through the owning host's tunnel endpoint. Control
+// supplies the sandbox's authorized keys and host address during authentication.
 //
 // Only `direct-tcpip` channels are permitted — no shells, no exec, no
 // remote port forwarding (`-R`), no agent forwarding. The target of each
@@ -26,8 +26,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
-	"github.com/NodeOps-app/sandbox/internal/mtlsclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/mtlsclient"
 )
 
 // Config configures a Gateway.
@@ -63,17 +63,22 @@ type Gateway struct {
 	listener net.Listener
 
 	// outboundTLS is the client-side mTLS config used by openTunnel's
-	// raw-TCP dial. nil = plaintext. Built once at New() time.
+	// raw-TCP dial. A nil config makes host tunnel opens fail. Built in New().
 	outboundTLS *tls.Config
 
-	// crlFetcher polls control's CRL endpoint and gates outbound dials
-	// in its VerifyPeerCertificate. nil when outbound mTLS is off.
+	// crlFetcher supplies revocation checks for host tunnels and the default
+	// HTTP client. Its bootstrap transport uses normal TLS verification.
 	crlFetcher *crl.Fetcher
 
 	// authLimiter throttles ssh public-key auth attempts per source IP
-	// before the control-plane lookup runs. Defends against timing-based
-	// sandbox-id enumeration (one DB read on hit vs O(µs) reject on miss).
+	// before control-plane lookup. This bounds repeated lookup attempts
+	// from a source; it does not make authentication paths equal-time.
 	authLimiter *connRateLimiter
+
+	// Include channels still opening their upstream tunnel in admission counts.
+	channelMu    sync.Mutex
+	channels     map[string]int
+	channelCount int
 }
 
 // New builds a Gateway. Call Run to start serving.
@@ -81,39 +86,27 @@ func New(cfg Config) *Gateway {
 	g := &Gateway{}
 	mtls := cfg.TLSCertPath != "" && cfg.TLSKeyPath != "" && cfg.TLSCAPath != ""
 	if mtls {
-		tlsCfg, err := mtlsclient.NewTLSConfig(cfg.TLSCertPath, cfg.TLSKeyPath, cfg.TLSCAPath)
+		tr, err := mtlsclient.NewTransport(cfg.TLSCertPath, cfg.TLSKeyPath, cfg.TLSCAPath, nil)
 		if err != nil {
-			// Fail loud at startup over latent: log and fall through
-			// to plain HTTP. Internal control routes are mTLS-only in
-			// production; this branch is for local-dev configs.
+			// Host tunnels fail closed when their TLS configuration cannot load.
 			log.Errorf("[gateway] outbound mTLS disabled: %v", err)
 		} else {
-			g.outboundTLS = tlsCfg
+			// Bootstrap CRL fetches verify TLS normally but cannot depend on
+			// the revocation cache they populate. Keep that transport separate.
+			g.crlFetcher = crl.New(cfg.ControlURL, &http.Client{Timeout: 10 * time.Second, Transport: tr})
+			g.crlFetcher.Logger = log.WithField("component", "crl")
+			g.outboundTLS = tr.TLSClientConfig.Clone()
+			g.outboundTLS.VerifyPeerCertificate = g.crlFetcher.VerifyPeerCertificate
+			g.outboundTLS.VerifyConnection = crl.VerifyConnectionFunc(g.crlFetcher.VerifyPeerCertificate)
+			if cfg.HTTP == nil {
+				httpTR := tr.Clone()
+				httpTR.TLSClientConfig = g.outboundTLS.Clone()
+				cfg.HTTP = &http.Client{Timeout: 10 * time.Second, Transport: httpTR}
+			}
 		}
 	}
 	if cfg.HTTP == nil {
-		if g.outboundTLS != nil {
-			// CRL fetcher uses a no-verify transport (otherwise it
-			// can't bootstrap its own revocation cache). The main
-			// transport then enforces revocation on every dial.
-			crlTR, err := mtlsclient.NewTransport(cfg.TLSCertPath, cfg.TLSKeyPath, cfg.TLSCAPath, nil)
-			if err != nil {
-				log.Errorf("[gateway] crl http transport: %v", err)
-				cfg.HTTP = &http.Client{Timeout: 10 * time.Second}
-			} else {
-				g.crlFetcher = crl.New(cfg.ControlURL, &http.Client{Timeout: 10 * time.Second, Transport: crlTR})
-				g.crlFetcher.Logger = log.WithField("component", "crl")
-				tr, err := mtlsclient.NewTransportWithVerify(cfg.TLSCertPath, cfg.TLSKeyPath, cfg.TLSCAPath, nil, g.crlFetcher.VerifyPeerCertificate)
-				if err != nil {
-					log.Errorf("[gateway] outbound mTLS http transport: %v", err)
-					cfg.HTTP = &http.Client{Timeout: 10 * time.Second}
-				} else {
-					cfg.HTTP = &http.Client{Timeout: 10 * time.Second, Transport: tr}
-				}
-			}
-		} else {
-			cfg.HTTP = &http.Client{Timeout: 10 * time.Second}
-		}
+		cfg.HTTP = &http.Client{Timeout: 10 * time.Second}
 	}
 	g.cfg = cfg
 	g.authLimiter = newConnRateLimiter()
@@ -176,24 +169,13 @@ func (g *Gateway) Run(ctx context.Context) error {
 			ssh.FingerprintSHA256(signer.PublicKey()))
 	}
 
-	// Restrict every negotiable algorithm to a small modern set. The
-	// x/crypto default accepts ssh-rsa / hmac-sha1 / dh-group14-sha1 etc.
-	// for compatibility; we don't need that — createos-cli, OpenSSH 7.7+, every
-	// modern client supports the post-quantum-ready curve25519 + AES-GCM /
-	// ChaCha20 + HMAC-SHA2-ETM / Ed25519 stack.
+	// Restrict negotiation to the explicit key-exchange, cipher, MAC,
+	// and public-key algorithms below. Curve25519 is classical ECDH,
+	// not a post-quantum key exchange.
 	srvCfg := &ssh.ServerConfig{
 		PublicKeyCallback: g.authPublicKey,
-		// Banner masks the gateway's actual implementation. Banner-only
-		// spoofing buys little against a determined adversary (the kex
-		// algorithm list, error-message phrasing, and channel-open
-		// rejection codes still fingerprint x/crypto/ssh in seconds via
-		// nmap/ssh-audit), but it does drop us off the radar of casual
-		// service-banner scans.
-		//
-		// IMPORTANT for operators: any internal log search filtering on
-		// the banner string (e.g. "find gateway by SSH banner") must
-		// now use the listener port or createos-cli's mTLS metadata instead —
-		// this banner is intentionally not a unique identifier.
+		// This compatibility banner is not the implementation version and
+		// must not be used to identify the deployed gateway build.
 		ServerVersion: "SSH-2.0-OpenSSH_9.6",
 		// Cap auth attempts per connection (default is 6). Even though
 		// every attempt has to go through PublicKeyCallback → fetchSandbox
@@ -257,12 +239,8 @@ func (g *Gateway) Run(ctx context.Context) error {
 	return nil
 }
 
-// sessionMaxDuration caps the lifetime of any single SSH session. After
-// this window the gateway force-closes the underlying TCP, dropping every
-// active port-forward through it. 24h is the standard SSH server default
-// (compatible with overnight `createos-cli shell` workflows but bounded against
-// indefinite resource hold). Made package-level so it's discoverable from
-// future config knobs.
+// sessionMaxDuration is this gateway's 24-hour cap on an authenticated SSH
+// connection. Expiry closes its TCP socket and all active forwards.
 const sessionMaxDuration = 24 * time.Hour
 
 // tcpKeepAlivePeriod is the TCP keepalive interval. With this set, an

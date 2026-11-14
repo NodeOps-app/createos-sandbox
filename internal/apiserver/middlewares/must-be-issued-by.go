@@ -5,10 +5,10 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 // Identity kinds — the canonical name for "which kind of internal actor
@@ -100,13 +100,8 @@ func (m *Middleware) MustBeIssuedBy(kinds ...string) fiber.Handler {
 		}
 		c.Locals(IssLocalsKey, claims.Iss)
 		c.Locals(ClaimsLocalsKey, claims)
-		// Propagate the originating user id (uid claim) into the
-		// fiber UserContext so downstream handlers — specifically
-		// dialHostUpgrade and any other handler that re-signs an
-		// inner JWT for the host — can re-issue with the uid intact.
-		// Without this, control receives a gateway JWT with uid set
-		// but signs its outbound JWT with an empty uid, and the
-		// host's requireOwner fails closed → 404 on /tunnel.
+		// Preserve the verified originating user for downstream request context.
+		// Host forwarding uses mTLS, not a newly signed host JWT.
 		if claims.UserID != "" {
 			c.SetUserContext(utils.WithUserID(c.UserContext(), claims.UserID))
 		}

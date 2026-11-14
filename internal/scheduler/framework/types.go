@@ -1,18 +1,18 @@
 // Package framework defines the pluggable scheduler pipeline: Filter,
 // Scorer, Reserver. Built-in plugins live in
-// github.com/NodeOps-app/sandbox/internal/scheduler/plugins; this package contains only
+// github.com/NodeOps-app/createos-sandbox/internal/scheduler/plugins; this package contains only
 // the abstract pipeline machinery.
 package framework
 
-import "github.com/NodeOps-app/sandbox/internal/vmcapacity"
+import "github.com/NodeOps-app/createos-sandbox/internal/vmcapacity"
 
-// Request is the placement request fed to the pipeline. Mirrors today's
-// Pick(host, mem, rootfs) plus a hint for host-pinning and a future-use
-// label map.
+// Request carries resource requirements, hard placement constraints, and
+// locality hints for the scheduling pipeline. Labels are host selectors.
 type Request struct {
-	Shape  string
-	Rootfs string
-	MemMiB int
+	SnapshotID string // owner-authorized reusable snapshot, used only for cache locality
+	Shape      string
+	Rootfs     string
+	MemMiB     int
 	// VCPU and DiskMiB drive the multi-dimensional admission filter.
 	// Caller (control plane) populates these from the shape catalog
 	// at /v1/schedule time. 0 means "don't filter on this dimension"
@@ -39,14 +39,9 @@ type Request struct {
 	// candidate set. Empty on create or fresh resume.
 	ExcludeHosts []string
 
-	// Resume-only: CPU vendor of the host that took the snapshot.
-	// Consumed by the cpu_compat filter (wired into the default
-	// pipeline). When set, the filter rejects any candidate whose
-	// CPUVendor differs — required because firecracker bakes source
-	// CPUID into vmstate and resuming on a different vendor SIGILLs the
-	// guest. Control populates it from the row's cpu_vendor lineage
-	// (origin host as fallback) before calling /v1/schedule. "" on
-	// cold-create.
+	// Source snapshot CPU vendor for resume or full-snapshot restore. Empty
+	// on cold creates. The default filter rejects unknown or different
+	// destination vendors; a match does not prove full CPU compatibility.
 	SourceCPUVendor string
 }
 

@@ -3,8 +3,8 @@ package placementpolicy
 import (
 	"context"
 
-	schedapi "github.com/NodeOps-app/sandbox/internal/scheduler/api"
-	"github.com/NodeOps-app/sandbox/models"
+	schedapi "github.com/NodeOps-app/createos-sandbox/internal/scheduler/api"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type ResumeScheduleOpts struct {
@@ -20,7 +20,10 @@ type ResumeBuildError struct {
 func (e *ResumeBuildError) Error() string { return e.Msg }
 
 // BuildResumeScheduleRequest converts a paused sandbox into scheduler
-// placement requirements. It does not contact either scheduler or host.
+// placement requirements. It requires a recorded durable upload and a source
+// CPU vendor, using the cached host record as a vendor fallback if necessary.
+// It may query the repository but does not contact the scheduler, host, or
+// object storage; it does not verify that bundle objects are still available.
 func BuildResumeScheduleRequest(
 	ctx context.Context, repo *models.Repo, rec *models.Sandbox, opts ResumeScheduleOpts,
 ) (schedapi.ScheduleRequest, error) {

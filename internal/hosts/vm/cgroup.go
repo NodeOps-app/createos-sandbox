@@ -9,15 +9,16 @@
 // Layout (cgroup v2 unified hierarchy, /sys/fs/cgroup):
 //
 //	/sys/fs/cgroup/createos/                 root for our VMs
-//	    cgroup.subtree_control               must include "+cpu +memory"
+//	    cgroup.subtree_control               enables cpu, memory, pids; cpuset for CPU lanes
 //	/sys/fs/cgroup/createos/<sandbox_id>/    per-VM leaf
 //	    cgroup.procs                         firecracker PID is written here
 //	    cpu.max                              "<quota> <period>" or "max <period>"
 //	    memory.max                           shared host-memory reservation
 //	    memory.swap.max                      "0" (no swap, clean death)
-//	    memory.oom.group                     "1" (kill all fc threads on OOM)
+//	    memory.oom.group                     "1" (group-scoped OOM handling)
+//	    pids.max                             "512" (host tasks in the VM cgroup)
 //
-// The root is created (and "+cpu +memory" added to subtree_control)
+// The parent is created (and "+cpu +memory +pids" added to subtree_control)
 // lazily on the first call. Per-VM leaves are mkdir'd on EnsureVMCgroup
 // and rmdir'd on RemoveVMCgroup. Failures are non-fatal — the VM still
 // runs without the throttle and we log a warning. cgroup v1 hosts
@@ -34,7 +35,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/vmcapacity"
+	"github.com/NodeOps-app/createos-sandbox/internal/vmcapacity"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -53,9 +54,10 @@ var (
 	cgParentErr  error
 )
 
-// ensureParent creates /sys/fs/cgroup/createos and ensures "+cpu +memory"
-// are in its subtree_control so per-VM leaves can use cpu.max and
-// memory.max. Idempotent; runs at most once per process.
+// ensureParent creates /sys/fs/cgroup/createos and enables cpu, memory,
+// and pids in subtree_control for per-VM limits. CPU lane configuration
+// enables cpuset separately.
+// Idempotent; runs at most once per process.
 func ensureParent() error {
 	cgParentOnce.Do(func() {
 		dir := filepath.Join(cgRoot, cgParent)
@@ -64,9 +66,8 @@ func ensureParent() error {
 			return
 		}
 		// Enable controllers on the parent so leaves inherit them.
-		// "+cpu +memory" are no-ops if already enabled. Single write so
-		// neither succeeds without the other (kernel parses the whole
-		// line at once).
+		// Enabling cpu, memory, and pids is a no-op for controllers already
+		// enabled. Request all three in one write.
 		ctl := filepath.Join(dir, "cgroup.subtree_control")
 		if err := os.WriteFile(ctl, []byte("+cpu +memory +pids"), 0); err != nil {
 			cgParentErr = fmt.Errorf("enable controllers on parent: %w", err)
@@ -77,13 +78,12 @@ func ensureParent() error {
 }
 
 // EnsureVMCgroup creates a per-VM cgroup, moves the firecracker PID
-// into it, and writes cpu.max (when quotaPct > 0) plus memory.max
-// (when memMib > 0). At least one of the two must be > 0 — when both
-// are zero the cgroup is skipped entirely to keep the spawn floor
-// low. All steps are best-effort: a failure logs a warning and returns
-// so the VM boot path is never blocked by cgroup quirks.
+// into it with a tenant cpuset when CPU lanes are active, and writes cpu.max
+// (when quotaPct > 0) plus memory.max (when memMib > 0). Without lanes or
+// resource limits, no cgroup is needed. Failures are logged rather than
+// returned to the caller; missing or failed writes may leave limits unapplied.
 func EnsureVMCgroup(vmID, shape string, pid int, quotaPct, memMib int) {
-	if pid <= 0 || (quotaPct <= 0 && memMib <= 0) {
+	if pid <= 0 || (quotaPct <= 0 && memMib <= 0 && !CPULanesActive()) {
 		// No throttle requested — skip the cgroup entirely. The mkdir +
 		// process migration was measured at ~21–28ms per VM on prod
 		// (mkdir ~7.7ms, kernel thread-walk on cgroup.procs write
@@ -107,6 +107,14 @@ func EnsureVMCgroup(vmID, shape string, pid int, quotaPct, memMib int) {
 	if err := os.MkdirAll(leaf, 0o755); err != nil {
 		log.Warnf("[cgroup] %s: mkdir leaf: %v", vmID, err)
 		return
+	}
+	// Set the tenant cpuset before migration so existing and future threads
+	// are constrained together, while retaining this VM's other resource limits.
+	if lanes != nil {
+		if err := setCgroupCPUs(leaf, &lanes.tenant); err != nil {
+			// A CPU-controller failure must not bypass memory and pids limits.
+			log.Warnf("[cgroup] %s: tenant cpuset: %v (continuing with other resource limits)", vmID, err)
+		}
 	}
 	// Move firecracker into the leaf. cgroup.procs accepts one pid per
 	// write; the kernel migrates the process and all its threads. If
@@ -158,10 +166,9 @@ func EnsureVMCgroup(vmID, shape string, pid int, quotaPct, memMib int) {
 			[]byte("0"), 0); err != nil && !os.IsNotExist(err) {
 			log.Debugf("[cgroup] %s: write memory.swap.max=0: %v", vmID, err)
 		}
-		// On OOM, kill EVERY process in this cgroup atomically.
-		// Without this the kernel kills only the highest-scoring
-		// thread of firecracker, leaving a half-dead VMM — worse than
-		// a clean kill that the reconciler picks up.
+		// Treat this cgroup as one workload during OOM handling, rather than
+		// selecting individual processes if more than one belongs to it.
+		// This is not a guest-process limit; guest tasks run inside the VM.
 		if err := os.WriteFile(filepath.Join(leaf, "memory.oom.group"),
 			[]byte("1"), 0); err != nil && !os.IsNotExist(err) {
 			log.Debugf("[cgroup] %s: write memory.oom.group=1: %v", vmID, err)

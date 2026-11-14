@@ -1,7 +1,7 @@
 package hosts
 
 import (
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
 )
 
 // mgrStater adapts *vm.Manager to HeartbeatStater. Kept here so vm and

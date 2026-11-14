@@ -1,13 +1,9 @@
 package jwt
 
-// Claims is the createos internal-RPC JWT payload — minimal: identity +
-// audience + freshness. Operation binding (op/sandbox_id/port) was tried
-// in an earlier iteration but added wire weight without meaningful
-// security benefit over today's bearer model. The route handler enforces
-// per-resource authorization (e.g. RequireSandboxOwner reads :id from
-// the URL and compares to sandboxes.host_id against the JWT's iss).
-//
-// Wire keys follow RFC 7519: iss, sub, aud, iat, nbf, exp, jti.
+// Claims is the internal JWT payload: issuer, audience, validity timestamps,
+// and optional subject, user, and role fields. Signature verification alone
+// does not authorize a resource operation; callers enforce route permissions.
+// Wire keys use RFC 7519 names plus the uid and role extensions.
 type Claims struct {
 	Iss string `json:"iss"`           // "<role>:<id>" — e.g. "host:fc-vm-1"
 	Sub string `json:"sub,omitempty"` // optional request target
@@ -17,8 +13,8 @@ type Claims struct {
 	Exp int64  `json:"exp"`           // unix seconds — typically iat + 60s
 	Jti string `json:"jti"`           // 128-bit random hex; not tracked, present for future use
 
-	UserID string `json:"uid,omitempty"`  // end-user id, set on control→host forwarded user requests
-	Role   string `json:"role,omitempty"` // "proxy" on a host-minted proxy token; empty for a host's own token
+	UserID string `json:"uid,omitempty"`  // optional end-user identity carried by SignFor
+	Role   string `json:"role,omitempty"` // "proxy" when minted by SignProxy
 }
 
 // Recognised audiences and roles. Stringly-typed by design.

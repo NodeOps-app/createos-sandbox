@@ -8,18 +8,18 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/apiserver"
-	"github.com/NodeOps-app/sandbox/internal/auditshipper"
-	"github.com/NodeOps-app/sandbox/internal/billing"
-	"github.com/NodeOps-app/sandbox/internal/builder"
-	"github.com/NodeOps-app/sandbox/internal/gateway"
-	"github.com/NodeOps-app/sandbox/internal/ingress"
-	"github.com/NodeOps-app/sandbox/internal/logging"
-	"github.com/NodeOps-app/sandbox/internal/relay"
-	"github.com/NodeOps-app/sandbox/internal/scheduler"
-	"github.com/NodeOps-app/sandbox/internal/sweep"
-	"github.com/NodeOps-app/sandbox/internal/ttlevict"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver"
+	"github.com/NodeOps-app/createos-sandbox/internal/auditshipper"
+	"github.com/NodeOps-app/createos-sandbox/internal/billing"
+	"github.com/NodeOps-app/createos-sandbox/internal/builder"
+	"github.com/NodeOps-app/createos-sandbox/internal/gateway"
+	"github.com/NodeOps-app/createos-sandbox/internal/ingress"
+	"github.com/NodeOps-app/createos-sandbox/internal/logging"
+	"github.com/NodeOps-app/createos-sandbox/internal/relay"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler"
+	"github.com/NodeOps-app/createos-sandbox/internal/sweep"
+	"github.com/NodeOps-app/createos-sandbox/internal/ttlevict"
 )
 
 func main() {

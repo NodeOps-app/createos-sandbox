@@ -12,7 +12,7 @@ import (
 	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // ResumeSpec is the per-VM input to Manager.ResumeFromSnapshot. Distinct
@@ -20,6 +20,8 @@ import (
 // snapshot artifacts to local paths and just wants firecracker spawned
 // with them. Sizing and rootfs identity must match what was paused.
 type ResumeSpec struct {
+	FirecrackerBuild string
+
 	ID string
 	// Name is the user-facing VM name, carried from the durable store
 	// record. Pushed into the guest via MMDS as `hostname` on resume.
@@ -72,6 +74,11 @@ type ResumeSpec struct {
 // would be possible but adds complexity (per-VM page server lifetime
 // management) and we want resume to be restart-survivable.
 func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*Sandbox, error) {
+	runtime, err := loadFirecrackerRuntime(firecrackerRuntimeDir, spec.FirecrackerBuild)
+	if err != nil {
+		return nil, fmt.Errorf("resume: %w", err)
+	}
+	log.WithField("sandbox_id", spec.ID).WithField("firecracker_build", runtime.Build).Info("[resume] selected Firecracker runtime")
 	releaseRuntime := m.HoldRuntime(spec.ID)
 	defer releaseRuntime()
 	rootfsPath, ok := m.LookupRootfs(spec.Rootfs)
@@ -84,6 +91,11 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 	}
 
 	pn, _ := m.Pool.GetWithDepth()
+	// Snapshot loading resumes vCPUs: establish identity before any guest runs.
+	if err := BindVMIPToIface(vethNameFor(pn.ContainerID), pn.IP.IP.String()); err != nil {
+		m.Pool.Return(pn)
+		return nil, fmt.Errorf("resume: bind network policy: %w", err)
+	}
 	uid := m.SlotUID(pn.VsockCID)
 	leaseGranted := false
 	keepLease := false
@@ -151,7 +163,7 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 	// Per-VM vsock UDS path for the resumed VM. Vmstate has the prior
 	// incarnation's UDS path baked in; vsock_override swaps it so that
 	// even if the old socket file is still on disk (e.g. cross-host
-	// resume from R2 bundle, or pause/resume on same host where the
+	// resume from a stored bundle, or pause/resume on same host where the
 	// pause path didn't clean it), the bind succeeds.
 	var vsockUDS string
 	if m.agentProbeTransport == "vsock" {
@@ -165,7 +177,7 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 	// When per-slot UIDs are enabled, transfer per-VM bundle files
 	// (overlay, memfile, vmstate) to the slot's UID so the post-drop
 	// firecracker can read/write them. Bundle was downloaded by root
-	// from R2 and lands with root ownership.
+	// from object storage and lands with root ownership.
 	// Parent dir traversal (x bit) is required for firecracker to open
 	// the files inside. The paused bundle dir is root:root mode 0700 at
 	// rest; ChownForSlot drops it to the resume slot uid mode 0700.
@@ -184,13 +196,15 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 	}
 	cfg.VMID = spec.ID
 	opts = append(opts, firecracker.WithProcessRunner(
-		buildFirecrackerCmd(mctx, cfg, uid, uid, []uint32{m.KVMGID()}, m.seccompFilterPath, guestConsole.writer())))
+		pn.trackProcess(buildFirecrackerCmd(mctx, cfg, uid, uid, []uint32{m.KVMGID()}, runtime, guestConsole.writer()))))
 	fm, err := firecracker.NewMachine(mctx, cfg, opts...)
 	if err != nil {
 		cancel()
 		m.Pool.Return(pn)
 		return nil, fmt.Errorf("resume: NewMachine: %w", err)
 	}
+	fm.Handlers.FcInit = fm.Handlers.FcInit.AppendAfter(
+		firecracker.StartVMMHandlerName, pinToBootLaneHandler())
 	// Always pass overlayfs as a block_path_override so vmstate's
 	// embedded drive path is irrelevant at restore — the live file is
 	// whatever this host calls spec.OverlayPath. Same-sandbox resume:
@@ -198,7 +212,7 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 	// the fork's own paused-dir file; vmstate's reference to the
 	// source's path is harmlessly ignored. Removes the need for the
 	// cross-id symlink + 0o711 chmod dance in pauseresume.go.
-	blockOverrides := map[string]string{"overlayfs": spec.OverlayPath}
+	blockOverrides := map[string]string{"overlayfs": spec.OverlayPath, "rootfs": rootfsPath}
 	if vsockUDS != "" || len(blockOverrides) > 0 {
 		fm.Handlers.FcInit = fm.Handlers.FcInit.Swap(firecracker.Handler{
 			Name: firecracker.LoadSnapshotHandlerName,
@@ -206,7 +220,7 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 		})
 	}
 
-	if err := fm.Start(mctx); err != nil {
+	if err := pn.start(mctx, fm); err != nil {
 		cancel()
 		m.Pool.Return(pn)
 		return nil, fmt.Errorf("resume: Start: %w", err)
@@ -290,7 +304,7 @@ func (m *Manager) ResumeFromSnapshot(ctx context.Context, spec ResumeSpec) (*San
 				cpuQuotaPct = q
 			}
 		}
-		if cpuQuotaPct > 0 || spec.MemMib > 0 {
+		if cpuQuotaPct > 0 || spec.MemMib > 0 || CPULanesActive() {
 			go EnsureVMCgroup(spec.ID, spec.Shape, pid, cpuQuotaPct, spec.MemMib)
 		}
 		if m.firecrackerUIDBase > 0 {

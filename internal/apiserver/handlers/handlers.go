@@ -10,18 +10,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/cache"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/diskcrypto"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/userapikey"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/billingemit"
-	"github.com/NodeOps-app/sandbox/internal/ca"
-	"github.com/NodeOps-app/sandbox/internal/clickhouse"
-	"github.com/NodeOps-app/sandbox/internal/createos"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/cache"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/diskcrypto"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/userapikey"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/billingemit"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca"
+	"github.com/NodeOps-app/createos-sandbox/internal/clickhouse"
+	"github.com/NodeOps-app/createos-sandbox/internal/createos"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type okResp struct {
@@ -63,6 +63,8 @@ type Quotas struct {
 // Handler carries every dependency the control-plane HTTP handlers use.
 // Constructed by NewHandler from the server's Deps.
 type Handler struct {
+	adminEmailMu sync.RWMutex
+	adminEmails  map[string]string
 	repo         *models.Repo
 	http         *http.Client
 	hostPubkeys  PubkeyInvalidator
@@ -78,7 +80,7 @@ type Handler struct {
 	schedulerClient     *schedclient.Client
 	storage             storage.Storage
 	// hostStorage is the raw S3 config relayed verbatim to hosts in the
-	// register response. Hosts use it to construct their own R2 client
+	// register response. Hosts use it to construct their own object-storage client
 	// for pause/resume + template fetches, so they don't need to carry
 	// credentials in their serve.yaml. Single source of truth lives in
 	// control's `storage:` block.

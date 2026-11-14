@@ -173,16 +173,24 @@ components:
     # ── sandbox: request ───────────────────────────────────────────
     CreateReq:
       type: object
-      required: [shape]
+      oneOf:
+        - required: [shape, rootfs]
+          not: { required: [snapshot_id] }
+        - required: [snapshot_id]
+          not: { required: [rootfs] }
       properties:
+        snapshot_id:
+          type: string
+          description: Owned ready snapshot to restore. Cannot be combined with rootfs.
+
         shape:
           type: string
-          description: Required; see `GET /v1/shapes`.
+          description: Required for ordinary creates; defaults to captured shape with snapshot_id. Full snapshots require the captured CPU and memory size.
           example: s-1vcpu-256mb
         rootfs:
           type: string
           description: |
-            Rootfs catalog name. Empty = host default (see `GET /v1/rootfs`).
+            Rootfs catalog name, required unless snapshot_id is supplied (see `GET /v1/rootfs`).
             Names marked `disabled=true` in `rootfs_catalog` are rejected
             with HTTP 400 and a `rootfs` field error pointing at the
             recommended successor when one is set.
@@ -218,7 +226,7 @@ components:
         disk_mib:
           type: integer
           format: int64
-          description: Disk size in MiB. 0 = shape default (10 GiB).
+          description: Disk size in MiB. Defaults to the snapshot disk size when restoring, otherwise the shape default. Disk snapshots may grow but never shrink; full snapshots require the captured disk size.
           example: 10240
         egress:
           type: array
@@ -312,9 +320,59 @@ components:
               mount_path: /mnt/data
 
     # ── sandbox: create response ───────────────────────────────────
+    DirectoryCheckpointCreate:
+      type: object
+      additionalProperties: false
+      required: [path]
+      properties:
+        path: { type: string, maxLength: 4096, description: Absolute path of an eligible directory inside the sandbox. }
+        name: { type: string, maxLength: 63, description: Optional non-unique display name using letters, digits, underscores and hyphens. }
+    DirectoryCheckpoint:
+      type: object
+      required: [id, path, created_at]
+      properties:
+        id: { type: string }
+        path: { type: string }
+        name: { type: string }
+        parent_id: { type: string, description: Historical parent checkpoint; its record may have been deleted. }
+        created_at: { type: string, format: date-time }
+    DirectoryCheckpointRestore:
+      type: object
+      required: [checkpoint_id, path]
+      properties:
+        checkpoint_id: { type: string }
+        path: { type: string }
+
+    SnapshotCreateReq:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type: { type: string, enum: [disk, full] }
+        name:
+          type: string
+          maxLength: 63
+          description: Optional non-unique display name; ASCII letters, digits, underscores and hyphens; starts and ends with a letter or digit.
+    SnapshotView:
+      type: object
+      properties:
+        id: { type: string }
+        sandbox_id: { type: string, description: Source sandbox; may have been deleted. }
+        name: { type: string }
+        type: { type: string, enum: [disk, full] }
+        status: { type: string, enum: [creating, ready, failed, deleting] }
+        created_at: { type: string, format: date-time }
+        ready_at: { type: string, format: date-time }
+        shape: { type: string }
+        vcpu: { type: integer }
+        mem_mib: { type: integer }
+        disk_mib: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+
     CreateResp:
       type: object
       properties:
+        snapshot_id: { type: string, description: Reusable snapshot used to create this VM. }
         id:                    { type: string, example: sb_01K… }
         status:                { type: string, enum: [running] }
         name:                  { type: string, example: brave-otter }
@@ -370,6 +428,7 @@ components:
       description: |
         Public view of a sandbox. Operator-only fields are not returned.
       properties:
+        snapshot_id: { type: string, description: Reusable snapshot used to create this VM. }
         id:            { type: string }
         name:          { type: string, example: brave-otter }
         labels:
@@ -1323,6 +1382,258 @@ paths:
                       data: { $ref: '#/components/schemas/RootfsData' }
 
   # ── sandbox lifecycle ───────────────────────────────────────────
+  /v1/sandboxes/{id}/checkpoints:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: createDirectoryCheckpoint
+      summary: Create a local directory checkpoint
+      description: Requires account-owner credentials or a sandbox access token scoped to this sandbox, sent in X-Api-Key, and a running sandbox. Stop writers before create or restore; detected busy directories return 409. No process is automatically paused. Restricted paths, separate mounts, special files and hardlinks are unsupported. Checkpoint layers remain on the sandbox disk; no bucket upload occurs.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/SuccessEnvelope'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/DirectoryCheckpoint'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Sandbox or directory is busy, or the layer limit was reached
+        '507':
+          description: Insufficient sandbox disk space
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DirectoryCheckpointCreate'
+    get:
+      operationId: listDirectoryCheckpoints
+      summary: List directory checkpoints in this sandbox
+      description: Requires account-owner credentials or a sandbox access token scoped to this sandbox, sent in X-Api-Key, and a running sandbox. Stop writers before create or restore; detected busy directories return 409. No process is automatically paused. Restricted paths, separate mounts, special files and hardlinks are unsupported. Checkpoint layers remain on the sandbox disk; no bucket upload occurs.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/SuccessEnvelope'
+                - type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/DirectoryCheckpoint'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Sandbox or directory is busy, or the layer limit was reached
+        '507':
+          description: Insufficient sandbox disk space
+  /v1/sandboxes/{id}/checkpoints/{checkpoint}:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: checkpoint
+      in: path
+      required: true
+      schema:
+        type: string
+    delete:
+      operationId: deleteDirectoryCheckpoint
+      summary: Delete a checkpoint while retaining layers still in use
+      description: Requires account-owner credentials or a sandbox access token scoped to this sandbox, sent in X-Api-Key, and a running sandbox. Stop writers before create or restore; detected busy directories return 409. No process is automatically paused. Restricted paths, separate mounts, special files and hardlinks are unsupported. Checkpoint layers remain on the sandbox disk; no bucket upload occurs.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/SuccessEnvelope'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Sandbox or directory is busy, or the layer limit was reached
+        '507':
+          description: Insufficient sandbox disk space
+  /v1/sandboxes/{id}/checkpoints/{checkpoint}/restore:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: checkpoint
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: restoreDirectoryCheckpoint
+      summary: Restore a checkpoint at its original directory
+      description: Requires account-owner credentials or a sandbox access token scoped to this sandbox, sent in X-Api-Key, and a running sandbox. Stop writers before create or restore; detected busy directories return 409. No process is automatically paused. Restricted paths, separate mounts, special files and hardlinks are unsupported. Checkpoint layers remain on the sandbox disk; no bucket upload occurs.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/SuccessEnvelope'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/DirectoryCheckpointRestore'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Sandbox or directory is busy, or the layer limit was reached
+        '507':
+          description: Insufficient sandbox disk space
+
+  /v1/sandboxes/{id}/snapshots:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createSnapshot
+      summary: Capture a reusable disk or full snapshot
+      description: |
+        Requires the source sandbox owner's user credential. Sources may be
+        running. Sources briefly freeze and then resume. Resume a paused sandbox
+        before requesting a snapshot. Poll the snapshot until ready.
+        Pause, delete and update are blocked while capture needs the source.
+        At most five creating/ready/deleting snapshots per user, across both
+        types; concurrent requests and regional replication may exceed this temporarily.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SnapshotCreateReq' }
+      responses:
+        '202':
+          description: Capture accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SnapshotView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Sandbox-scoped credentials cannot manage snapshots }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Source is busy or cannot be captured }
+        '429': { description: Snapshot quota or request rate limit exceeded }
+        '503': { description: Capture service temporarily unavailable }
+
+  /v1/snapshots:
+    get:
+      operationId: listSnapshots
+      summary: List snapshots owned by the caller
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PagedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          data:
+                            type: array
+                            items: { $ref: '#/components/schemas/SnapshotView' }
+                          pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Sandbox-scoped credentials cannot manage snapshots }
+
+  /v1/snapshots/{snapshot}:
+    parameters:
+      - { name: snapshot, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getSnapshot
+      summary: Retrieve an owned snapshot
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SnapshotView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Sandbox-scoped credentials cannot manage snapshots }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteSnapshot
+      summary: Delete an owned ready or failed snapshot
+      description: Removes the snapshot from API listings and lookups. Bucket files are retained so in-flight restores can finish. A region with replication lag may briefly accept a restore after deletion. VMs already restored remain independent.
+      responses:
+        '202':
+          description: Deletion accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id: { type: string }
+                          status: { type: string, enum: [deleting] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Sandbox-scoped credentials cannot manage snapshots }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Snapshot is still being created }
+
   /v1/sandboxes:
     get:
       operationId: listSandboxes

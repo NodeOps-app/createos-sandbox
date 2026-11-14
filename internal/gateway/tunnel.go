@@ -31,8 +31,8 @@ import (
 // Auth is the outbound mTLS client cert (gateway's SPIFFE leaf). The
 // host's tunnel route is `HostMustBePeerRoleMTLS("ingress", "gateway",
 // "control")` — gateway is accepted directly, no need to round-trip
-// through control. The SSH-side owner check (g.authorise) already proved
-// this user owns the sandbox at session-open time.
+// through control. authPublicKey checked the SSH key against this sandbox
+// when the session opened; that check is not repeated for every channel.
 func (g *Gateway) openTunnel(ctx context.Context, hostAddr, sandboxID string, port int) (net.Conn, error) {
 	// hostAddr may arrive as "192.0.2.30:9090", "https://192.0.2.30:9090", or
 	// bare "192.0.2.30" (host DB stores any of these). Normalise:
@@ -102,7 +102,7 @@ func (g *Gateway) openTunnel(ctx context.Context, hostAddr, sandboxID string, po
 	// Expect "HTTP/1.1 101 Switching Protocols".
 	parts := strings.SplitN(statusLine, " ", 3)
 	if len(parts) < 2 || parts[1] != "101" {
-		// Drain a few bytes for context, then fail.
+		// Close on a rejected upgrade and retain the status line for diagnostics.
 		conn.Close()
 		return nil, fmt.Errorf("tunnel upgrade failed: %q", statusLine)
 	}

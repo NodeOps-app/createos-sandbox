@@ -11,10 +11,10 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/pprof"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/handlers"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/handlers"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // Register mounts every control-plane route onto app. The global
@@ -51,6 +51,11 @@ func Register(app fiber.Router, h *handlers.Handler, mw *middlewares.Middleware,
 	v1.Get(fmt.Sprintf("/devices/:%s/sessions", id), h.HandleDeviceSessionList)
 	v1.Put(fmt.Sprintf("/devices/:%s/sessions/:%s", id, middlewares.ParamSessionID), h.HandleDeviceSessionRenew)
 	v1.Delete(fmt.Sprintf("/devices/:%s/sessions/:%s", id, middlewares.ParamSessionID), h.HandleDeviceSessionDelete)
+	// Capture and restore share the normal authenticated sandbox lifecycle.
+	v1.Post(fmt.Sprintf("/sandboxes/:%s/snapshots", id), h.HandleSnapshotCreate)
+	v1.Get("/snapshots", h.HandleSnapshotList)
+	v1.Get(fmt.Sprintf("/snapshots/:%s", middlewares.ParamSnapshotID), h.HandleSnapshotGet)
+	v1.Delete(fmt.Sprintf("/snapshots/:%s", middlewares.ParamSnapshotID), h.HandleSnapshotDelete)
 	v1.Post("/sandboxes", h.HandleCreate)
 	v1.Get("/sandboxes", h.HandleList)
 	v1.Get(fmt.Sprintf("/sandboxes/by-ip/:%s", middlewares.ParamIP), h.HandleGetByIP)
@@ -65,6 +70,11 @@ func Register(app fiber.Router, h *handlers.Handler, mw *middlewares.Middleware,
 	v1.Post(fmt.Sprintf("/sandboxes/:%s/ssh-pubkeys", id), h.HandleAddSSHPubkey)
 	v1.Delete(fmt.Sprintf("/sandboxes/:%s", id), h.HandleDestroy)
 	v1.Post(fmt.Sprintf("/sandboxes/:%s/exec", id), h.HandleExec)
+	checkpointID := middlewares.ParamCheckpointID
+	v1.Post(fmt.Sprintf("/sandboxes/:%s/checkpoints", id), h.HandleCheckpoints)
+	v1.Get(fmt.Sprintf("/sandboxes/:%s/checkpoints", id), h.HandleCheckpoints)
+	v1.Delete(fmt.Sprintf("/sandboxes/:%s/checkpoints/:%s", id, checkpointID), h.HandleCheckpoints)
+	v1.Post(fmt.Sprintf("/sandboxes/:%s/checkpoints/:%s/restore", id, checkpointID), h.HandleCheckpoints)
 	processID := middlewares.ParamProcessID
 	v1.Post(fmt.Sprintf("/sandboxes/:%s/processes", id), h.HandleProcesses)
 	v1.Get(fmt.Sprintf("/sandboxes/:%s/processes", id), h.HandleProcesses)
@@ -116,7 +126,7 @@ func Register(app fiber.Router, h *handlers.Handler, mw *middlewares.Middleware,
 	// keyless `createos-cli shell` path (no SSH gateway, no SSH key).
 	v1.Post(fmt.Sprintf("/sandboxes/:%s/shell", id), h.HandleShell)
 	// Browser-friendly WS flavor of the same PTY. xterm.js in the
-	// web console talks to this. Same auth (API key, ?token= for
+	// createos-ui SPA talks to this. Same auth (API key, ?token= for
 	// browsers that can't set headers on a WS handshake).
 	v1.Get(fmt.Sprintf("/sandboxes/:%s/shell-ws", id), h.HandleShellWS)
 
@@ -145,8 +155,14 @@ func Register(app fiber.Router, h *handlers.Handler, mw *middlewares.Middleware,
 	v1.Post(fmt.Sprintf("/sandboxes/:%s/networks", id), h.HandleNetworkAttach)
 	v1.Delete(fmt.Sprintf("/sandboxes/:%s/networks/:%s", id, middlewares.ParamNetwork), h.HandleNetworkDetach)
 
-	// Deliberately narrow bearer-token operator surface. API-key management,
-	// listings, and certificate lifecycle are not exposed here.
+	// Read-only usage routes use the separate metrics token, including per-user
+	// aggregates. Register them before the admin-token host-operation/profiling
+	// gate. API-key management and certificate issuance are not exposed here.
+	v1.Get("/admin/metrics", mw.MustReadMetrics(), h.HandleAdminMetrics)
+	v1.Get("/admin/metrics/features", mw.MustReadMetrics(), h.HandleAdminFeatureMetrics)
+	v1.Get("/admin/metrics/users", mw.MustReadMetrics(), h.HandleAdminUserMetrics)
+	v1.Get("/admin/metrics/regions", mw.MustReadMetrics(), h.HandleAdminRegionMetrics)
+	v1.Get("/admin/metrics/activity", mw.MustReadMetrics(), h.HandleAdminActivity)
 	admin := v1.Group("/admin", mw.MustBeAdmin())
 	admin.Post(fmt.Sprintf("/hosts/:%s/cordon", id), h.HandleOperatorCordonHost)
 	admin.Post(fmt.Sprintf("/hosts/:%s/uncordon", id), h.HandleOperatorUncordonHost)
@@ -206,8 +222,6 @@ func Register(app fiber.Router, h *handlers.Handler, mw *middlewares.Middleware,
 	// (--verify-billing-pubkey).
 	internal.Get(fmt.Sprintf("/billing/sandboxes/:%s", id),
 		mw.MustBeIssuedBy("billing"), h.HandleBillingGetSandbox)
-	// DB reads + writes: JWT-required. Writes additionally check
-	// sandbox ownership (MustBeOwningHost inside registerDBProxy).
 	// Wake-on-request: the ingress (mTLS role=ingress) hits this when a
 	// browser lands on the public URL of a paused sandbox. Fires a resume
 	// and returns 202 immediately; the ingress serves the waking page and
@@ -216,6 +230,7 @@ func Register(app fiber.Router, h *handlers.Handler, mw *middlewares.Middleware,
 	// control forwarding a cross-region wake (it dials with its own cert).
 	internal.Post(fmt.Sprintf("/sandboxes/:%s/wake", id), mw.MustBePeerRoleMTLS("ingress", "control"), h.HandleInternalWake)
 
+	// DB RPCs use role-scoped mTLS and host ownership checks in registerDBProxy.
 	dbGroup := internal.Group("/db")
 	registerDBProxy(dbGroup, h, mw)
 }
@@ -247,6 +262,12 @@ func registerDBProxy(g fiber.Router, h *handlers.Handler, mw *middlewares.Middle
 	owningHost := mw.MustBeOwningHost()
 	scopedRead := mw.MustOwnSandboxIfHostRole()
 	scopedHostQuery := mw.MustOwnHostQueryIfHostRole("host")
+
+	// Snapshot workers may read and update only their assigned rows.
+	g.Get("/snapshots", hostOnly, h.DbListSnapshotJobs)
+	g.Get(fmt.Sprintf("/snapshots/:%s", middlewares.ParamSnapshotID), hostOnly, h.DbGetHostSnapshot)
+	g.Get(fmt.Sprintf("/snapshots/:%s/source", middlewares.ParamSnapshotID), hostOnly, h.DbSnapshotSource)
+	g.Post(fmt.Sprintf("/snapshots/:%s/:%s", middlewares.ParamSnapshotID, middlewares.ParamSnapshotAction), hostOnly, h.DbSnapshotProgress)
 
 	// Sandboxes table
 	// Static paths registered before the :id wildcard so Fiber doesn't
@@ -302,7 +323,7 @@ func registerDBProxy(g fiber.Router, h *handlers.Handler, mw *middlewares.Middle
 	// (which would suppress the stale-host eviction scheduler relies on).
 	g.Patch(fmt.Sprintf("/hosts/:%s/heartbeat", id), hostOnly,
 		mw.MustBeSelfHostFromParam(id), h.DbHeartbeatHost)
-	// Pause / resume / fork — all JWT-gated writes, hosts call these
+	// Pause / resume / fork — host-role mTLS writes; hosts call these
 	// from their pause/resume goroutines. The sandbox id rides in the
 	// JSON body (not the URL), so apply the body-scoped variants of
 	// MustBeOwningHost / MustBeSelfHost to prevent host-A from

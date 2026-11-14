@@ -8,8 +8,8 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/bake"
-	"github.com/NodeOps-app/sandbox/internal/logging"
+	"github.com/NodeOps-app/createos-sandbox/internal/bake"
+	"github.com/NodeOps-app/createos-sandbox/internal/logging"
 )
 
 func main() {

@@ -1,18 +1,12 @@
-// Rootfs is a tiny TTL cache for the cluster-wide rootfs
-// catalog: the union of names advertised across active hosts + the
-// rootfs_catalog metadata map. Every create call queries both today
-// (see clusterRootfsUnion) at ~10ms p50 / ~80ms p99 per lookup — under
-// N=100 burst that's the third-largest server-side stage. The union
-// changes only when a host restarts or an operator flips rootfs_catalog,
-// so a 30s TTL matches the freshness callers actually need.
+// Rootfs caches the cluster-wide rootfs catalog: image names advertised by
+// available hosts and metadata from rootfs_catalog. Nonempty catalogs default
+// to a 30-second TTL with request-triggered background refresh; missing or empty
+// catalogs refresh synchronously before use.
 //
-// SAFETY: this cache holds ONLY catalog rootfs — names from
-// hosts.rootfses and rows from rootfs_catalog. User templates
-// (tpl_<ulid>, resolved from the per-user templates table) never pass
-// through here; their code path skips clusterRootfsUnion entirely by
-// checking the TemplateIDPrefix. Get returns an explicit "not cached"
-// signal for any name with that prefix as belt-and-suspenders in case
-// a future caller forgets the guard.
+// User templates are resolved through their owner-scoped template records and
+// must not enter this shared catalog. Callers use IsTemplateName to distinguish
+// template references before consulting the catalog; the cache stores snapshots,
+// not individual name lookups.
 package cache
 
 import (
@@ -23,12 +17,12 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Snapshot is what a cached union call returns. Held immutably: callers
 // treat both fields as read-only. Refreshing swaps a whole new Snapshot
-// in one pointer store, so a reader never sees a half-updated slice.
+// under the cache mutex, so a reader never sees a half-updated slice.
 type Snapshot struct {
 	Names   []string                        // sorted, deduped, disabled filtered out
 	MetaByN map[string]models.RootfsCatalog // every rootfs_catalog row keyed by name
@@ -42,11 +36,8 @@ type Rootfs struct {
 	snap *Snapshot
 	exp  time.Time
 
-	// sf dedups concurrent misses. Without this, a burst that arrives
-	// right after TTL expiry would fire N parallel DB refreshes (each
-	// doing ListHosts + ListRootfsMetadata) — a classic thundering herd.
-	// With single-flight the first miss owns the DB call; every other
-	// concurrent miss blocks on the same call and gets the same result.
+	// sf deduplicates refreshes. Cold/empty-cache callers wait for one load;
+	// callers with a stale nonempty snapshot keep using it during refresh.
 	sf singleflight.Group
 
 	hits   atomic.Uint64
@@ -54,9 +45,7 @@ type Rootfs struct {
 	loads  atomic.Uint64 // number of DB round-trips (should be << misses under burst)
 }
 
-// New constructs a Cache with the given TTL. ttl<=0 defaults to 30s
-// (the rootfs union changes on the scale of host restarts / operator
-// deprecations — minutes-to-days between events).
+// NewRootfs constructs a catalog cache. A non-positive TTL defaults to 30s.
 func NewRootfs(ttl time.Duration) *Rootfs {
 	if ttl <= 0 {
 		ttl = 30 * time.Second
@@ -102,9 +91,8 @@ func (c *Rootfs) Put(s *Snapshot) {
 	c.mu.Unlock()
 }
 
-// Invalidate drops the cached snapshot. Called after operator writes
-// that change the catalog (host register/deregister, disable/enable a
-// rootfs) so the change is visible on the next Get.
+// Invalidate drops the cached snapshot. Host registration calls it so the
+// next lookup reloads the catalog. Other catalog changes rely on TTL refresh.
 func (c *Rootfs) Invalidate() {
 	c.mu.Lock()
 	c.snap = nil
@@ -120,18 +108,17 @@ func (c *Rootfs) Invalidate() {
 // that used to block on singleflight now all return in µs, while one
 // background goroutine silently updates the cache for the next tick.
 //
-// Only path that blocks is the truly-empty cache (first request ever,
-// or right after Invalidate() until the refresh completes) — a
+// A missing snapshot or a catalog with no image names blocks on a
+// refresh, including before TTL expiry. This lets recovered hosts become
+// visible without first rejecting a create using an empty catalog. A
 // synchronous single-flighted load is unavoidable because we have
 // nothing to serve. Failed loads never poison the cache.
 //
-// Staleness bound: at most one refresh-duration behind reality (~150ms
-// under a hot DB). The refresh timer is not proactive — a stale entry
-// stays stale until the next Get() triggers the async refresh.
-// Acceptable because rootfs data changes on the order of hours-to-days.
+// Nonempty catalogs use request-triggered refresh: the first request after
+// expiry still receives the old catalog while the refresh runs.
 func (c *Rootfs) GetOrLoad(load func() (*Snapshot, error)) (*Snapshot, error) {
 	snap, exp := c.getRaw()
-	if snap != nil {
+	if snap != nil && len(snap.Names) != 0 {
 		if time.Now().After(exp) {
 			// Stale — fire background refresh, don't wait. singleflight
 			// dedups concurrent stale-triggered refreshes to one at a
@@ -150,11 +137,13 @@ func (c *Rootfs) GetOrLoad(load func() (*Snapshot, error)) (*Snapshot, error) {
 		}
 		return snap, nil
 	}
-	// Cold cache: no value to serve stale, must block on load.
+	// A missing or empty catalog must refresh synchronously. An empty union
+	// may mean all hosts were temporarily dead, not that the requested image
+	// is invalid. Serving it until TTL expiry would reject recovered hosts.
 	c.misses.Add(1)
 	v, err, _ := c.sf.Do("union", func() (any, error) {
 		// Double-check under sf — another caller may have filled during queue.
-		if s, _ := c.getRaw(); s != nil {
+		if s, _ := c.getRaw(); s != nil && len(s.Names) != 0 {
 			return s, nil
 		}
 		c.loads.Add(1)
@@ -176,8 +165,7 @@ func (c *Rootfs) GetOrLoad(load func() (*Snapshot, error)) (*Snapshot, error) {
 // should NEVER look up template names in this cache — templates are
 // per-user and live in the templates table, not rootfs_catalog. The
 // create handler already guards its clusterRootfsUnion calls with
-// this prefix check; this helper is exposed so the cache layer can
-// enforce it again as belt-and-suspenders.
+// this prefix check; this helper does not filter snapshots stored by Put.
 func IsTemplateName(name string) bool {
 	return strings.HasPrefix(name, models.TemplateIDPrefix)
 }

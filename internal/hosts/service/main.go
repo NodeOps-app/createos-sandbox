@@ -5,11 +5,11 @@ import (
 	"crypto/ed25519"
 	"sync"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // requireOwner is the central ownership check. Returns api.ErrNotFound
@@ -68,6 +68,7 @@ type Service struct {
 	// Internal coordination state for the pause/templates workflows.
 	tplMu       sync.Mutex
 	tplInflight map[string]chan struct{}
+	tplUses     map[string]*templateUse
 
 	// transitionInflight gates runPause/runResume against double-trigger
 	// from HTTP and the reconcile poll. Key = sandbox id. tryClaim
@@ -75,6 +76,12 @@ type Service struct {
 	// returns no-op. Both code paths land in the same goroutine; one
 	// wins, the other is a 10µs no-op.
 	transitionInflight sync.Map // map[id]struct{}
+
+	// snapshotMu bounds capture/upload IO to one worker per host.
+	snapshotMu sync.Mutex
+
+	snapshotCache *snapshotDownloadCache
+	diskBudget    *diskBudget
 
 	// bootSlots bounds how many firecracker.Start calls run concurrently
 	// on this host. Mitigates the nested-virt PCI MMIO race observed on
@@ -146,6 +153,18 @@ func (s *Service) SecretToken(ctx context.Context, id string) (string, error) {
 		return "", api.ErrNotFound
 	}
 	return sb.SecretToken, nil
+}
+
+func (s *Service) OpenFileTransfer(ctx context.Context, id, caller string) (*api.FileTransferTarget, error) {
+	if _, err := s.loadOwned(ctx, id, caller); err != nil {
+		return nil, err
+	}
+	sb, ok := s.Mgr.Lookup(id)
+	if !ok {
+		return nil, api.ErrNotFound
+	}
+	ctx, cancel := sb.FileTransferContext(ctx)
+	return &api.FileTransferTarget{IP: sb.IP, Token: sb.SecretToken, Context: ctx, Cancel: cancel}, nil
 }
 
 // LookupIP returns the live VM IP without per-user owner scoping. See

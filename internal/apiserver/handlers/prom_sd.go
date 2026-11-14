@@ -10,8 +10,8 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/metrics"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
 )
 
 // promSDTarget matches Prometheus's http_sd response shape.

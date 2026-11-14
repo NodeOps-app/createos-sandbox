@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -15,7 +15,6 @@ import (
 // user request is traceable across control → scheduler → host.
 const HeaderRequestID = "X-Request-Id"
 
-// ctxKeyRequestID is a private type for ctx.Value lookup.
 // WithRequestID returns a child context that carries the given request
 // id. Background goroutines spawned mid-request should derive from this
 // so their logs and outbound RPCs stay correlated.

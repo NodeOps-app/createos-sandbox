@@ -12,8 +12,8 @@ import (
 //
 // Bucket size 10, refill 1 per 10s. Mutex-protected map of buckets.
 // Tokens are consumed BEFORE the control-plane round-trip; once a
-// bucket is empty subsequent attempts return immediately, masking the
-// timing-oracle channel.
+// bucket is empty subsequent attempts return immediately without a lookup.
+// Allowed attempts can still have different timings.
 type connRateLimiter struct {
 	mu      sync.Mutex
 	buckets map[string]*tokenBucket
@@ -63,7 +63,8 @@ func (r *connRateLimiter) Allow(key string) bool {
 	}
 	b.tokens -= 1.0
 
-	// Opportunistic reap of cold buckets to keep the map bounded.
+	// Reap cold buckets opportunistically. Recent source-IP churn can still
+	// grow the map beyond 1024; this threshold is not a hard entry cap.
 	if len(r.buckets) > 1024 {
 		for k, v := range r.buckets {
 			if now.Sub(v.updated) > rlReapAfter {

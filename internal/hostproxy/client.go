@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
 )
 
 // APIClient speaks to createos's HTTP API to resolve a source IP into

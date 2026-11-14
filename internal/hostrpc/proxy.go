@@ -8,16 +8,18 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 var ErrResponseTooLarge = errors.New("host response exceeds buffered limit")
 
 // ForwardRequest describes an HTTP request that control proxies to a machine
-// host. Body may be streaming; callers retain responsibility for closing it.
+// host. Body may be streaming; callers retain responsibility for its lifecycle.
+// WithoutTimeout clears only http.Client.Timeout; context and transport
+// deadlines still apply.
 type ForwardRequest struct {
 	Method         string
 	Path           string
@@ -40,8 +42,10 @@ var proxyHopByHop = map[string]struct{}{
 	"upgrade":             {},
 }
 
-// Forward sends a client-shaped request to a host while stripping credentials
-// and hop-by-hop headers. The returned response body belongs to the caller.
+// Forward sends a request to a host, removing the explicit credential and
+// hop-by-hop header names listed below. It is not a general header allowlist.
+// Callers must authorize the operation and supply a trusted UserID. The
+// returned response body belongs to the caller.
 func Forward(ctx context.Context, httpClient *http.Client, host models.Host, in ForwardRequest) (*http.Response, error) {
 	if httpClient == nil {
 		return nil, fmt.Errorf("hostrpc requires an HTTP client")

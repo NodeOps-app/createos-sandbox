@@ -1,13 +1,12 @@
-// Package middlewares holds the scheduler service's HTTP middleware —
-// one fiber gate per file, each a method on Middleware with its logic
-// declared inline. internal/auth is referenced only for shared types
-// and locals-key constants; the gate logic itself lives here.
+// Package middlewares provides optional JWT authentication middleware.
+// The current scheduler server uses listener-level TLS client verification
+// when configured and does not install these gates.
 package middlewares
 
 import (
 	"strings"
 
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
 )
 
 const (

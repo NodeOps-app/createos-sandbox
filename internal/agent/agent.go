@@ -18,9 +18,10 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/NodeOps-app/sandbox/internal/agent/childreaper"
-	agentprocess "github.com/NodeOps-app/sandbox/internal/agent/process"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/agent/childreaper"
+	agentprocess "github.com/NodeOps-app/createos-sandbox/internal/agent/process"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
 )
 
 const (
@@ -46,10 +47,17 @@ var sandboxIDCh = make(chan string, 1)
 var phase2DiskReady atomic.Bool
 
 // Run runs the guest agent. It is normally invoked as PID 1 inside the VM.
-// Split into two phases so the template snapshot is taken BEFORE any
-// filesystem mounts — each restored VM mounts /dev/vdb fresh, giving it the
+// The read-only rootfs is mounted before the template snapshot. Each
+// restored VM mounts its private writable /dev/vdb fresh, giving it the
 // correct size automatically (no resize2fs dance).
 func Run() {
+	if len(os.Args) == 2 && os.Args[1] == "--warmup-rootfs" {
+		if err := warmImage("/lower"); err != nil {
+			// Never log image-controlled names or parser input.
+			fmt.Fprintln(os.Stderr, "agent: invalid or unreadable image warmup ignored")
+		}
+		return
+	}
 	// ─── Phase 1: pre-overlay setup (runs in the template; frozen in snapshot)
 	mustMount("proc", "/proc", "proc", 0, "")
 	mustMount("sysfs", "/sys", "sysfs", 0, "")
@@ -65,8 +73,8 @@ func Run() {
 	//   - chmod 0 on /proc/sysrq-trigger gets reset back to 0200 by
 	//     procfs on the next open.
 	// We still set the sysctl so the keyboard path is closed, even
-	// though the proc trigger remains live; closing it fully needs a
-	// kernel config change. Self-DoS only, no cross-tenant
+	// though the proc trigger remains live. Tracked: needs kernel
+	// rebuild for full mitigation. Self-DoS only, no cross-tenant
 	// impact (each guest has its own kernel).
 	_ = os.WriteFile("/proc/sys/kernel/sysrq", []byte("0\n"), 0o644)
 
@@ -75,6 +83,17 @@ func Run() {
 
 	if err := configureNetworkFromMMDS(); err != nil {
 		fmt.Fprintf(os.Stderr, "agent: network config from MMDS failed: %v\n", err)
+	}
+
+	if parseCmdlineArg("overlay_root") != "" {
+		// Keep only immutable image state in the reusable snapshot. Writable
+		// disk setup and per-sandbox changes still happen in phase 2.
+		os.MkdirAll("/lower", 0755)
+		if err := syscall.Mount("/dev/vda", "/lower", "ext4", syscall.MS_RDONLY, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "agent: cannot mount read-only rootfs")
+			select {} // Do not advertise template readiness without its rootfs.
+		}
+		prepareWarmup()
 	}
 
 	// Background watchers — goroutines survive the snapshot and keep running
@@ -147,6 +166,14 @@ func Run() {
 	overlayRoot := parseCmdlineArg("overlay_root")
 	if overlayRoot != "" {
 		setupOverlay(overlayRoot) // mounts /dev/vdb fresh → correct size
+	}
+
+	// Restore directory checkpoint mounts before starting services or hooks.
+	if err := guestCheckpoints.initialize(); err != nil {
+		fmt.Fprintf(os.Stderr, "agent: directory checkpoint recovery failed: %v\n", err)
+		// Treat this like a rootfs mount failure. Do not leave a listener
+		// accepting TCP while silently exposing an older directory view.
+		os.Exit(1)
 	}
 
 	// Container-runtime environment setup, done once at boot so Docker and
@@ -232,7 +259,7 @@ func Run() {
 	phase2DiskReady.Store(true)
 	// Slow disk-apply retry loop. watchMMDS runs the fast path on every
 	// MMDS change; this catches "MMDS unchanged but earlier mount
-	// failed" and retries every 30 s without bothering the 2 ms hot loop.
+	// failed" and retries every 30 s independently of the adaptive MMDS polling interval.
 	go runDiskApplyLoop()
 	// Maintain long-running wall-clock accuracy with four tiny public SNTP
 	// exchanges per day. This is asynchronous and never delays readiness.
@@ -379,30 +406,15 @@ func configureNetworkFromMMDS() error {
 	return fmt.Errorf("MMDS returned no network config within deadline")
 }
 
-// watchMMDS polls MMDS for (a) IP changes — reapplies eth0 config — and
-// (b) the phase:"live" signal from the host, which unblocks phase 2.
-//
-// Poll interval is adaptive: starts at 2 ms (so post-snapshot-restore
-// latency to "agent reachable on new IP" is negligible — the guest can
-// only accept the host's first TCP SYN after MMDS has been read and
-// eth0 reconfigured), and doubles on every poll that returns an
-// identical doc, capping at 200 ms. Any change resets to 2 ms so we
-// stay responsive after resume / disk attach / hostname change /
-// secret push. Steady-state per-VM cost drops from ~17% of one core
-// (500 Hz polling) to <0.5% — multiplied across hundreds of VMs this
-// is the difference between a busy host and an idle one.
+// MMDS polling starts at 2 ms and backs off on unchanged documents. The
+// initial cap is 20 ms; watchMMDS raises it to 200 ms five minutes after claim.
 const (
 	mmdsPollMin = 2 * time.Millisecond
-	// Capped at 20ms (was 200ms). Regular MMDS activity keeps the guest
-	// vCPU warm — KVM halt-poll stays within its budget, so a real event
-	// (exec TCP packet arriving) doesn't have to fully wake a deep-halted
-	// vCPU. In production this shows as slow-first-exec-after-idle
-	// dropping from ~150ms to ~30-50ms.
-	// Cost: ~2% extra guest vCPU + ~50 KB/s MMDS traffic per VM.
-	// Revert to 200ms if issue not observed.
 	mmdsPollMax = 20 * time.Millisecond
 )
 
+// watchMMDS applies host-provided network, token, hostname, clock, and disk
+// updates and unblocks phase 2 when the host publishes phase:"live".
 func watchMMDS() {
 	phase2Sent := false
 	lastAppliedNowNS := int64(0)
@@ -411,25 +423,16 @@ func watchMMDS() {
 	var lastDoc mmdsDoc
 	haveLastDoc := false
 	interval := mmdsPollMin
-	// Post-claim relaxation: pool VMs need aggressive polling so the vCPU
-	// stays warm (see mmdsPollMax comment) and so any host-side event lands
-	// in <20ms. Once claimed by a tenant, and 5 minutes have elapsed since
-	// that claim, the tenant's steady state is established: relax the cap
-	// to 200 ms to give back the ~2% guest vCPU we spend on polling. Live
-	// events (disk attach, clock refresh) still push MMDS and reset
-	// interval to the 2 ms floor via the doc-change branch below, so the
-	// relaxation only affects the true-idle case.
+	// Relax the polling cap five minutes after claim. Changes reset the
+	// interval only once observed, so detection still depends on polling.
 	var claimedAtMs int64
 	pollMax := mmdsPollMax
 	const relaxAfter = 5 * time.Minute
 	const relaxedPollMax = 200 * time.Millisecond
 	for {
 		time.Sleep(interval)
-		// No per-tick `ip route add` re-issue here — snapshots preserve
-		// routes, and this loop runs ~500 times/sec. Each busybox fork+
-		// execve was ~10 ms of scheduler work per poll on a shared
-		// vCPU, adding ~100 ms of jitter to spawn latency. If MMDS ever
-		// genuinely becomes unreachable we re-add it reactively below.
+		// Snapshots preserve routes. Avoid spawning ip on every poll;
+		// retry the MMDS route only after a fetch failure below.
 		doc, err := fetchMMDS(300 * time.Millisecond)
 		if err != nil {
 			// Recover from "route vanished" (shouldn't normally happen
@@ -442,8 +445,8 @@ func watchMMDS() {
 				fmt.Fprintf(os.Stderr, "agent: re-apply network failed: %v\n", err)
 			}
 		}
-		// Stash the per-VM secret on first non-empty push. setToken is a
-		// no-op for subsequent pushes — the token never rotates.
+		// Apply the host's current secret, including a new identity when
+		// restoring a full snapshot into a different sandbox.
 		if doc.Token != "" {
 			setToken(doc.Token)
 		}
@@ -474,7 +477,7 @@ func watchMMDS() {
 		// the `now_ns` we read here is whatever the host PUT'd at restore
 		// (or whatever the previous restore wrote, if no new push since)
 		// and never changes on its own. Without dedup, we'd re-clobber
-		// the system clock back to the restore moment every 2ms and
+		// the system clock back to the restore moment on every poll and
 		// freeze guest time. lastAppliedNowNS holds the last value we've
 		// already acted on; we only fire on a new value.
 		if doc.NowNS > 0 && doc.NowNS != lastAppliedNowNS {
@@ -522,9 +525,8 @@ func watchMMDS() {
 			applyDisks(doc.Disks)
 		}
 		// Adaptive interval: if the doc is identical to the last one we
-		// saw, double the sleep (capped at 200 ms). Any change snaps us
-		// back to the 2 ms floor so post-restore / post-resume reactions
-		// stay near-instant.
+		// saw, double the sleep up to pollMax. An observed change resets
+		// the interval to the 2 ms floor.
 		// Latch the claim timestamp and, once 5 minutes have passed since
 		// claim, permanently relax the poll cap. Latched only-once so a
 		// later MMDS mutation that carries claimed_at_ms=0 doesn't yo-yo
@@ -810,12 +812,7 @@ func setupOverlay(overlayRoot string) {
 	os.MkdirAll("/overlay/upper", 0755)
 	os.MkdirAll("/overlay/work", 0755)
 
-	// Mount base rootfs read-only
-	os.MkdirAll("/lower", 0755)
-	if err := syscall.Mount("/dev/vda", "/lower", "ext4", syscall.MS_RDONLY, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "mount rootfs: %v\n", err)
-		return
-	}
+	// /lower is already mounted read-only and survives snapshot restore.
 
 	// Create merged overlay view
 	os.MkdirAll("/merged", 0755)
@@ -935,6 +932,13 @@ func handleAgentConn(conn net.Conn) {
 		return
 	}
 
+	// Normal exec JSON still follows the existing path. Checkpoint RPCs use
+	// an explicit prefix on the same authenticated connection, not a shell command.
+	if first, _ := reader.Peek(1); len(first) == 1 && first[0] == proto.CheckpointRequestPrefix[0] {
+		handleCheckpointConn(conn, reader)
+		return
+	}
+
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		writeJSON(conn, proto.ExecResponse{ExitCode: -1, Error: fmt.Sprintf("read error: %v", err)})
@@ -952,13 +956,15 @@ func handleAgentConn(conn net.Conn) {
 		return
 	}
 
-	// Execute the command in its own process group. Cap each output
+	// Execute in a private cgroup so cancellation stops descendants too. Cap each output
 	// buffer at 1 MiB so a runaway command (`yes`, etc.) can't OOM
 	// the agent — agent is PID 1, so its death takes the VM with it.
 	// Truncation emits a sentinel suffix; the exit code still flows.
-	// Context-bound: if the command runs past execTimeoutBuffered the
-	// kernel sends SIGKILL automatically (CommandContext semantics).
-	ctx, cancel := context.WithTimeout(context.Background(), execTimeoutBuffered)
+	// Connection closure or the runtime ceiling cancels the command, with
+	// SIGTERM followed by cgroup-wide SIGKILL after the grace period.
+	clientCtx, stop := requestctx.WithDisconnect(context.Background(), conn)
+	defer stop()
+	ctx, cancel := context.WithTimeout(clientCtx, execTimeoutBuffered)
 	defer cancel()
 	stdout := &capBuffer{max: maxExecOutputBytes}
 	stderr := &capBuffer{max: maxExecOutputBytes}
@@ -968,7 +974,12 @@ func handleAgentConn(conn net.Conn) {
 	if req.Stdin != "" {
 		cmd.Stdin = boundedStdin(req.Stdin)
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cleanup, err := agentprocess.BindExecCommand(cmd)
+	if err != nil {
+		writeJSON(conn, proto.ExecResponse{ExitCode: -1, Error: err.Error()})
+		return
+	}
+	defer cleanup()
 	// Merge the host-injected env-var map into the agent's inherited
 	// environment. Inheriting first guarantees PATH/HOME/TERM (set in
 	// phase 2) reach the child; appending after means later entries —
@@ -1009,27 +1020,27 @@ func handleAgentConn(conn net.Conn) {
 }
 
 // handleStreamingExec runs the command and emits one NDJSON event per
-// stdout/stderr chunk. A 5s heartbeat keeps the connection observable
-// even on silent commands. When the conn write fails (host hung up),
-// we cancel the command via SIGTERM → SIGKILL grace.
+// stdout/stderr chunk. A 5s heartbeat keeps the stream observable; socket
+// closure cancels silent commands without waiting for a failed write.
+// Cancellation terminates the command's cgroup with SIGTERM → SIGKILL grace.
 //
-// Encoding strategy:
-//   - Use Pipe() rather than buffer attachment so we can scan output in
-//     real time, not on cmd exit.
-//   - Two goroutines (stdout/stderr) push events through a single
-//     channel; the writer goroutine flushes one at a time. JSON encoder
-//     access is mutex-protected so a heartbeat never interleaves into
-//     the middle of an output event.
+// Stdout and stderr are read from separate pipes as output arrives.
+// Both readers and the heartbeat serialize JSON writes through one mutex
+// so their events cannot interleave on the connection.
 func handleStreamingExec(conn net.Conn, req proto.ExecRequest) {
-	// Context-bound: if the command outlives execTimeoutStreaming, the
-	// kernel SIGKILLs it (CommandContext semantics). The 5s heartbeat
-	// already catches the case where the client disconnects; this
-	// timeout backstops the case where the client stays alive but the
-	// command is stuck forever (`cat /dev/zero`, `sleep 86400`).
-	ctx, cancel := context.WithTimeout(context.Background(), execTimeoutStreaming)
+	// Both client disconnect and the runtime ceiling terminate the command
+	// and its descendants. Heartbeats remain useful to stream consumers.
+	clientCtx, stopClient := requestctx.WithDisconnect(context.Background(), conn)
+	defer stopClient()
+	ctx, cancel := context.WithTimeout(clientCtx, execTimeoutStreaming)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, req.Cmd, req.Args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cleanup, err := agentprocess.BindExecCommand(cmd)
+	if err != nil {
+		emitExecEvent(conn, nil, proto.ExecStreamEvent{Error: err.Error()})
+		return
+	}
+	defer cleanup()
 	if len(req.Env) > 0 {
 		env := os.Environ()
 		for k, v := range req.Env {
@@ -1055,22 +1066,10 @@ func handleStreamingExec(conn net.Conn, req proto.ExecRequest) {
 		return
 	}
 
-	// writeMu serialises emissions so an HB tick never arrives mid-line.
-	// killOnce ensures we only signal the process tree once even if both
-	// the writer goroutine and the heartbeat detect the broken pipe.
+	// writeMu serialises emissions so a heartbeat never splits an event.
 	var writeMu sync.Mutex
-	var killOnce sync.Once
 	stop := make(chan struct{})
-	kill := func() {
-		killOnce.Do(func() {
-			// Negative pgid = entire process group, matches Setpgid above.
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-			go func() {
-				time.Sleep(2 * time.Second)
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}()
-		})
-	}
+	kill := cancel
 
 	// Writer helper. Returns false on conn write failure → caller should
 	// trigger kill + bail. Locks writeMu so HB cannot interleave.
@@ -1196,31 +1195,16 @@ const maxExecOutputBytes = 1 << 20
 // 10× headroom for legitimate "pipe in a file" usage but is still bounded.
 const maxExecInputBytes = 10 << 20
 
-// execTimeoutBuffered is the hard ceiling on a buffered (`createos-cli exec`)
-// command's wall-clock runtime. Commands that don't exit within this
-// window get SIGKILLed via the cmd's context. Without it, a request like
-// `sleep 86400` would hold a goroutine + TCP connection on agent and host
-// until the host's HTTP timeout — fine for a single test, catastrophic
-// for an attacker hitting it in a loop (PID 1 OOM = VM dies).
-//
-// Bumped from 5m to 1h (aligned with execTimeoutStreaming) so legitimate
-// long-running buffered commands (npm install on big trees, apt upgrade,
-// dataset downloads, big test suites) don't have to switch to the
-// streaming variant just to dodge the cap. The edge proxy's idle
-// timeout must be at least as long, so the full request stays alive
-// end-to-end.
-//
-// Memory-pressure footprint is still bounded: each in-flight exec holds
-// ~10 KiB of goroutine stack + one TCP/vsock conn. A small s-1vcpu-256mb
-// VM can absorb thousands of concurrent execs before PID-1 OOM, and the
-// damage stays inside the caller's own VM.
+// execTimeoutBuffered caps a buffered command's wall-clock runtime at one
+// hour. The deadline or client disconnect cancels the command and terminates
+// its cgroup. Output buffers have separate byte limits; this timeout does not
+// limit the number of concurrent exec requests.
 const execTimeoutBuffered = 1 * time.Hour
 
 // execTimeoutStreaming is the ceiling on a streaming (`createos-cli exec --stream`)
 // command. Streaming exec is the long-running flavor (tail -f, build
-// watches) so the budget is higher. The 5s heartbeat already kills the
-// command when the client hangs up; this timeout backstops the case
-// where the client stays connected but the command runs forever.
+// watches). Connection closure cancels the command directly; this
+// timeout also bounds commands whose clients remain connected.
 const execTimeoutStreaming = 1 * time.Hour
 
 // boundedStdin returns an io.Reader over s that exposes at most

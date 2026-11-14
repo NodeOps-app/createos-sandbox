@@ -16,9 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
@@ -57,6 +58,7 @@ func newFileClient(token string) *http.Client {
 			if err != nil {
 				return nil, err
 			}
+			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			// Single small write, no flush needed (TCP small-write
 			// nagle is fine here — the next write is the HTTP request
 			// line which arrives within microseconds).
@@ -64,7 +66,7 @@ func newFileClient(token string) *http.Client {
 				c.Close()
 				return nil, fmt.Errorf("write auth line: %w", werr)
 			}
-			return c, nil
+			return &fileConn{Conn: c}, nil
 		},
 		// Disable Keep-Alive: this client is constructed per request,
 		// so connection reuse never kicks in anyway. Explicit DisableKeepAlives
@@ -72,7 +74,11 @@ func newFileClient(token string) *http.Client {
 		// outlive the client.
 		DisableKeepAlives: true,
 	}
-	return &http.Client{Transport: tr, Timeout: 30 * time.Minute}
+	return &http.Client{Transport: tr, Timeout: 30 * time.Minute,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("guest file redirects are not permitted")
+		},
+	}
 }
 
 func (s *Server) handleFileUpload(c *fiber.Ctx) error {
@@ -86,35 +92,36 @@ func (s *Server) handleFileUpload(c *fiber.Ctx) error {
 		return httpx.Fail(c, fiber.StatusRequestEntityTooLarge, "file exceeds 10 GiB limit")
 	}
 
-	view, err := s.Svc.Get(c.UserContext(), id, utils.UserID(c))
+	target, err := s.Svc.OpenFileTransfer(c.UserContext(), id, utils.UserID(c))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return httpx.Fail(c, fiber.StatusNotFound, "sandbox not found")
 		}
-		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
+		log.WithContext(c.UserContext()).Errorf("[files.agent] target lookup: %v", err)
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 	}
-	if view.IP == nil || *view.IP == "" {
+	if target.IP == "" {
+		target.Cancel()
 		return httpx.Error(c, fiber.StatusServiceUnavailable, "sandbox has no ip")
 	}
-	token, err := s.Svc.SecretToken(c.UserContext(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return httpx.Fail(c, fiber.StatusNotFound, "sandbox not found")
-		}
-		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
-		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
+	release, ok := s.acquireFileTransfer(id)
+	if !ok {
+		target.Cancel()
+		c.Set(fiber.HeaderRetryAfter, "1")
+		return httpx.Fail(c, fiber.StatusTooManyRequests, "file transfer capacity busy")
 	}
-
-	u := url.URL{Scheme: "http", Host: net.JoinHostPort(*view.IP, strconv.Itoa(agentFilePort)), Path: "/files" + path}
+	transferCtx, stopTransfer := requestctx.WithFileTransfer(target.Context, c.Context().Conn())
+	finish := func() { stopTransfer(); target.Cancel(); release() }
+	defer finish()
+	u := url.URL{Scheme: "http", Host: net.JoinHostPort(target.IP, strconv.Itoa(agentFilePort)), Path: "/files" + path}
 	uploadBody := c.Context().RequestBodyStream()
 	if uploadBody == nil {
 		uploadBody = bytes.NewReader(c.Body())
 	}
 	uploadBody = io.LimitReader(uploadBody, proto.MaxFileUploadBytes+1)
-	req, err := http.NewRequestWithContext(c.UserContext(), http.MethodPut, u.String(), uploadBody)
+	uploadCtx, bodyReader, stopUpload := requestctx.WithFileUpload(transferCtx, uploadBody, c.Context().Conn())
+	defer stopUpload()
+	req, err := http.NewRequestWithContext(uploadCtx, http.MethodPut, u.String(), bodyReader)
 	if err != nil {
 		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
 
@@ -123,7 +130,7 @@ func (s *Server) handleFileUpload(c *fiber.Ctx) error {
 	if contentLength >= 0 {
 		req.ContentLength = contentLength
 	}
-	resp, err := newFileClient(token).Do(req)
+	resp, err := newFileClient(target.Token).Do(req)
 	if err != nil {
 		log.WithContext(c.UserContext()).Errorf("[files.agent] upstream error: %v", err)
 
@@ -147,54 +154,52 @@ func (s *Server) handleFileDownload(c *fiber.Ctx) error {
 		return httpx.Fail(c, fiber.StatusBadRequest, err.Error())
 	}
 
-	view, err := s.Svc.Get(c.UserContext(), id, utils.UserID(c))
+	target, err := s.Svc.OpenFileTransfer(c.UserContext(), id, utils.UserID(c))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return httpx.Fail(c, fiber.StatusNotFound, "sandbox not found")
 		}
-		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
+		log.WithContext(c.UserContext()).Errorf("[files.agent] target lookup: %v", err)
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 	}
-	if view.IP == nil || *view.IP == "" {
+	if target.IP == "" {
+		target.Cancel()
 		return httpx.Error(c, fiber.StatusServiceUnavailable, "sandbox has no ip")
 	}
-	token, err := s.Svc.SecretToken(c.UserContext(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return httpx.Fail(c, fiber.StatusNotFound, "sandbox not found")
+	release, ok := s.acquireFileTransfer(id)
+	if !ok {
+		target.Cancel()
+		c.Set(fiber.HeaderRetryAfter, "1")
+		return httpx.Fail(c, fiber.StatusTooManyRequests, "file transfer capacity busy")
+	}
+	transferCtx, stopTransfer := requestctx.WithFileTransfer(target.Context, c.Context().Conn())
+	finish := func() { stopTransfer(); target.Cancel(); release() }
+	streaming := false
+	defer func() {
+		if !streaming {
+			finish()
 		}
-		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
-		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
-	}
-
-	u := url.URL{Scheme: "http", Host: net.JoinHostPort(*view.IP, strconv.Itoa(agentFilePort)), Path: "/files" + path}
-	streamCtx, cancel := context.WithCancel(context.WithoutCancel(c.UserContext()))
-	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, u.String(), nil)
+	}()
+	u := url.URL{Scheme: "http", Host: net.JoinHostPort(target.IP, strconv.Itoa(agentFilePort)), Path: "/files" + path}
+	req, err := http.NewRequestWithContext(transferCtx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		cancel()
 		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
 
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 	}
-	fileClient := newFileClient(token)
-	fileClient.Timeout = 0 // stream lifetime is owned by cancel/client disconnect
+	fileClient := newFileClient(target.Token)
 	resp, err := fileClient.Do(req)
 	if err != nil {
-		cancel()
 		log.WithContext(c.UserContext()).Errorf("[files.agent] upstream error: %v", err)
 
 		return httpx.Error(c, fiber.StatusBadGateway, "upstream error")
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		defer resp.Body.Close()
-		cancel()
 		return httpx.Fail(c, fiber.StatusNotFound, "file not found")
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		defer resp.Body.Close()
-		cancel()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return httpx.Error(c, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -206,8 +211,9 @@ func (s *Server) handleFileDownload(c *fiber.Ctx) error {
 	c.Set("Content-Type", "application/octet-stream")
 	c.Status(resp.StatusCode)
 	upstream := resp.Body
+	streaming = true
 	c.Response().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
-		defer cancel()
+		defer finish()
 		defer upstream.Close()
 		buf := make([]byte, 64*1024)
 		for {
@@ -253,4 +259,44 @@ func validateFilePath(p string) error {
 		return errors.New("path must be canonical (no '..', '.', or '//')")
 	}
 	return nil
+}
+
+// Refresh both directions on progress: uploads may write for longer than the
+// idle limit while the response reader is already waiting for guest headers.
+type fileConn struct{ net.Conn }
+
+func (c *fileConn) NetConn() net.Conn { return c.Conn }
+
+func (c *fileConn) Read(b []byte) (int, error) {
+	_ = c.Conn.SetDeadline(time.Now().Add(time.Minute))
+	return c.Conn.Read(b)
+}
+func (c *fileConn) Write(b []byte) (int, error) {
+	_ = c.Conn.SetDeadline(time.Now().Add(time.Minute))
+	return c.Conn.Write(b)
+}
+
+// Reject excess work rather than queueing more stalled transfers. Limits are
+// shared by uploads/downloads and held until the response stream is closed.
+func (s *Server) acquireFileTransfer(id string) (func(), bool) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.fileCount >= 64 || s.fileTransfers[id] >= 8 {
+		return nil, false
+	}
+	if s.fileTransfers == nil {
+		s.fileTransfers = make(map[string]int)
+	}
+	id = strings.Clone(id)
+	s.fileCount++
+	s.fileTransfers[id]++
+	return func() {
+		s.fileMu.Lock()
+		defer s.fileMu.Unlock()
+		s.fileCount--
+		s.fileTransfers[id]--
+		if s.fileTransfers[id] == 0 {
+			delete(s.fileTransfers, id)
+		}
+	}, true
 }

@@ -11,9 +11,11 @@ import (
 )
 
 // LoadSnapshots scans m.SnapshotDir and registers any (shape, rootfs) snapshot
-// whose vmstate+mem files exist, the rootfs is still in the catalog, and the
-// rootfs file's mtime is not newer than the snapshot. Stale snapshots are
-// removed so the next prewarm/create rebuilds them.
+// whose state, memory, and base-overlay files exist, whose rootfs remains in
+// the catalog, and whose vmstate is not older than that rootfs. It reads the
+// generation manifest when present and falls back to the legacy fixed paths
+// only when no manifest exists. Invalid manifests are skipped; obsolete
+// rootfs entries and entries with missing base overlays are removed for rebuilding.
 //
 // Returns the number of ready snapshots registered.
 func (m *Manager) LoadSnapshots() (int, error) {

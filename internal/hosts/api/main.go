@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -19,11 +21,12 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
 	log "github.com/sirupsen/logrus"
+	"github.com/valyala/fasthttp"
 
-	"github.com/NodeOps-app/sandbox/internal/ca/crl"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/logging"
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/ca/crl"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/logging"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // buildHostTLSConfig assembles a TLS 1.3 server config wired for required
@@ -166,6 +169,14 @@ type Server struct {
 	computerMu          sync.Mutex
 	computerScreenshots map[string]struct{}
 	computerSlots       chan struct{}
+
+	fileMu        sync.Mutex
+	fileTransfers map[string]int
+	fileCount     int
+
+	processMu       sync.Mutex
+	processRequests map[string]int
+	processCount    int
 }
 
 // SetCordoned updates the cordoned flag from the host's poll loop.
@@ -181,6 +192,9 @@ func (s *Server) Run(ctx context.Context) error {
 	app := fiber.New(fiber.Config{
 		AppName:               "createos",
 		DisableStartupMessage: true,
+		// Ownership IDs are retained in sandbox state and stream callbacks.
+		// They must not alias request buffers recycled by fasthttp.
+		Immutable: true,
 		// Control retires its idle host connections after nine minutes. Keep
 		// the server side open slightly longer so a burst never races a host-side
 		// idle close and pays TCP+mTLS setup in the exec critical path.
@@ -198,12 +212,14 @@ func (s *Server) Run(ctx context.Context) error {
 			if status >= http.StatusInternalServerError {
 				remoteAddr, peerIdentity := httpx.RequestPeer(c)
 				log.WithContext(ctx).WithFields(log.Fields{
-					"status":      status,
-					"method":      c.Method(),
-					"path":        c.Path(),
-					"request_id":  c.Locals("requestid"),
-					"remote_addr": remoteAddr,
-					"mtls_peer":   peerIdentity,
+					"connection_id":   c.Context().ConnID(),
+					"response_status": fiber.StatusInternalServerError,
+					"status":          status,
+					"method":          c.Method(),
+					"path":            c.Path(),
+					"request_id":      c.Locals("requestid"),
+					"remote_addr":     remoteAddr,
+					"mtls_peer":       peerIdentity,
 				}).Errorf("[http-error] request failed: %v", err)
 
 				return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
@@ -211,6 +227,8 @@ func (s *Server) Run(ctx context.Context) error {
 			return httpx.Error(c, status, err.Error())
 		},
 	})
+
+	logHostConnectionErrors(app)
 
 	app.Use(recover.New())
 	app.Use(requestid.New())
@@ -259,6 +277,10 @@ func (s *Server) Run(ctx context.Context) error {
 	v1.Put("/sandboxes/:id/egress", mtlsControl, s.handleSetEgress)
 	v1.Delete("/sandboxes/:id", mtlsControl, s.handleDestroy)
 	v1.Post("/sandboxes/:id/exec", mtlsControl, s.handleExec)
+	v1.Post("/sandboxes/:id/checkpoints", mtlsControl, s.handleCheckpointProxy)
+	v1.Get("/sandboxes/:id/checkpoints", mtlsControl, s.handleCheckpointProxy)
+	v1.Delete("/sandboxes/:id/checkpoints/:"+proto.CheckpointIDParam, mtlsControl, s.handleCheckpointProxy)
+	v1.Post("/sandboxes/:id/checkpoints/:"+proto.CheckpointIDParam+"/restore", mtlsControl, s.handleCheckpointProxy)
 	v1.Post("/sandboxes/:id/processes", mtlsControl, s.handleProcessProxy)
 	v1.Get("/sandboxes/:id/processes", mtlsControl, s.handleProcessProxy)
 	v1.Get("/sandboxes/:id/processes/:process", mtlsControl, s.handleProcessProxy)
@@ -361,4 +383,44 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// Fiber replaces transport errors with generic HTTP errors. Capture diagnostics
+// before that conversion; an unread request can otherwise look like GET /.
+func logHostConnectionErrors(app *fiber.App) {
+	server := app.Server()
+	previous := server.ErrorHandler
+	server.ErrorHandler = func(c *fasthttp.RequestCtx, err error) {
+		fields := log.Fields{
+			"component": "host", "phase": "receive_request",
+			"remote_addr": c.RemoteAddr().String(), "local_addr": c.LocalAddr().String(),
+			"connection_id": c.ConnID(), "connection_request": c.ConnRequestNum(),
+			"error_type":               fmt.Sprintf("%T", err),
+			"request_headers_received": len(c.Request.Header.RawHeaders()) != 0,
+		}
+		// Do not log err.Error(): parser errors can contain raw request bytes,
+		// including credentials. Types and known OS errors retain the cause safely.
+		var netErr net.Error
+		if errors.As(err, &netErr) {
+			fields["timeout"] = netErr.Timeout()
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
+			fields["network_operation"] = opErr.Op
+			fields["network_error_type"] = fmt.Sprintf("%T", opErr.Err)
+		}
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			fields["os_error"] = errno.Error()
+		}
+		fields["eof"] = errors.Is(err, io.EOF)
+		fields["unexpected_eof"] = errors.Is(err, io.ErrUnexpectedEOF)
+		if state := c.TLSConnectionState(); state != nil {
+			fields["tls_handshake_complete"] = state.HandshakeComplete
+			fields["tls_version"] = state.Version
+			fields["tls_peer_verified"] = len(state.VerifiedChains) != 0
+		}
+		log.WithFields(fields).Warn("[http-connection-error] receiving request failed")
+		previous(c, err)
+	}
 }

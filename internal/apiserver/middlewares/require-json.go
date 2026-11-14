@@ -5,8 +5,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
 )
 
 // RequireJSON enforces that any user-facing request with a body uses
@@ -23,7 +23,7 @@ import (
 //   - Empty Content-Type — matches Fiber's default-to-JSON behaviour and
 //     keeps existing clients that omit the header working.
 //   - Routes that take raw bytes rather than JSON (file uploads).
-//   - The /v1/internal/* JWT-gated tree (may carry NDJSON log streams,
+//   - The /v1/internal/* separately authenticated tree (may carry NDJSON log streams,
 //     raw tunnel upgrades, etc).
 //   - Health / catalog probes.
 //
@@ -53,7 +53,7 @@ func (m *Middleware) RequireJSON() fiber.Handler {
 }
 
 // skipJSONEnforcement reports routes exempt from the JSON-only gate:
-// file upload (raw bytes), the internal JWT tree (NDJSON / tunnel
+// file upload (raw bytes), the separately authenticated internal tree (NDJSON / tunnel
 // upgrades / etc), and health/catalog probes.
 func skipJSONEnforcement(p string) bool {
 	switch {

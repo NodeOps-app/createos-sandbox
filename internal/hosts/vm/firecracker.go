@@ -15,7 +15,7 @@ import (
 	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // createBaseSnapshot boots a template VM of the given shape+rootfs, waits for
@@ -46,13 +46,9 @@ func (m *Manager) createBaseSnapshot(key shapeKey) error {
 	generation := strings.TrimPrefix(newSandboxID(), "sb-")
 	vmStatePath := filepath.Join(snapshotDir, "vmstate."+generation)
 	memFilePath := filepath.Join(snapshotDir, "mem."+generation)
-	// Template-side vsock UDS is temporary and is not a published snapshot
-	// artifact, so it does not need a generation suffix. Keeping this name
-	// short matters: sockaddr_un has a small fixed path limit, and a custom
-	// tpl_<ULID> shape directory plus another ULID exceeded it. The absolute
-	// path baked into vmstate is harmless because every restore supplies its
-	// own unique per-VM path through vsock_override.
-	vsockTemplateUDS := filepath.Join(snapshotDir, "vsock-template.uds")
+	// Keep runtime sockets short regardless of the configured artifact path.
+	// Restores replace this temporary path through vsock_override.
+	vsockTemplateUDS := runtimePath("fc-template-vsock-" + generation + ".uds")
 	_ = os.Remove(vsockTemplateUDS) // stale from prior prewarm
 	defer os.Remove(vsockTemplateUDS)
 
@@ -61,6 +57,9 @@ func (m *Manager) createBaseSnapshot(key shapeKey) error {
 	// per-VM overlay anyway — only vmstate+mem need to persist.
 	pn := m.Pool.Get()
 	defer m.Pool.Return(pn)
+	if err := BindVMIPToIface(vethNameFor(pn.ContainerID), pn.IP.IP.String()); err != nil {
+		return fmt.Errorf("template: bind network policy: %w", err)
+	}
 
 	// Base overlay lives inside the snapshot dir at a canonical, stable path.
 	// Firecracker bakes this path into vmstate; restoring the snapshot on a
@@ -166,6 +165,7 @@ func (m *Manager) createBaseSnapshot(key shapeKey) error {
 	// in NewManager, which sweeps orphans at the next serve startup.
 	fm, err := firecracker.NewMachine(ctx, cfg,
 		firecracker.WithLogger(log.NewEntry(log.StandardLogger())),
+		firecracker.WithProcessRunner(pn.trackProcess(buildFirecrackerCmd(ctx, cfg, 0, 0, nil, m.firecrackerRuntime, nil))),
 	)
 	if err != nil {
 		return fmt.Errorf("create template VM: %w", err)
@@ -180,7 +180,7 @@ func (m *Manager) createBaseSnapshot(key shapeKey) error {
 	fm.Handlers.FcInit = fm.Handlers.FcInit.AppendAfter(
 		firecracker.StartVMMHandlerName, pinToBootLaneHandler())
 
-	if err := fm.Start(ctx); err != nil {
+	if err := pn.start(ctx, fm); err != nil {
 		return fmt.Errorf("start template VM: %w", err)
 	}
 
@@ -190,8 +190,9 @@ func (m *Manager) createBaseSnapshot(key shapeKey) error {
 
 	// Wait for the agent to reach the phase-1 probe listener (port 1023) —
 	// this is the snapshot boundary. The agent has NOT mounted /dev/vdb yet
-	// and has NOT started the exec listener; every restored VM will do that
-	// fresh with its own overlay, which is how disk_mib sizing stays correct.
+	// and is not serving exec requests. The read-only rootfs and optional
+	// image page cache are ready; each restore mounts its own writable overlay
+	// fresh, which is how disk_mib sizing stays correct.
 	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer readyCancel()
 	if err := waitForPhase1Probe(readyCtx, pn.IP.IP.String()); err != nil {
@@ -254,10 +255,11 @@ func (m *Manager) createBaseSnapshot(key shapeKey) error {
 	}
 
 	files := &snapshotFiles{
-		VmStatePath: vmStatePath,
-		MemFilePath: memFilePath,
-		BaseOverlay: overlayPath,
-		Ready:       true,
+		FirecrackerBuild: m.firecrackerRuntime.Build,
+		VmStatePath:      vmStatePath,
+		MemFilePath:      memFilePath,
+		BaseOverlay:      overlayPath,
+		Ready:            true,
 	}
 	// This atomic rename is the only publication point. A crash before it
 	// leaves the prior manifest intact; readers can never observe a mixed
@@ -309,6 +311,12 @@ func (m *Manager) createFromSnapshot(id, name string, pn *PooledNet, overlayPath
 	m.SnapshotsMu.Unlock()
 	if !ok || !files.Ready {
 		return nil, fmt.Errorf("no snapshot for %s", key)
+	}
+	// The manifest selects the producer runtime, independently of the current
+	// default. Legacy templates use the same explicit legacy mapping as pauses.
+	runtime, err := loadFirecrackerRuntime(firecrackerRuntimeDir, files.FirecrackerBuild)
+	if err != nil {
+		return nil, fmt.Errorf("template Firecracker runtime: %w", err)
 	}
 	// Tamper check on the shared base.ext4 BEFORE handing it to
 	// firecracker for /snapshot/load. A mismatch means a previous
@@ -452,7 +460,7 @@ func (m *Manager) createFromSnapshot(id, name string, pn *PooledNet, overlayPath
 	uid := m.SlotUID(pn.VsockCID)
 	cfg.VMID = id
 	opts = append(opts, firecracker.WithProcessRunner(
-		buildFirecrackerCmd(ctx, cfg, uid, uid, []uint32{m.KVMGID()}, m.seccompFilterPath, guestConsole.writer())))
+		pn.trackProcess(buildFirecrackerCmd(ctx, cfg, uid, uid, []uint32{m.KVMGID()}, runtime, guestConsole.writer()))))
 	tNewMachine := time.Now()
 	fm, err := firecracker.NewMachine(ctx, cfg, opts...)
 	if err != nil {
@@ -518,7 +526,7 @@ func (m *Manager) createFromSnapshot(id, name string, pn *PooledNet, overlayPath
 	})
 
 	tStart := time.Now()
-	if err := fm.Start(ctx); err != nil {
+	if err := pn.start(ctx, fm); err != nil {
 		// Start spawns firecracker AND runs the init handler chain
 		// (LoadSnapshot etc.). When a later handler fails, the
 		// firecracker process is alive but the SDK doesn't reap it.
@@ -598,11 +606,9 @@ func (m *Manager) createFromSnapshot(id, name string, pn *PooledNet, overlayPath
 }
 
 // loadSnapshotFn returns a handler that PUTs /snapshot/load with optional
-// UFFD mem_backend, vsock_override, and/or block_path_overrides (all
-// cherry-picked features from our firecracker fork, not in stock v1.15.1).
-// The SDK's typed SnapshotLoadParams doesn't expose any of these fields,
-// so we build the JSON body by hand and send it over the API socket
-// directly.
+// UFFD mem_backend, vsock_override, and/or block_path_overrides. The
+// request includes extensions used by our Firecracker runtime that the SDK
+// integration does not model, so we build JSON and send it over the API socket.
 //
 //   - uffdSockPath != ""           → use UFFD mem backend instead of file-backed
 //   - vsockUDSPath != ""           → override the snapshot's baked-in vsock UDS path
@@ -614,7 +620,7 @@ func (m *Manager) createFromSnapshot(id, name string, pn *PooledNet, overlayPath
 //     Used at fork resume to point "overlayfs" at the
 //     fork's own paused-dir file instead of the
 //     source's (whose path the vmstate carries by
-//     accident of byte-identical R2 copy).
+//     accident of byte-identical object copy).
 func loadSnapshotFn(snapshotPath, memFilePath, uffdSockPath, vsockUDSPath string, blockPathOverrides map[string]string) func(context.Context, *firecracker.Machine) error {
 	return func(ctx context.Context, m *firecracker.Machine) error {
 		var memBackend string
@@ -767,7 +773,7 @@ func (m *Manager) createColdBoot(id string, pn *PooledNet, overlayPath, socketPa
 	uid := m.SlotUID(pn.VsockCID)
 	cfg.VMID = id
 	opts = append(opts, firecracker.WithProcessRunner(
-		buildFirecrackerCmd(ctx, cfg, uid, uid, []uint32{m.KVMGID()}, m.seccompFilterPath, guestConsole.writer())))
+		pn.trackProcess(buildFirecrackerCmd(ctx, cfg, uid, uid, []uint32{m.KVMGID()}, m.firecrackerRuntime, guestConsole.writer()))))
 	fm, err := firecracker.NewMachine(ctx, cfg, opts...)
 	if err != nil {
 		cancel()
@@ -787,7 +793,7 @@ func (m *Manager) createColdBoot(id string, pn *PooledNet, overlayPath, socketPa
 	// Cold boot is also the snapshot failure fallback. That path can recreate
 	// runtime/sb-* as root, so restore slot ownership immediately before launch.
 	m.ChownForSlot(SlotRuntimeDir(id), pn.VsockCID)
-	if err := fm.Start(ctx); err != nil {
+	if err := pn.start(ctx, fm); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start (cold): %w", err)
 	}

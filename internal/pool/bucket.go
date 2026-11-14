@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/config"
 )
 
 // bucketNames are the 24 hourly UTC bucket keys ("00" .. "23").

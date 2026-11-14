@@ -2,12 +2,14 @@ package vm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -18,6 +20,7 @@ import (
 // from a store.Record. Keeping this type inside the vm package avoids a
 // circular import on store.
 type RehydrateSpec struct {
+	Freezing              bool // durable reusable-capture freeze intent for this incarnation
 	ID                    string
 	IP                    string // VM IP, e.g. "192.168.0.4"
 	MAC                   string
@@ -143,6 +146,8 @@ func (m *Manager) Rehydrate(spec RehydrateSpec) error {
 	sb.BandwidthBaseline, sb.BandwidthIngressBaseline = totals[0], totals[1]
 	sb.BandwidthIngressBytes = spec.BandwidthIngressBytes
 
+	pn.trackExistingProcess(spec.FCPid)
+	sb.Freezing.Store(spec.Freezing)
 	m.Mu.Lock()
 	m.Sandboxes[spec.ID] = sb
 	m.Mu.Unlock()
@@ -236,8 +241,8 @@ func CleanupOrphan(spec OrphanCleanupSpec) {
 func CleanupVMArtifacts(spec OrphanCleanupSpec) {
 	// Kill any straggler firecracker first so it stops holding onto the
 	// tap / overlay file. Harmless if PID 0 or already gone.
-	if spec.FCPid > 0 && pidIsFirecracker(spec.FCPid) {
-		stopFirecrackerByPID(spec.FCPid)
+	if spec.FCPid > 0 {
+		stopFirecrackerByPID(spec.FCPid, spec.ID)
 	}
 
 	// iptables chains (egress + bandwidth meter). HostVethFor derives the
@@ -259,6 +264,89 @@ func CleanupVMArtifacts(spec OrphanCleanupSpec) {
 	}
 	if spec.APISock != "" {
 		_ = os.Remove(spec.APISock)
+	}
+}
+
+// openSandboxProcess binds the process before reading /proc. If that PID exits
+// and gets reused during validation, signals through this fd still refer only
+// to the original process. Never fall back to signalling a numeric PID.
+func openSandboxProcess(pid int, id string) (int, error) {
+	if pid <= 0 || id == "" {
+		return -1, fmt.Errorf("missing process identity")
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return -1, err
+	}
+	valid := false
+	defer func() {
+		if !valid {
+			_ = unix.Close(fd)
+		}
+	}()
+	if !pidIsFirecracker(pid) {
+		return -1, fmt.Errorf("process is not firecracker")
+	}
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return -1, err
+	}
+	args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+	found := ""
+	for i := 1; i < len(args); i++ {
+		if args[i] != "--id" {
+			continue
+		}
+		if found != "" || i+1 >= len(args) {
+			return -1, fmt.Errorf("ambiguous process identity")
+		}
+		i++
+		found = args[i]
+	}
+	if found != id {
+		return -1, fmt.Errorf("sandbox process identity mismatch")
+	}
+	valid = true
+	return fd, nil
+}
+
+// stopFirecrackerByPID stops only the expected sandbox, including escalation.
+// An unreadable/mismatched identity or unavailable pidfd never permits a signal.
+func stopFirecrackerByPID(pid int, id string) {
+	fd, err := openSandboxProcess(pid, id)
+	if errors.Is(err, unix.ESRCH) || errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		log.Warnf("[orphan-cleanup] sandbox=%s pid=%d: skipping signal: %v", id, pid, err)
+		return
+	}
+	defer unix.Close(fd)
+	if err = unix.PidfdSendSignal(fd, unix.SIGINT, nil, 0); err != nil {
+		if !errors.Is(err, unix.ESRCH) {
+			log.Warnf("[orphan-cleanup] sandbox=%s pid=%d interrupt: %v", id, pid, err)
+		}
+		return
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		remaining := max(0, time.Until(deadline).Milliseconds())
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, int(remaining))
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			log.Warnf("[orphan-cleanup] sandbox=%s pid=%d wait: %v", id, pid, err)
+			return
+		}
+		if n > 0 && fds[0].Revents&unix.POLLIN != 0 {
+			return
+		}
+		break
+	}
+	if err = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		log.Warnf("[orphan-cleanup] sandbox=%s pid=%d kill: %v", id, pid, err)
 	}
 }
 

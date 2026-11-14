@@ -3,8 +3,8 @@ package plugins
 import (
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Test fixture for a host with full dimension config. Defaults match

@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // diskRuntimeRoot is the tmpfs-backed scratch dir where each attachment's
@@ -31,7 +31,7 @@ import (
 //	/run/createos/disks/<dirkey>/passwd-s3fs   — mode 0600, "access:secret"
 //	/run/createos/disks/<dirkey>/mount_path    — the absolute mount path
 //
-// `dirkey` is `<disk_id>--<8-hex-of-sha1(mount_path)>` so two attachments
+// `dirkey` is `<disk_id>--<first-8-hex-of-sha256(mount_path)>` so two attachments
 // of the same disk at different mount paths get distinct dirs. The
 // pre-pause hook walks $base/*/ + reads $dir/mount_path so it doesn't
 // care about the dirkey shape.
@@ -97,7 +97,8 @@ func diskRuntimeDir(diskID, mountPath string) string {
 }
 
 // applyDisks is the agent-side reconciler. Idempotent: called on every
-// MMDS change. Mounts new attachments, unmounts ones that disappeared,
+// successful MMDS poll after phase 2, skipping unchanged disk inputs.
+// Mounts new attachments, unmounts ones that disappeared,
 // and refreshes diskStates so /disks/status is current.
 func applyDisks(disks []proto.MMDSDisk) {
 	applyMu.Lock()
@@ -656,7 +657,7 @@ func handleDiskStatus(w http.ResponseWriter, r *http.Request) {
 // runDiskApplyLoop spawns a slow background watcher that re-applies the
 // disks from MMDS every diskApplyInterval. Catches "MMDS unchanged but a
 // previous mount failed and we want to retry" without bothering the
-// 2ms watchMMDS hot loop. Removed mounts are retried even with an empty doc.
+// adaptive watchMMDS loop. Removed mounts are retried even with an empty doc.
 const diskApplyInterval = 30 * time.Second
 
 func runDiskApplyLoop() {

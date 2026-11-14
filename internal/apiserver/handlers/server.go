@@ -20,24 +20,24 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/cache"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/metrics"
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/audit"
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/placementpolicy"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
-	schedapi "github.com/NodeOps-app/sandbox/internal/scheduler/api"
-	schedclient "github.com/NodeOps-app/sandbox/internal/scheduler/client"
-	"github.com/NodeOps-app/sandbox/internal/storage"
-	"github.com/NodeOps-app/sandbox/internal/trace"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/cache"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/audit"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/placementpolicy"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	schedapi "github.com/NodeOps-app/createos-sandbox/internal/scheduler/api"
+	schedclient "github.com/NodeOps-app/createos-sandbox/internal/scheduler/client"
+	"github.com/NodeOps-app/createos-sandbox/internal/storage"
+	"github.com/NodeOps-app/createos-sandbox/internal/trace"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type patchSandboxReq struct {
@@ -354,9 +354,8 @@ func (h *Handler) DbSetRuntime(c *fiber.Ctx) error {
 	return httpx.Success(c, proto.NewIDResp(c.Params(middlewares.ParamSandboxID)))
 }
 
-// DbSetSandboxDiskStatus handles PATCH /v1/internal/db/sandboxes/:id/disks/:disk/status.
-// Owner gate (host-issued JWT must match the sandbox's host_id) is
-// applied at the route layer, same as other write endpoints.
+// DbSetBandwidthQuota updates the owning sandbox's bandwidth quota.
+// The route requires host-role mTLS and a matching sandbox host assignment.
 
 func (h *Handler) DbSetBandwidthQuota(c *fiber.Ctx) error {
 	var r proto.ControlBandwidthValueReq
@@ -559,6 +558,9 @@ func (h *Handler) HandleCreate(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return httpx.Fail(c, fiber.StatusBadRequest, "invalid JSON")
 	}
+	if req.SnapshotCache != nil {
+		return httpx.Fail(c, fiber.StatusBadRequest, types.FieldError{"snapshot_cache": "internal field"})
+	}
 	// Resolved credentials are produced only after control checks disk ownership.
 	if len(req.DisksResolved) != 0 {
 		return httpx.Fail(c, fiber.StatusBadRequest, types.FieldError{
@@ -582,6 +584,24 @@ func (h *Handler) HandleCreate(c *fiber.Ctx) error {
 		return httpx.Fail(c, fiber.StatusBadRequest, err.Error())
 	}
 	req.Egress = expandedEgress
+	if req.SnapshotID != nil {
+		id := strings.TrimSpace(*req.SnapshotID)
+		if !strings.HasPrefix(id, models.SnapshotIDPrefix) || strings.ContainsAny(id, "/\\") {
+			return httpx.Fail(c, fiber.StatusBadRequest, "invalid snapshot_id")
+		}
+		user := utils.UserIDFromContext(c.UserContext())
+		if user == "" {
+			return httpx.Fail(c, fiber.StatusUnauthorized, "invalid api key")
+		}
+		snap, err := h.repo.GetSnapshot(c.UserContext(), id, user)
+		if err != nil {
+			return httpx.Error(c, fiber.StatusServiceUnavailable, "internal error")
+		}
+		if status, msg := prepareSnapshotRestore(&req, snap, h.shapes.Shapes(c.UserContext())); status != 0 {
+			return httpx.Fail(c, status, msg)
+		}
+		req.SnapshotID = &id
+	}
 	// Rootfs must be explicit. Letting the host resolve an omitted value to
 	// its local default makes create succeed while control persists NULL;
 	// pause/resume later has no durable rootfs identity and fails trying to
@@ -644,6 +664,10 @@ func (h *Handler) HandleCreate(c *fiber.Ctx) error {
 		// peer validates and schedules the same region value. Keep the bandwidth
 		// quota at zero here: it is not client-settable, and stamping our default
 		// before forwarding makes the destination reject it as caller input.
+		if req.SnapshotID != nil {
+			// The peer resolves the owned snapshot itself; rootfs is not a public override.
+			req.Rootfs = nil
+		}
 		if body, marshalErr := json.Marshal(&req); marshalErr == nil {
 			c.Request().SetBody(body)
 		}
@@ -942,7 +966,7 @@ func (h *Handler) HandleCreate(c *fiber.Ctx) error {
 	preferredHosts := placementpolicy.PreferredHosts(
 		utils.UserID(c), req.Shape, req.Region,
 	)
-	if quotaUserID != "" && len(preferredHosts) == 0 {
+	if req.SnapshotID == nil && quotaUserID != "" && len(preferredHosts) == 0 {
 		if sb, perr := h.tryClaimFromPool(ctx, c, &req, quotaUserID); perr != nil {
 			log.WithContext(c.UserContext()).Warnf("[pool] claim tx failed for user=%s shape=%s: %v (falling through to normal create)", quotaUserID, req.Shape, perr)
 		} else if sb != nil {
@@ -962,14 +986,9 @@ func (h *Handler) HandleCreate(c *fiber.Ctx) error {
 
 func (h *Handler) createFallbackTarget(user string, req *proto.CreateReq) string {
 	policy, _ := placementpolicy.Lookup(user)
-	if !placementpolicy.CrossRegionEnabled(user) || policy.Region != "" || len(policy.PreferredHostIDs) != 0 ||
+	if req.SnapshotID != nil || !placementpolicy.CrossRegionEnabled(user) || policy.Region != "" || len(policy.PreferredHostIDs) != 0 ||
 		strings.TrimSpace(req.Region) != "" || strings.TrimSpace(req.HostID) != "" ||
 		len(req.NodeSelector) != 0 || len(req.Disks) != 0 || len(req.Networks) != 0 || len(req.DisksResolved) != 0 {
-		return ""
-	}
-	// Explicit names can collide with the origin's still-replicating creating
-	// row under the cross-region unique-name index. Keep them regional for now.
-	if req.Name != nil && strings.TrimSpace(*req.Name) != "" {
 		return ""
 	}
 	target := models.EuropeRegion
@@ -1021,6 +1040,33 @@ func (h *Handler) HandleCreateExternal(c *fiber.Ctx, t *trace.Trace, ctx context
 		Envs:                req.Envs,
 		Labels:              req.Labels,
 	}
+	// Resolve again at the authoritative writer before reserving the new row.
+	// Hosts read this immutable restore descriptor through their existing,
+	// assignment-scoped sandbox lookup; no public storage metadata is accepted.
+	sourceCPUVendor := ""
+	if req.SnapshotID != nil {
+		snap, err := h.repo.GetSnapshot(ctx, *req.SnapshotID, rec.CreatedBy)
+		if err != nil {
+			return httpx.Error(c, fiber.StatusServiceUnavailable, "snapshot service is temporarily unavailable; please try again")
+		}
+		if snap == nil {
+			return httpx.Fail(c, fiber.StatusNotFound, "snapshot not found")
+		}
+		if snap.Status != models.SnapshotStatusReady {
+			return httpx.Fail(c, fiber.StatusConflict, "snapshot is not ready")
+		}
+		manifest, err := storage.ParseCaptureManifest(snap.SnapshotManifest, snap.Type == models.SnapshotTypeFull)
+		if err != nil {
+			return httpx.Fail(c, fiber.StatusConflict, "this snapshot is unavailable for creating a sandbox")
+		}
+		rec.SnapshotID = req.SnapshotID
+		rec.SnapshotManifest = snap.SnapshotManifest
+		uri := "s3://" + storage.BundlePrefix(snap.ID)
+		rec.SnapshotURI = &uri
+		if snap.Type == models.SnapshotTypeFull {
+			sourceCPUVendor = manifest.CPUVendor
+		}
+	}
 	if req.IngressEnabled != nil && *req.IngressEnabled {
 		rec.IngressEnabled = true
 	}
@@ -1047,15 +1093,21 @@ func (h *Handler) HandleCreateExternal(c *fiber.Ctx, t *trace.Trace, ctx context
 	req.Name = &name
 	rec.Name = &name
 
+	snapshotID := ""
+	if rec.SnapshotID != nil {
+		snapshotID = *rec.SnapshotID
+	}
 	stopReserve := t.Phase("schedule")
 	resp, err := h.schedulerClient.Schedule(ctx, schedapi.ScheduleRequest{
-		SandboxID: sbID,
-		Shape:     req.Shape,
-		Rootfs:    reqRootfs,
-		MemMiB:    schedMem,
-		VCPU:      schedVCPU,
-		DiskMiB:   schedDisk,
-		HostID:    req.HostID,
+		SnapshotID:      snapshotID,
+		SourceCPUVendor: sourceCPUVendor,
+		SandboxID:       sbID,
+		Shape:           req.Shape,
+		Rootfs:          reqRootfs,
+		MemMiB:          schedMem,
+		VCPU:            schedVCPU,
+		DiskMiB:         schedDisk,
+		HostID:          req.HostID,
 		// Local region only — cross-region requests were already
 		// forwarded to the owning region's control above.
 		Region: h.region,
@@ -1073,12 +1125,35 @@ func (h *Handler) HandleCreateExternal(c *fiber.Ctx, t *trace.Trace, ctx context
 			return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 		}
 		if fallback != nil && errors.Is(err, schedclient.ErrNoCapacity) {
+			if fallback.Name != nil && *fallback.Name != "" {
+				if waitErr := h.waitForPeerFailedSandbox(c, fallback.Region, sbID); waitErr != nil {
+					return httpx.Error(c, fiber.StatusServiceUnavailable, "service unavailable")
+				}
+			}
 			body, marshalErr := json.Marshal(fallback)
 			if marshalErr != nil {
 				return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 			}
 			c.Request().SetBody(body)
-			return h.forwardToPeerControl(c, fallback.Region, http.MethodPost, "/v1/sandboxes")
+			entry := log.WithContext(ctx).WithFields(log.Fields{
+				"origin_region": h.region,
+				"target_region": fallback.Region,
+				"sandbox_id":    sbID,
+				"named":         fallback.Name != nil && *fallback.Name != "",
+			})
+			entry.Info("[create-fallback] forwarding after no capacity")
+			started := time.Now()
+			forwardErr := h.forwardToPeerControl(c, fallback.Region, http.MethodPost, "/v1/sandboxes")
+			entry = entry.WithFields(log.Fields{
+				"http_status": c.Response().StatusCode(),
+				"duration_ms": time.Since(started).Milliseconds(),
+			})
+			if forwardErr != nil || c.Response().StatusCode() >= http.StatusBadRequest {
+				entry.WithError(forwardErr).Warn("[create-fallback] peer response")
+			} else {
+				entry.Info("[create-fallback] peer response")
+			}
+			return forwardErr
 		}
 		log.WithContext(ctx).Errorf("[handler] service unavailable: %v", err)
 
@@ -1174,6 +1249,7 @@ func (h *Handler) HandleCreateExternal(c *fiber.Ctx, t *trace.Trace, ctx context
 	}
 	stopDisks()
 
+	req.SnapshotCache = resp.SnapshotCache
 	host := models.Host{ID: resp.HostID, Addr: resp.HostAddr}
 	stopForward := t.Phase("forward")
 	hostResponse, fwdErr := hostrpc.Create(
@@ -1504,13 +1580,9 @@ func redactEnvs(envs map[string]string) string {
 	return fmt.Sprintf("{%d keys}", len(envs))
 }
 
-// extractSSHPubkeys pulls req.SSHPubkeys via a tiny helper so this file
-// compiles against today's api.CreateReq (no field) and the integrated
-// CreateReq (field present). Once the field exists, this becomes a direct
-// access; for now we marshal/unmarshal to pick it up if present.
+// extractSSHPubkeys reads ssh_pubkeys through the request's JSON projection,
+// matching the serialization used by setCanonicalSSHPubkeys.
 func extractSSHPubkeys(req *api.CreateReq) []string {
-	// Fast path: if future CreateReq has SSHPubkeys, reflect-less marshal will
-	// include it; otherwise we get nothing. Keep it cheap and resilient.
 	b, err := json.Marshal(req)
 	if err != nil {
 		return nil
@@ -1524,9 +1596,9 @@ func extractSSHPubkeys(req *api.CreateReq) []string {
 // then re-encodes via ssh.MarshalAuthorizedKey so the stored form is
 // only "<type> <base64>" — comments stripped, options stripped, the
 // trailing newline trimmed. Rejects empty input or any line we can't
-// parse, returning the offending index. ParseAuthorizedKey rejects
-// embedded newlines and only consumes the first entry of a multi-line
-// input, so this is also the gate against newline-injection bypass.
+// parse, returning the offending index. ParseAuthorizedKey returns trailing
+// input separately; rejecting non-whitespace leftovers prevents multiple
+// keys from being accepted as one entry.
 func canonicalizeSSHPubkeys(raw []string) ([]string, int, error) {
 	out := make([]string, 0, len(raw))
 	for i, s := range raw {
@@ -1668,7 +1740,8 @@ func ownerOK(c *fiber.Ctx, rec *models.Sandbox) bool {
 // delegated sandbox credential. All account/configuration controllers keep
 // using ownerOK, so a sandbox token cannot grow beyond its runtime surface.
 func runtimeOwnerOK(c *fiber.Ctx, rec *models.Sandbox) bool {
-	// A sandbox-scoped token may only act on its own sandbox.
+	// we are checking principal is set?
+	// if yes then match with the principal
 	if sandboxID := utils.SandboxPrincipalIDFromContext(c.UserContext()); sandboxID != "" {
 		if rec == nil || rec.ID != sandboxID {
 			return false
@@ -1786,6 +1859,9 @@ func (h *Handler) HandleExec(c *fiber.Ctx) error {
 	if c.QueryBool("stream") || bodyAsksStream(c.Body()) {
 		return h.forwardStreamBySandboxUsingRec(c, "/v1/sandboxes/"+id+"/exec", rec)
 	}
+	ctx, stop := requestctx.WithDisconnect(c.UserContext(), c.Context().Conn())
+	defer stop()
+	c.SetUserContext(ctx)
 	// Skip the redundant Repo.Get inside forwardBySandbox — we already
 	// fetched rec above for the owner gate. Saves one DB round-trip
 	// (~30ms under N≥30 contention).
@@ -1849,7 +1925,7 @@ func (h *Handler) HandleDestroy(c *fiber.Ctx) error {
 	if rec == nil || !runtimeOwnerOK(c, rec) {
 		return httpx.Fail(c, fiber.StatusNotFound, "sandbox not found")
 	}
-	// Already terminal — DELETE is idempotent: same shape, status=destroyed.
+	// Already terminal: DELETE is idempotent and preserves destroyed or failed.
 	if rec.Status == models.StatusDestroyed || rec.Status == models.StatusFailed {
 		return httpx.Success(c, proto.DestroyResp{ID: id, Status: string(rec.Status)})
 	}
@@ -1863,7 +1939,7 @@ func (h *Handler) HandleDestroy(c *fiber.Ctx) error {
 	// that ONLY fires when the row is still in {paused, error} — without
 	// this, a concurrent HandleResume can flip paused→resuming between
 	// our read at (rec.Status check) and the destroy, leaving us about
-	// to delete the R2 bundle while a host is restoring from it.
+	// to delete the stored bundle while a host is restoring from it.
 	if rec.Status == models.StatusPaused || rec.Status == models.StatusError {
 		ok, err := h.repo.MarkDestroyingFromTerminalCAS(ctx, id)
 		if err != nil {
@@ -1872,7 +1948,7 @@ func (h *Handler) HandleDestroy(c *fiber.Ctx) error {
 		}
 		if !ok {
 			// Row moved out from under us — likely a /resume slipped in.
-			// Refresh + tell the caller to retry; do NOT touch R2.
+			// Refresh + tell the caller to retry; do NOT delete stored objects.
 			return httpx.Fail(c, fiber.StatusConflict, "sandbox state changed; retry")
 		}
 		// The caller that wins the transition owns the single logical
@@ -1902,6 +1978,10 @@ func (h *Handler) HandleDestroy(c *fiber.Ctx) error {
 		log.WithContext(c.UserContext()).Errorf("[destroy.mark-destroying] internal error: %v", err)
 
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
+	}
+	// A rejected transition must not reach the eager host-destroy path.
+	if transitionedTo == "" && rec.Status != models.StatusDestroying {
+		return httpx.Fail(c, fiber.StatusConflict, "sandbox state changed or snapshot capture in progress")
 	}
 	if transitionedTo != "" {
 		h.audit.Emit(ctx, h.auditCtxForSandboxLifecycle(c, rec),
@@ -2216,47 +2296,39 @@ func (h *Handler) HandlePatchSandbox(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return httpx.Fail(c, fiber.StatusBadRequest, "invalid JSON")
 	}
-	if req.IngressEnabled != nil {
-		if err := h.repo.SetIngressEnabled(ctx, id, *req.IngressEnabled); err != nil {
-			log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
-			return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
-		}
-	}
-	if req.DisableAutoPause {
-		if err := h.repo.SetAutoPause(ctx, id, nil); err != nil {
-			log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
-			return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
-		}
-	} else if req.AutoPauseAfterSeconds != nil {
+	// Validate the entire request before any mutation. Apply all fields under
+	// one capture-operation lock so rejection cannot leave a partial PATCH.
+	if !req.DisableAutoPause && req.AutoPauseAfterSeconds != nil {
 		v := *req.AutoPauseAfterSeconds
 		if v < 60 || v > 86400 {
-			return httpx.Fail(c, fiber.StatusBadRequest,
-				"auto_pause_after_seconds must be between 60 and 86400")
-		}
-		if err := h.repo.SetAutoPause(ctx, id, req.AutoPauseAfterSeconds); err != nil {
-			log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
-
-			return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
+			return httpx.Fail(c, fiber.StatusBadRequest, "auto_pause_after_seconds must be between 60 and 86400")
 		}
 	}
+	var merged map[string]string
 	if req.Labels != nil {
-		merged := make(map[string]string, len(rec.Labels)+len(req.Labels))
-		for key, value := range rec.Labels {
-			merged[key] = value
+		merged = make(map[string]string, len(rec.Labels)+len(req.Labels))
+		for k, v := range rec.Labels {
+			merged[k] = v
 		}
-		for key, value := range req.Labels {
-			merged[key] = value
+		for k, v := range req.Labels {
+			merged[k] = v
 		}
 		if field, msg := validateLabels(merged); msg != "" {
 			return httpx.Fail(c, fiber.StatusBadRequest, map[string]string{field: msg})
 		}
-		if err := h.repo.SetSandboxLabels(ctx, id, merged); err != nil {
-			log.WithContext(c.UserContext()).Errorf("[handler] update labels: %v", err)
-			return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
-		}
 	}
+	err = h.repo.PatchSandboxConfiguration(ctx, id, rec.CreatedBy, rec.Region, models.SandboxConfigurationPatch{
+		IngressEnabled: req.IngressEnabled, AutoPauseAfterSeconds: req.AutoPauseAfterSeconds,
+		DisableAutoPause: req.DisableAutoPause, Labels: merged, PreviousLabels: rec.Labels,
+	})
+	if errors.Is(err, models.ErrSnapshotCaptureConflict) {
+		return httpx.Fail(c, fiber.StatusConflict, "sandbox state changed or snapshot capture in progress; retry")
+	}
+	if err != nil {
+		log.WithContext(ctx).WithError(err).Error("[handler] patch sandbox")
+		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
+	}
+
 	out, err := h.repo.Get(ctx, id)
 	if err != nil {
 		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
@@ -2556,11 +2628,10 @@ func (h *Handler) HandleWhoAmI(c *fiber.Ctx) error {
 // the create handler's pre-forward validation so /v1/rootfs and a
 // rejection from POST /v1/sandboxes agree on what's actually available.
 //
-// Served from a 30s TTL cache (cache.Rootfs). The union changes on
-// host restart / operator deprecation cadence — minutes to days — so
-// stale-by-up-to-30s is acceptable. On cold/stale, one DB round-trip
-// (ListHosts + ListRootfsMetadata) refreshes the whole snapshot. See
-// internal/apiserver/cache/rootfs.go for the SAFETY note about templates.
+// Served through cache.Rootfs with a default 30s TTL. Missing or empty
+// catalogs refresh synchronously; stale nonempty catalogs are returned while
+// one background refresh runs. Failed refreshes retain the last catalog, so
+// TTL is not a hard upper bound on staleness. Templates bypass this catalog.
 func (h *Handler) clusterRootfsUnion(ctx context.Context) ([]string, map[string]models.RootfsCatalog, error) {
 	// Cache path (typical): single-flighted so a 100-parallel burst on
 	// an expired cache fires ONE DB refresh, not 100. Without this
@@ -2733,7 +2804,7 @@ func (h *Handler) HandleUserTunnel(c *fiber.Ctx) error {
 
 // tunnelSplice opens the upstream host tunnel for (id, :port) and hijacks
 // the incoming connection into a raw bidirectional byte pipe. Shared by
-// the internal (JWT) and user-facing (API-key) tunnel handlers.
+// the internal mTLS and user-facing authenticated tunnel handlers.
 func (h *Handler) tunnelSplice(c *fiber.Ctx, id, userID string) error {
 	portStr := c.Params(middlewares.ParamPort)
 	port, err := strconv.Atoi(portStr)

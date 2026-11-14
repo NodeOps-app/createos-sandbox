@@ -9,8 +9,9 @@ import (
 )
 
 // ClientTimings decomposes an outbound HTTP request without changing its
-// transport. Zero durations mean that phase did not run (usually because a
-// pooled connection was reused).
+// transport. Pool measures GetConn to GotConn, including connection setup
+// when needed; it overlaps DNS/Connect/TLS rather than being additive.
+// Zero durations can mean a phase did not run or has not completed.
 type ClientTimings struct {
 	mu                                sync.Mutex
 	started, dns, connect, tls, wrote time.Time

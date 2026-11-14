@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/createos"
+	"github.com/NodeOps-app/createos-sandbox/internal/createos"
 )
 
 // Limits is the effective per-user policy resolved from the precedence

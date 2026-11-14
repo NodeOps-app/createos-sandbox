@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -116,6 +116,9 @@ type Sandbox struct {
 	// Envs is the persistent server-side env-var map injected into every
 	// /exec call against this sandbox.
 	Envs map[string]string `json:"envs,omitempty" sql:"envs"`
+
+	// SnapshotID records the reusable snapshot used at creation, not captures of this VM.
+	SnapshotID *string `json:"snapshot_id,omitempty" sql:"snapshot_id"`
 
 	// Pause / resume / fork state. All NULL on a fresh `running` row.
 	PausedAt            *time.Time      `json:"paused_at,omitempty" sql:"paused_at"`
@@ -354,6 +357,7 @@ func scanSandbox(s scannable) (*Sandbox, error) {
 		&cpuVendor, &cpuFamily,
 		&rec.DrainPauseAttempts,
 		&rec.AutoPauseAfterSeconds, &rec.LastActivityAt, &rec.LastMeteredBytes,
+		&rec.SnapshotID,
 	)
 	if err != nil {
 		return nil, err
@@ -449,7 +453,7 @@ func InsertSandbox(ctx context.Context, d *database.Db, rec Sandbox) error {
 		envsJSON, labelsJSON,
 		rec.Name,
 		rec.CPUVendor, rec.CPUFamily,
-		rec.AutoPauseAfterSeconds,
+		rec.AutoPauseAfterSeconds, rec.SnapshotID, rec.SnapshotURI, rec.SnapshotManifest,
 	)
 	return err
 }
@@ -477,7 +481,8 @@ func CompleteSandboxCreate(ctx context.Context, d *database.Db, rec Sandbox, hos
 // MarkSandboxDestroyed flips status to 'destroyed' and emits a
 // sandbox.destroyed billing event in the SAME transaction so both
 // commit-or-roll-back atomically. emitter=nil is a no-op (status still
-// commits).
+// commits). An already-destroyed or missing row is a no-op; retries preserve
+// the original destruction time and do not emit another billing event.
 func MarkSandboxDestroyed(ctx context.Context, d *database.Db, id string, at time.Time, note *string, emitter BillingEmitter) error {
 	q, err := query(d, "markSandboxDestroyed")
 	if err != nil {
@@ -488,7 +493,12 @@ func MarkSandboxDestroyed(ctx context.Context, d *database.Db, id string, at tim
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, q, id, at, note); err != nil {
+	var changedID string
+	err = tx.QueryRow(ctx, q, id, at, note).Scan(&changedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if err := emitInTx(ctx, tx, emitter, id, BillingEventSandboxDestroyed, ""); err != nil {
@@ -497,20 +507,52 @@ func MarkSandboxDestroyed(ctx context.Context, d *database.Db, id string, at tim
 	return tx.Commit(ctx)
 }
 
+// MarkSandboxDestroyedOnDeadHost rejects stale sweeper observations. Sandbox
+// and host locks serialize capture/migration and heartbeat recovery respectively.
+// Billing and resource cleanup commit only for the winning transition.
+func MarkSandboxDestroyedOnDeadHost(ctx context.Context, d *database.Db, id, hostID, region string, cutoff, at time.Time, note *string, emitter BillingEmitter) (bool, error) {
+	if region == "" || hostID == "" {
+		return false, nil
+	}
+	lock, err := query(d, "lockDeadHostEviction")
+	if err != nil {
+		return false, err
+	}
+	destroy, err := query(d, "markSandboxDestroyed")
+	if err != nil {
+		return false, err
+	}
+	tx, ok, err := beginCaptureOperation(ctx, d, id)
+	if err != nil || !ok {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var got string
+	err = tx.QueryRow(ctx, lock, id, hostID, region, cutoff).Scan(&got)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err = tx.QueryRow(ctx, destroy, id, at, note).Scan(&got); err != nil {
+		return false, err
+	}
+	if err = emitInTx(ctx, tx, emitter, id, BillingEventSandboxDestroyed, ""); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // MarkSandboxDestroyingFromTerminalCAS atomically claims a paused/error row
 // for deletion. False means a concurrent operation (most importantly resume)
 // moved it first, so the caller must not delete its snapshot bundle.
 func MarkSandboxDestroyingFromTerminalCAS(ctx context.Context, d *database.Db, id string) (bool, error) {
-	q, err := query(d, "markSandboxDestroyingFromTerminalCAS")
-	if err != nil {
-		return false, err
-	}
-	var newStatus string
-	err = d.Con.QueryRow(ctx, q, id).Scan(&newStatus)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	return newStatus == string(StatusDestroying), err
+	st, err := guardedSandboxTransition(ctx, d, id, "markSandboxDestroyingFromTerminalCAS", id)
+	return st == string(StatusDestroying), err
 }
 
 // MarkSandboxDestroyedFromDestroyingCAS publishes completion of asynchronous
@@ -543,8 +585,9 @@ func MarkSandboxDestroyedFromDestroyingCAS(ctx context.Context, d *database.Db, 
 	return newStatus == string(StatusDestroyed), nil
 }
 
-// MarkSandboxFailed flips status to 'failed' and emits a sandbox.failed
-// billing event in the SAME transaction.
+// MarkSandboxFailed flips a nonterminal row to 'failed' and emits a
+// sandbox.failed billing event in the SAME transaction. Late callbacks after
+// deletion starts or failure completes are no-ops, including billing.
 func MarkSandboxFailed(ctx context.Context, d *database.Db, id string, errText *string, at time.Time, emitter BillingEmitter) error {
 	q, err := query(d, "markSandboxFailed")
 	if err != nil {
@@ -555,8 +598,12 @@ func MarkSandboxFailed(ctx context.Context, d *database.Db, id string, errText *
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, q, id, errText, at); err != nil {
+	tag, err := tx.Exec(ctx, q, id, errText, at)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
 	}
 	if err := emitInTx(ctx, tx, emitter, id, BillingEventSandboxFailed, ""); err != nil {
 		return err
@@ -689,10 +736,7 @@ func ListSandboxes(ctx context.Context, d *database.Db, host, userID, status str
 	if offset < 0 {
 		offset = 0
 	}
-	q, err := query(d, "listSandboxes")
-	if err != nil {
-		return nil, err
-	}
+	var err error
 	labelsJSON := []byte(`{}`)
 	if len(labels) > 0 {
 		labelsJSON, err = json.Marshal(labels)
@@ -700,7 +744,23 @@ func ListSandboxes(ctx context.Context, d *database.Db, host, userID, status str
 			return nil, fmt.Errorf("marshal label filter: %w", err)
 		}
 	}
-	rows, err := d.Con.Query(ctx, q, host, userID, status, labelsJSON, limit, offset)
+	name := "listSandboxes"
+	args := []any{host, userID, status, labelsJSON, limit, offset}
+	// Host reconciliation polls these states repeatedly. Its dedicated query
+	// keeps generic plans on the small transient-state index. Never drop a
+	// caller's owner or label filter when selecting this path.
+	if host != "" && userID == "" && len(labels) == 0 {
+		switch Status(status) {
+		case StatusPausing, StatusResuming, StatusDestroying:
+			name = "listHostTransitionSandboxes"
+			args = []any{host, status, limit, offset}
+		}
+	}
+	q, err := query(d, name)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := d.Con.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -994,24 +1054,47 @@ func SnapshotMeteredBytes(ctx context.Context, d *database.Db, region string) er
 // idle check. Uses a CAS on status='running' so a concurrent user-pause or
 // destroy won't be clobbered.
 func MarkIdlePausing(ctx context.Context, d *database.Db, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	lock, err := query(d, "lockIdlePauseCandidates")
+	if err != nil {
+		return nil, err
+	}
 	q, err := query(d, "markIdlePausing")
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.Con.Query(ctx, q, ids)
+	tx, err := d.Con.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var flipped []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		flipped = append(flipped, id)
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, lock, ids)
+	if err != nil {
+		return nil, err
 	}
-	return flipped, rows.Err()
+	locked, err := scanIDList(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(locked) == 0 {
+		return nil, nil
+	}
+	// Separate statement after acquiring locks: capture reservations committed
+	// before the lock must be visible to the idle-pause exclusion check.
+	rows, err = tx.Query(ctx, q, locked)
+	if err != nil {
+		return nil, err
+	}
+	flipped, err := scanIDList(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return flipped, nil
 }
 
 func GetIngressRoute(ctx context.Context, d *database.Db, id string) (IngressRoute, error) {
@@ -1041,11 +1124,7 @@ func UpdateSandboxBandwidthIngress(ctx context.Context, d *database.Db, id strin
 }
 
 func MarkPausing(ctx context.Context, d *database.Db, id string, at time.Time) (string, error) {
-	q, err := query(d, "markPausing")
-	if err != nil {
-		return "", err
-	}
-	return scanCASStatus(d.Con.QueryRow(ctx, q, id, at))
+	return guardedSandboxTransition(ctx, d, id, "markPausing", id, at)
 }
 
 // MarkPaused flips pausing→paused and stamps bundle_uploaded_at in the same
@@ -1099,11 +1178,7 @@ func MarkResuming(ctx context.Context, d *database.Db, id string, clearFailedHos
 	if clearFailedHosts {
 		queryName = "markResumingFromError"
 	}
-	q, err := query(d, queryName)
-	if err != nil {
-		return "", err
-	}
-	return scanCASStatus(d.Con.QueryRow(ctx, q, id, at))
+	return guardedSandboxTransition(ctx, d, id, queryName, id, at)
 }
 
 func MarkResumed(
@@ -1190,10 +1265,13 @@ func MarkStuckPauseFailed(ctx context.Context, d *database.Db, id string, errMsg
 	return st, nil
 }
 
+var ErrForkSourceUnavailable = errors.New("fork source unavailable")
+
 // MarkForking inserts a brand-new row in 'forking' state, validating
 // that the source row is paused. Done in a single transaction so the
 // source-status check and the new-row INSERT can't race a concurrent
-// resume of the source.
+// resume of the source. The committed forking child then protects the source
+// bundle through guarded lifecycle transitions until copying finishes.
 func MarkForking(ctx context.Context, d *database.Db, srcID string, newRow Sandbox) (*Sandbox, error) {
 	tx, err := d.Con.Begin(ctx)
 	if err != nil {
@@ -1201,18 +1279,25 @@ func MarkForking(ctx context.Context, d *database.Db, srcID string, newRow Sandb
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var srcStatus string
-	if err := tx.QueryRow(ctx,
-		`SELECT status FROM sandboxes WHERE id = $1 FOR UPDATE`, srcID,
-	).Scan(&srcStatus); err != nil {
+	lock, err := query(d, "lockForkSource")
+	if err != nil {
+		return nil, err
+	}
+	var srcStatus, owner, region string
+	var manifest json.RawMessage
+	var uploaded *time.Time
+	if err := tx.QueryRow(ctx, lock, srcID).Scan(&srcStatus, &manifest, &uploaded, &owner, &region); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("source sandbox %q not found", srcID)
+			return nil, ErrForkSourceUnavailable
 		}
 		return nil, err
 	}
-	if srcStatus != string(StatusPaused) {
-		return nil, fmt.Errorf("source sandbox %q is %s, not paused", srcID, srcStatus)
+	if srcStatus != string(StatusPaused) || uploaded == nil || len(manifest) == 0 || owner != newRow.CreatedBy || region != newRow.Region {
+		return nil, ErrForkSourceUnavailable
 	}
+	// Capture metadata under the same lock as child creation. The earlier HTTP
+	// read may describe a previous pause generation.
+	newRow.SnapshotManifest = append(json.RawMessage(nil), manifest...)
 
 	q, err := query(d, "insertForkRow")
 	if err != nil {
@@ -1327,11 +1412,7 @@ func ClearLocalCache(ctx context.Context, d *database.Db, id, host string) error
 }
 
 func MarkDestroying(ctx context.Context, d *database.Db, id string) (string, error) {
-	q, err := query(d, "markDestroying")
-	if err != nil {
-		return "", err
-	}
-	return scanCASStatus(d.Con.QueryRow(ctx, q, id))
+	return guardedSandboxTransition(ctx, d, id, "markDestroying", id)
 }
 
 func ListPausing(ctx context.Context, d *database.Db, host string) ([]string, error) {
@@ -1560,18 +1641,35 @@ type AgedRunningRow struct {
 // MarkAgedRunningDestroyed flips every 'running' row older than cutoff
 // to 'destroyed' with the supplied destroyedAt + note, detaches their
 // sandbox_disks, and emits one sandbox.destroyed billing event per
-// flipped id — all inside one transaction. Returns the flipped rows.
-func MarkAgedRunningDestroyed(ctx context.Context, d *database.Db, cutoff, destroyedAt time.Time, note, region string, emitter BillingEmitter) ([]AgedRunningRow, error) {
+// flipped id — all inside one transaction. userCutoffs overrides the default
+// cutoff by durable owner ID, preserving the running_at pause/resume clock.
+// Returns the flipped rows.
+func MarkAgedRunningDestroyed(ctx context.Context, d *database.Db, cutoff, destroyedAt time.Time, note, region string, userCutoffs map[string]time.Time, emitter BillingEmitter) ([]AgedRunningRow, error) {
 	q, err := query(d, "markAgedRunningDestroyed")
 	if err != nil {
 		return nil, err
 	}
-	tx, err := d.Con.Begin(ctx)
+	lock, err := query(d, "lockAgedRunningCandidates")
+	if err != nil {
+		return nil, err
+	}
+	tx, err := d.Con.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	rows, err := tx.Query(ctx, q, cutoff, destroyedAt, note, region)
+	rows, err := tx.Query(ctx, lock, cutoff, region, userCutoffs)
+	if err != nil {
+		return nil, err
+	}
+	locked, err := scanIDList(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(locked) == 0 {
+		return nil, tx.Commit(ctx)
+	}
+	rows, err = tx.Query(ctx, q, cutoff, destroyedAt, note, region, locked, userCutoffs)
 	if err != nil {
 		return nil, err
 	}
@@ -1834,4 +1932,52 @@ func GetUserMetricsTimeseries(ctx context.Context, d *database.Db, userID string
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// SandboxConfigurationPatch carries already-validated fields. Labels is the
+// merged map; PreviousLabels is the version used to validate that merge.
+type SandboxConfigurationPatch struct {
+	IngressEnabled        *bool
+	AutoPauseAfterSeconds *int
+	DisableAutoPause      bool
+	Labels                map[string]string
+	PreviousLabels        map[string]string
+}
+
+func (r *Repo) PatchSandboxConfiguration(ctx context.Context, id, userID, region string, p SandboxConfigurationPatch) error {
+	q, err := query(r.DB, "patchSandboxConfiguration")
+	if err != nil {
+		return err
+	}
+	var labels, previous []byte
+	if p.Labels != nil {
+		labels, err = json.Marshal(p.Labels)
+		if err != nil {
+			return err
+		}
+		previous = []byte(`{}`)
+		if len(p.PreviousLabels) > 0 {
+			previous, err = json.Marshal(p.PreviousLabels)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	tx, ok, err := beginCaptureOperation(ctx, r.DB, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrSnapshotCaptureConflict
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var updated string
+	err = tx.QueryRow(ctx, q, id, userID, region, p.IngressEnabled, p.DisableAutoPause, p.AutoPauseAfterSeconds, labels, previous).Scan(&updated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrSnapshotCaptureConflict
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

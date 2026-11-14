@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/firecracker-microvm/firecracker-go-sdk"
 	log "github.com/sirupsen/logrus"
@@ -142,17 +143,17 @@ func ApplyRlimits(pid int, diskMib int64) {
 // supplementaryGIDs MUST include the kvm gid so the child can open
 // /dev/kvm post-drop; tap access is handled separately by chowning the
 // tap device to `uid` at NetPool slot init.
-func buildFirecrackerCmd(ctx context.Context, cfg firecracker.Config, uid, gid uint32, supplementaryGIDs []uint32, seccompFilterPath string, console io.Writer) *exec.Cmd {
+func buildFirecrackerCmd(ctx context.Context, cfg firecracker.Config, uid, gid uint32, supplementaryGIDs []uint32, runtime firecrackerRuntime, console io.Writer) *exec.Cmd {
 	// Mirror what the SDK's unexported configureBuilder does:
 	// firecracker --api-sock <path> --id <vmid>
 	args := []string{"--api-sock", cfg.SocketPath}
 	if cfg.VMID != "" {
 		args = append(args, "--id", cfg.VMID)
 	}
-	if seccompFilterPath != "" {
-		args = append(args, "--seccomp-filter", seccompFilterPath)
+	if runtime.Seccomp != "" {
+		args = append(args, "--seccomp-filter", runtime.Seccomp)
 	}
-	cmd := exec.CommandContext(ctx, firecrackerBin, args...)
+	cmd := exec.CommandContext(ctx, runtime.Binary, args...)
 	cmd.Stdin = os.Stdin
 	if file, ok := console.(*os.File); ok {
 		// Direct file descriptors are inherited by Firecracker. A journald
@@ -209,4 +210,96 @@ func buildFirecrackerCmd(ctx context.Context, cfg firecracker.Config, uid, gid u
 		}
 	}
 	return cmd
+}
+
+// slotProcess keeps a kernel handle to the exact child, avoiding PID reuse.
+// The SDK owns cmd.Wait; pidfd polling independently confirms kernel exit.
+type slotProcess struct {
+	cmd *exec.Cmd
+	fd  int
+}
+
+func (pn *PooledNet) trackProcess(cmd *exec.Cmd) *exec.Cmd {
+	pn.processMu.Lock()
+	defer pn.processMu.Unlock()
+	child := &slotProcess{cmd: cmd, fd: -1}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.PidFD = &child.fd
+	pn.processes = append(pn.processes, child)
+	return cmd
+}
+
+// start waits for a failed previous attempt before a cold-boot fallback can
+// attach to the same tap. Serialize the kernel's pidfd publication with cleanup.
+func (pn *PooledNet) start(ctx context.Context, machine *firecracker.Machine) error {
+	if err := pn.waitProcessExit(3 * time.Second); err != nil {
+		return err
+	}
+	pn.processMu.Lock()
+	defer pn.processMu.Unlock()
+	return machine.Start(ctx)
+}
+
+func (pn *PooledNet) waitProcessExit(timeout time.Duration) error {
+	pn.processMu.Lock()
+	defer pn.processMu.Unlock()
+	deadline := time.Now().Add(timeout)
+	for _, child := range pn.processes {
+		if child.cmd != nil && child.cmd.Process == nil {
+			continue
+		} // exec failed or not started yet
+		if child.fd < 0 {
+			return fmt.Errorf("process exit cannot be verified: missing pidfd")
+		}
+		for {
+			wait := time.Until(deadline).Milliseconds()
+			if wait < 0 {
+				wait = 0
+			}
+			fds := []unix.PollFd{{Fd: int32(child.fd), Events: unix.POLLIN}}
+			n, err := unix.Poll(fds, int(wait))
+			if err == unix.EINTR {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("wait for slot process: %w", err)
+			}
+			if n == 0 || fds[0].Revents&unix.POLLIN == 0 {
+				return fmt.Errorf("slot process has not exited")
+			}
+			break
+		}
+	}
+	// All started children exited. Keep only commands not started yet (the next
+	// fallback is built before start); never close a live child's handle.
+	pending := pn.processes[:0]
+	for _, child := range pn.processes {
+		if child.cmd != nil && child.cmd.Process == nil {
+			pending = append(pending, child)
+			continue
+		}
+		_ = unix.Close(child.fd)
+	}
+	pn.processes = pending
+	return nil
+}
+
+// Rehydrated borrowers have no exec.Cmd, but still need an exit barrier.
+func (pn *PooledNet) trackExistingProcess(pid int) {
+	if pid <= 0 {
+		return
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err == unix.ESRCH {
+		return
+	} // already gone
+	if err != nil {
+		log.Warnf("[netpool] cannot track process pid=%d slot=%s: %v; release will fail closed", pid, pn.ContainerID, err)
+		fd = -1
+	}
+	pn.processMu.Lock()
+	pn.processes = append(pn.processes, &slotProcess{fd: fd})
+	pn.processMu.Unlock()
 }

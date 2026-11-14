@@ -5,8 +5,8 @@ import (
 	"errors"
 	"io"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Shared control↔host wire contracts live in proto. These aliases keep the
@@ -49,6 +49,9 @@ type Service interface {
 	// file proxy) that dial the guest agent and must prepend
 	// "AUTH <token>\n". Returns ErrNotFound for unknown sandboxes.
 	SecretToken(ctx context.Context, id string) (string, error)
+	// OpenFileTransfer authorizes the caller and captures the address, secret,
+	// and cancellation context from one VM incarnation. Caller must Cancel.
+	OpenFileTransfer(ctx context.Context, id, caller string) (*FileTransferTarget, error)
 
 	// MergeProcessEnv applies the Exec environment contract to managed
 	// process creation before the request crosses into the guest.
@@ -109,6 +112,14 @@ type Service interface {
 	PoolClaimKick(ctx context.Context, id, owner string) error
 }
 
+// FileTransferTarget is internal host state, never a public API response.
+type FileTransferTarget struct {
+	IP      string
+	Token   string
+	Context context.Context
+	Cancel  context.CancelFunc
+}
+
 // NewSandboxView projects a models.Sandbox into the user-facing SandboxView
 // (lowercase JSON tags, secrets stripped, env values replaced with keys).
 // Handlers MUST use this rather than returning a raw models.Sandbox — the
@@ -123,6 +134,7 @@ func NewSandboxView(r models.Sandbox) SandboxView {
 		}
 	}
 	return SandboxView{
+		SnapshotID:            r.SnapshotID,
 		ID:                    r.ID,
 		Name:                  r.Name,
 		Status:                string(r.Status),

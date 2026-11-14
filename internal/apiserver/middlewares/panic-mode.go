@@ -5,7 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
 )
 
 // PanicMode is an emergency public-API kill switch. It deliberately leaves

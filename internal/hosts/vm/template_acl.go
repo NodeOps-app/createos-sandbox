@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // setfacl performs a read-modify-write of the file ACL. Serialize all ACL

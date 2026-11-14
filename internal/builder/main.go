@@ -1,8 +1,6 @@
 // Package builder implements the control builder service: a long-lived
 // loop that claims pending template builds from Postgres, dispatches a
 // disposable CreateOS sandbox per claim, and finalises the row when it exits.
-//
-// See DESIGN/templates.md.
 package builder
 
 import (
@@ -16,8 +14,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/buildqueue"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/buildqueue"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
 )
 
 // Config bundles the runtime knobs Service.Run needs.
@@ -212,12 +210,10 @@ func (s *Service) failBuild(ctx context.Context, tplID, msg string) {
 	log.WithContext(ctx).Warnf("[builder] %s: %s", tplID, msg)
 }
 
-// janitor sweeps stuck `building` rows every JanitorInterval and
-// marks them `failed`. There is no retry — a stuck row means either
-// the dispatcher crashed mid-build or the sandbox died without
-// PATCHing terminal state, and re-running on the same Dockerfile
-// rarely helps. Users retry by submitting again. Diagnostic build
-// output is in ClickHouse, fetchable via `createos-cli templates logs`.
+// janitor runs immediately and then every JanitorInterval. It fails builds
+// older than BuildTimeout plus five minutes and, when the executor supports
+// SandboxJanitor, cleans up orphaned build sandboxes. Active local workers
+// retain ownership of their cleanup. Failed builds are not re-enqueued.
 func (s *Service) janitor(ctx context.Context) {
 	tick := time.NewTicker(s.cfg.JanitorInterval)
 	defer tick.Stop()

@@ -7,8 +7,8 @@ package relay
 //  1. Detect underlay IP (UDP-connect probe to control URL).
 //  2. Load (or generate) the host's WireGuard keypair from disk.
 //  3. POST /v1/internal/hosts/register with our pubkey + region + role.
-//     Control allocates a wg-hosts /32 (the /22 VM subnet allocator
-//     fires too but relays never use it).
+//     Control assigns the relay's wg-hosts address; relay traffic does not
+//     use a compute VM subnet.
 //  4. Bring up the `wg-hosts` kernel iface with the assigned IP.
 //  5. Start the wg-hosts peer reconciler (60s tick).
 //  6. Start the heartbeat loop (5s tick).
@@ -27,11 +27,11 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/hosts/wg"
-	authjwt "github.com/NodeOps-app/sandbox/internal/jwt"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/wg"
+	authjwt "github.com/NodeOps-app/createos-sandbox/internal/jwt"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // bootstrapConfig is everything bootstrap() needs from the caller.

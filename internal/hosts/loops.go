@@ -6,11 +6,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/api"
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/hosts/service"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/service"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // reconcileTickLoop is the host's periodic DB↔memory drift fixer. The
@@ -226,6 +226,7 @@ func reconcileTickLoop(ctx context.Context, repo *controlclient.Client, mgr *vm.
 			// /runResume is cheap: the in-process transitionInflight set
 			// makes the second goroutine a no-op when HTTP already won.
 			if svc != nil {
+				go svc.ReconcileSnapshots(ctx)
 				if rows, err := repo.List(bg, hostname, "", string(models.StatusPausing), 500); err == nil {
 					for _, r := range rows {
 						svc.RunPauseAsync(context.Background(), r.ID)

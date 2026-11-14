@@ -9,19 +9,16 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/NodeOps-app/sandbox/database"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 const (
-	// idleThresholdBytes is the maximum metered-byte delta over one sweep
-	// interval that we treat as "no real activity".
-	//
-	// Baseline: the host's liveness probe opens a TCP connection to the VM
-	// every 5 s — roughly 80 B/s combined egress + ingress, or ~2.4-4.8 KB
-	// at the expected 30-60 s sweep cadence. The 24 KB allowance keeps that
-	// incidental TCP overhead from preventing a pause, while real user traffic
-	// normally exceeds it.
+	// idleThresholdBytes is the exclusive upper bound for the metered-byte
+	// delta since the last baseline update. The allowance tolerates small
+	// amounts of background traffic; it does not distinguish user traffic
+	// from liveness probes or measure CPU activity. The time window depends
+	// on sweep cadence and whether prior baseline updates succeeded.
 	idleThresholdBytes = 24 * 1024
 )
 
@@ -48,8 +45,9 @@ func RunOnce(ctx context.Context, db *database.Db, region string, dryRun bool) (
 		return result, nil
 	}
 
-	// Step 2: flip idle candidates to 'pausing'. CAS on status='running'
-	// prevents racing with user-initiated pause or destroy.
+	// Step 2: lock candidates and skip active snapshot captures. Recheck state
+	// and idle settings before flipping; skipped rows are reconsidered next sweep.
+	// The byte-delta predicate is checked during candidate selection above.
 	if len(result.Candidates) > 0 {
 		flipped, ferr := models.MarkIdlePausing(ctx, db, result.Candidates)
 		if ferr != nil {
@@ -59,7 +57,7 @@ func RunOnce(ctx context.Context, db *database.Db, region string, dryRun bool) (
 	}
 
 	// Step 3: snapshot current metered bytes for ALL running auto-pause
-	// sandboxes so the NEXT sweep measures the delta over one sweep interval,
+	// sandboxes in this region so the NEXT sweep measures the delta from here,
 	// not the accumulated total since the last user API call. Without this,
 	// long-running VMs accumulate enough liveness-probe traffic to exceed
 	// the threshold and never get paused.

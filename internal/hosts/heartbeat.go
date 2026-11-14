@@ -10,16 +10,17 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/controlclient"
-	"github.com/NodeOps-app/sandbox/internal/hosts/vm"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/controlclient"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/vm"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // HeartbeatConfig controls the heartbeat loop.
 type HeartbeatConfig struct {
-	HostID   string        // hostname
-	Interval time.Duration // heartbeat interval, default 5s
+	SnapshotCacheHints func() []proto.CachedSnapshot
+	HostID             string        // hostname
+	Interval           time.Duration // heartbeat interval, default 5s
 	// DiskPath is statfs'd at heartbeat time to report disk usage to
 	// control. Typically the snapshot or overlay directory.
 	DiskPath string
@@ -57,6 +58,7 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, repo *controlclient.
 	defer ticker.Stop()
 
 	var consecutiveFailures int
+	var outageStart, lastFailureLog time.Time
 	backoff := time.Second
 
 	for {
@@ -73,13 +75,25 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, repo *controlclient.
 
 		case <-ticker.C:
 			inUse, vmCount := state.Snapshot()
+			var cachedSnapshots []proto.CachedSnapshot
+			if cfg.SnapshotCacheHints != nil {
+				cachedSnapshots = cfg.SnapshotCacheHints()
+			}
+			attemptStart := time.Now()
 			resp, err := repo.Heartbeat(ctx, proto.ControlHostHeartbeatReq{
-				ID: cfg.HostID, InUseMib: inUse, VMCount: vmCount, Status: models.HostStatusActive,
+				CachedSnapshots: cachedSnapshots,
+				ID:              cfg.HostID, InUseMib: inUse, VMCount: vmCount, Status: models.HostStatusActive,
 				DiskUsedMib: CollectHardware(cfg.DiskPath).DiskUsedMib,
 			})
 			if err != nil {
 				consecutiveFailures++
-				log.WithContext(ctx).Warnf("[hostagent] heartbeat failed (%d consecutive): %v", consecutiveFailures, err)
+				if outageStart.IsZero() {
+					outageStart = attemptStart
+				}
+				if lastFailureLog.IsZero() || time.Since(lastFailureLog) >= time.Minute {
+					log.WithContext(ctx).Warnf("[hostagent] heartbeat failed (%d consecutive): %v", consecutiveFailures, err)
+					lastFailureLog = time.Now()
+				}
 				if consecutiveFailures >= 3 {
 					backoff *= 2
 					if backoff > 30*time.Second {
@@ -92,6 +106,10 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, repo *controlclient.
 				}
 				continue
 			}
+			if consecutiveFailures > 0 {
+				log.WithContext(ctx).WithFields(log.Fields{"failures": consecutiveFailures, "outage_duration": time.Since(outageStart)}).Info("[hostagent] heartbeat recovered")
+			}
+			outageStart, lastFailureLog = time.Time{}, time.Time{}
 			consecutiveFailures = 0
 			backoff = time.Second
 			// Apply the control-pushed shape catalog, if any. Empty

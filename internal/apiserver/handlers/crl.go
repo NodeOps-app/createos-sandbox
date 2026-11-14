@@ -15,14 +15,13 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // crlNextUpdateOffset is the validity window the CRL response
-// advertises. 60s matches the per-actor JWT TTL — every verifier
-// re-polls at least once per token rotation, so a freshly revoked
-// serial can't outlive its leaf cert by more than this window.
+// advertises. TLS verifiers use next_update_at to detect stale revocation
+// data; this window is independent of JWT expiry and certificate lifetime.
 const crlNextUpdateOffset = 60 * time.Second
 
 type crlEntryJSON struct {

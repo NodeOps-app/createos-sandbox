@@ -4,40 +4,22 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 	"golang.org/x/sys/unix"
 )
 
-// CPU lane isolation. Reserves a small set of host cores as the "boot
-// lane" — createos and any newly-spawning firecracker run there. All
-// existing/running firecrackers are confined to the "tenant lane"
-// (everything else). The kernel scheduler cannot migrate a tenant VM
-// onto a boot-lane core, so spawn work always has cycles available
-// regardless of how busy the tenant lane is.
-//
-// This is the cpuset-isolation pattern Firecracker's own design doc
-// recommends (and that gVisor, k8s static CPU manager, and realtime
-// Linux all use in different forms). Applied here specifically to
-// guarantee spawn latency under load.
-//
-// Layout for an N-core host:
-//
-//	cores [0, BootLaneCores)            → boot lane (createos + spawning fc)
-//	cores [BootLaneCores, N)            → tenant lane (running fc)
-//
-// Sized at startup from runtime.NumCPU(). Hosts below MinCoresForLane
-// disable the feature (lane carving doesn't pay off when the tenant
-// lane would be tiny).
-
+// CPU lanes reserve the first two available logical CPUs for boot work.
+// Firecracker starts in a shared boot cgroup, then moves to its per-VM
+// cgroup with a tenant cpuset. The kernel restricts all current and future
+// threads; no /proc task scan is needed. The host service stays unpinned.
 const (
-	// BootLaneCores is how many host cores are reserved for boot work.
-	// 2 is a reasonable default for 8–32 core hosts: enough for one
-	// concurrent /snapshot/load to complete in ~17 ms even when the
-	// tenant lane is saturated, small enough that we lose <17% of host
-	// capacity to the reservation.
+	// BootLaneCores is the number of logical CPUs excluded from the tenant
+	// lane and made available to booting Firecracker processes. The host
+	// service remains unpinned; these CPUs are not exclusive to it.
 	BootLaneCores = 2
 
 	// MinCoresForLane disables lane carving on hosts smaller than this.
@@ -49,112 +31,161 @@ const (
 // laneState is the resolved lane layout for this host. Computed once
 // at startup by ConfigureCPULanes; nil if lane carving is disabled.
 type laneState struct {
-	boot   unix.CPUSet // cores createos + booting fc may run on
+	boot   unix.CPUSet // CPUs available to booting firecrackers
 	tenant unix.CPUSet // cores running fc may run on
 }
 
 var lanes *laneState
 
-// ConfigureCPULanes computes the boot/tenant lane masks for this host
-// and pins createos itself to the boot lane. Returns nil if lane
-// carving is disabled (host too small) — callers should treat this as
-// a soft no-op everywhere else.
+// ConfigureCPULanes derives lanes from CPUs available in the cgroup hierarchy.
+// It does not change the host service's own affinity.
 func ConfigureCPULanes() error {
-	n := runtime.NumCPU()
-	if n < MinCoresForLane {
+	data, err := os.ReadFile(filepath.Join(cgRoot, "cpuset.cpus.effective"))
+	if err != nil {
+		return fmt.Errorf("cpu lanes: available CPUs: %w", err)
+	}
+	available, err := parseCPUList(string(data))
+	if err != nil {
+		return err
+	}
+	if available.Count() < MinCoresForLane {
 		return nil
 	}
-	if BootLaneCores >= n {
-		return fmt.Errorf("BootLaneCores=%d >= NumCPU=%d, refusing to leave tenant lane empty", BootLaneCores, n)
+	// Some hosts enable cpu/memory/pids at the hierarchy root but not cpuset.
+	// Enable it there first so our parent can delegate it to the VM leaves.
+	if err := os.WriteFile(filepath.Join(cgRoot, "cgroup.subtree_control"), []byte("+cpuset"), 0); err != nil {
+		return fmt.Errorf("cpu lanes: enable root cpuset: %w", err)
 	}
 	st := &laneState{}
-	for i := 0; i < BootLaneCores; i++ {
-		st.boot.Set(i)
+	for cpu := 0; cpu < 1024; cpu++ {
+		if !available.IsSet(cpu) {
+			continue
+		}
+		if st.boot.Count() < BootLaneCores {
+			st.boot.Set(cpu)
+		} else {
+			st.tenant.Set(cpu)
+		}
 	}
-	for i := BootLaneCores; i < n; i++ {
-		st.tenant.Set(i)
+	if err := ensureParent(); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(cgRoot, cgParent, "cgroup.subtree_control"), []byte("+cpuset"), 0); err != nil {
+		return fmt.Errorf("cpu lanes: enable cpuset: %w", err)
+	}
+	for name, set := range map[string]*unix.CPUSet{"boot": &st.boot, "tenant": &st.tenant} {
+		dir := filepath.Join(cgRoot, cgParent, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := setCgroupCPUs(dir, set); err != nil {
+			return err
+		}
 	}
 	lanes = st
-	// Note: we deliberately do NOT pin createos or the booting
-	// firecracker to the boot lane. Pinning createos made its Go
-	// goroutines compete with the booting firecracker for the 2 boot
-	// cores, defeating the point — measured boot phase went from ~17ms
-	// idle to ~120ms even with lanes. Instead, only the tenant VMs are
-	// fenced *out* of the boot lane. createos and any in-flight
-	// firecracker boot are unpinned; the kernel CFS scheduler picks
-	// the least-loaded core, which is almost always a boot-lane core
-	// because the tenant lane is busy and the boot lane has nothing
-	// allowed there except them.
 	return nil
+}
+
+func parseCPUList(value string) (unix.CPUSet, error) {
+	var set unix.CPUSet
+	for _, item := range strings.Split(strings.TrimSpace(value), ",") {
+		bounds := strings.Split(item, "-")
+		first, err := strconv.Atoi(bounds[0])
+		if err != nil {
+			return set, fmt.Errorf("invalid CPU list %q", value)
+		}
+		last := first
+		if len(bounds) == 2 {
+			last, err = strconv.Atoi(bounds[1])
+		}
+		if err != nil || len(bounds) > 2 || first < 0 || last < first || last >= 1024 {
+			return set, fmt.Errorf("invalid CPU list %q", value)
+		}
+		for cpu := first; cpu <= last; cpu++ {
+			set.Set(cpu)
+		}
+	}
+	return set, nil
+}
+
+func cpuList(set *unix.CPUSet) string {
+	var cpus []string
+	for cpu := 0; cpu < 1024; cpu++ {
+		if set.IsSet(cpu) {
+			cpus = append(cpus, strconv.Itoa(cpu))
+		}
+	}
+	return strings.Join(cpus, ",")
+}
+
+// Verify the effective mask: unavailable CPUs can otherwise cause cpuset to
+// fall back to the parent's mask rather than enforce the requested restriction.
+func setCgroupCPUs(dir string, set *unix.CPUSet) error {
+	if set.Count() == 0 {
+		return fmt.Errorf("cpu lanes: empty CPU set")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cpuset.cpus"), []byte(cpuList(set)), 0); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "cpuset.cpus.effective"))
+	if err != nil {
+		return err
+	}
+	effective, err := parseCPUList(string(data))
+	if err != nil {
+		return err
+	}
+	if effective != *set {
+		return fmt.Errorf("cpu lanes: requested %s, effective %s", cpuList(set), strings.TrimSpace(string(data)))
+	}
+	return nil
+}
+
+func moveToCPULane(pid int, dir string, set *unix.CPUSet) error {
+	if err := setCgroupCPUs(dir, set); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0)
 }
 
 // CPULanesActive reports whether lane carving is enabled on this host.
 func CPULanesActive() bool { return lanes != nil }
 
-// PinPidToBootLane confines the given pid (and all its threads) to
-// the boot lane. Applied to a brand-new firecracker right after
-// StartVMM so /snapshot/load AND the first guest instructions (the
-// ones the agent-ready probe is waiting on) run on cores that no
-// tenant is allowed to touch. Migrated out via PinPidToTenantLane
-// once the agent answers — boot done, joins the steady-state fleet.
-//
-// createos itself stays unpinned on purpose: pinning it too would
-// trap its Go goroutines on the same 2 boot cores, fighting the
-// booting firecracker for CPU. With ONLY firecracker pinned and
-// createos floating, the boot lane has at most ~5 firecracker
-// threads on it (main + fc_api + fc_vcpu_0 + kvm-nx-lpage + possibly
-// a worker) and the kernel-scheduler-driven createos orchestration
-// runs on the tenant lane (where there's slack alongside the
-// existing 100 polling VMs).
+// PinPidToBootLane places a new Firecracker in the boot cgroup before VM
+// startup. EnsureVMCgroup later moves it to its tenant-restricted VM cgroup.
 func PinPidToBootLane(pid int) error {
 	if lanes == nil {
 		return nil
 	}
-	return pinPidAllThreads(pid, &lanes.boot)
+	return moveToCPULane(pid, filepath.Join(cgRoot, cgParent, "boot"), &lanes.boot)
 }
 
-// PinPidToTenantLane confines the given pid (and all its threads) to
-// the tenant lane. Called once the agent has answered — the boot is
-// done and this firecracker joins the steady-state fleet.
+// PinPidToTenantLane restores tenant CPU restrictions for a surviving
+// Firecracker on host restart, preserving any existing per-VM resource limits.
 func PinPidToTenantLane(pid int) error {
 	if lanes == nil {
 		return nil
 	}
-	return pinPidAllThreads(pid, &lanes.tenant)
-}
-
-// pinPidAllThreads iterates /proc/<pid>/task and applies the cpuset to
-// every TID. SchedSetaffinity is per-thread under Linux; setting the
-// TGID only changes that one thread.
-func pinPidAllThreads(pid int, set *unix.CPUSet) error {
-	dir := fmt.Sprintf("/proc/%d/task", pid)
-	ents, err := os.ReadDir(dir)
+	// Preserve existing memory, CPU quota and pids limits on host restart.
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
 		return err
 	}
-	var firstErr error
-	for _, e := range ents {
-		tid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		if err := unix.SchedSetaffinity(tid, set); err != nil && firstErr == nil {
-			// Race: thread may have exited between readdir and now.
-			// ESRCH is benign; surface anything else as the first error.
-			if !os.IsNotExist(err) && err != unix.ESRCH {
-				firstErr = fmt.Errorf("setaffinity tid=%d: %w", tid, err)
-			}
+	for _, line := range strings.Split(string(data), "\n") {
+		path, ok := strings.CutPrefix(line, "0::/"+cgParent+"/")
+		if ok && strings.HasPrefix(path, "sb-") && !strings.Contains(path, "/") {
+			return setCgroupCPUs(filepath.Join(cgRoot, cgParent, path), &lanes.tenant)
 		}
 	}
-	return firstErr
+	return moveToCPULane(pid, filepath.Join(cgRoot, cgParent, "tenant"), &lanes.tenant)
 }
 
 // PinExistingFirecrackersToTenantLane scans /proc for already-running
 // firecracker processes (rehydrated from a prior serve run) and pins
-// each to the tenant lane. Without this, after a createos restart the
-// rehydrated tenants stay on default affinity (every core) and would
-// pollute the boot lane until they exit. No-op when lane carving is
-// disabled. Reports the count of pinned PIDs.
+// each to the tenant lane. Existing per-VM cgroups survive service restart;
+// update their cpusets in place to preserve resource limits. Processes without
+// a per-VM leaf move to the shared tenant cgroup. No-op when lane carving is
+// disabled. Reports the count of updated PIDs.
 func PinExistingFirecrackersToTenantLane() (int, error) {
 	if lanes == nil {
 		return 0, nil
@@ -164,6 +195,7 @@ func PinExistingFirecrackersToTenantLane() (int, error) {
 		return 0, err
 	}
 	pinned := 0
+	var firstErr error
 	for _, e := range procs {
 		if !e.IsDir() {
 			continue
@@ -179,21 +211,24 @@ func PinExistingFirecrackersToTenantLane() (int, error) {
 		if string(comm) != "firecracker\n" {
 			continue
 		}
-		if err := pinPidAllThreads(pid, &lanes.tenant); err == nil {
-			pinned++
+		if err := PinPidToTenantLane(pid); err != nil {
+			if !os.IsNotExist(err) && firstErr == nil {
+				firstErr = fmt.Errorf("tenant lane pid %d: %w", pid, err)
+			}
+			continue
 		}
+		pinned++
 	}
-	return pinned, nil
+	return pinned, firstErr
 }
 
 // LaneSummary returns a one-line description of the lane configuration
 // for logging on startup.
 func LaneSummary() string {
 	if lanes == nil {
-		return fmt.Sprintf("cpu-lanes: disabled (NumCPU=%d < %d)", runtime.NumCPU(), MinCoresForLane)
+		return "cpu-lanes: disabled"
 	}
-	return fmt.Sprintf("cpu-lanes: boot=[0..%d) tenant=[%d..%d)",
-		BootLaneCores, BootLaneCores, runtime.NumCPU())
+	return fmt.Sprintf("cpu-lanes: boot=%s tenant=%s", cpuList(&lanes.boot), cpuList(&lanes.tenant))
 }
 
 // pinToBootLaneHandler is an SDK init handler that pins firecracker
@@ -214,8 +249,7 @@ func pinToBootLaneHandler() firecracker.Handler {
 			if err != nil {
 				return nil // not fork()'d yet; harmless
 			}
-			_ = PinPidToBootLane(pid)
-			return nil
+			return PinPidToBootLane(pid)
 		},
 	}
 }

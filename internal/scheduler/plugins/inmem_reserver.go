@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/scheduler/framework"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/scheduler/framework"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // reservation tracks one in-flight schedule decision keyed by sandbox id.
@@ -30,6 +30,8 @@ type InMemReserver struct {
 	mu sync.Mutex
 	// usage is the per-host map of reservations keyed by sandbox id.
 	usage map[string]map[string]reservation
+	// hosts is the latest admission view, published with reservation reconciliation.
+	hosts map[string]models.Host
 }
 
 // NewInMemReserver constructs a fresh reserver. The grace period is owned
@@ -55,6 +57,17 @@ func (r *InMemReserver) Reserve(_ context.Context, sbID string, req *framework.R
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Filtering may have copied an older host before hydration. Final admission
+	// must use the counters published with the current pending deltas.
+	if r.hosts != nil {
+		latest, ok := r.hosts[h.ID]
+		if !ok {
+			// This filtering candidate disappeared during hydration. Try the
+			// next eligible host rather than aborting the whole pipeline.
+			return framework.ErrConflict
+		}
+		h = &latest
+	}
 	hostMap := r.usage[h.ID]
 	pendingMem := 0
 	pendingVMs := 0
@@ -74,8 +87,8 @@ func (r *InMemReserver) Reserve(_ context.Context, sbID string, req *framework.R
 		return framework.ErrConflict
 	}
 	// Multi-dim admission against pending+live counters. Treats
-	// hosts/requests that haven't advertised the new dimensions as
-	// "skip this check" (factor of 0). See OvercommitFilter for the
+	// hosts/requests with missing CPU or disk capacity as
+	// "skip this check". Nonpositive factors use defaults. See OvercommitFilter for the
 	// same logic applied against authoritative-only counters.
 	if req.VCPU > 0 && h.CPUCount > 0 {
 		factor := h.CPUOvercommitX10
@@ -131,12 +144,22 @@ func (r *InMemReserver) Release(_ context.Context, sbID string) error {
 //     avoid double-counting.
 //   - terminated[id]==true → row is failed/destroyed; drop from delta
 //     immediately (don't wait for the grace timer).
-//   - reservedAt < cutoff  → control crashed mid-flight; drop.
+//   - reservedAt < cutoff  → grace period elapsed without a live row; drop.
 //   - otherwise            → keep (still in-flight, durable record may
 //     simply not have caught up yet).
-func (r *InMemReserver) Reconcile(live, terminated map[string]bool, graceCutoff time.Time) {
+func (r *InMemReserver) Reconcile(hosts map[string]models.Host, live, terminated map[string]bool, graceCutoff time.Time) {
+	// Own the map: hostCache may be updated separately by heartbeat handling.
+	// Prepare the copy outside the admission lock; no DB work happens here.
+	var current map[string]models.Host
+	if hosts != nil {
+		current = make(map[string]models.Host, len(hosts))
+		for id, h := range hosts {
+			current[id] = h
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.hosts = current
 	for hostID, hostMap := range r.usage {
 		for sbID, res := range hostMap {
 			switch {
@@ -201,7 +224,7 @@ func (r *InMemReserver) UpsertCounters(_ string, _ int, _ int) {}
 // placement decision away from hosts that have already taken many
 // pending placements within the current hydrate window — the antidote
 // to the "all 100 concurrent decisions pick the same most-free host
-// because hydrate is 1s stale" failure mode under burst.
+// between hydration ticks" failure mode under burst.
 func (r *InMemReserver) PendingVMs(hostID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

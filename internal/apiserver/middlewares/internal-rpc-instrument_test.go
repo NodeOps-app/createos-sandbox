@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/NodeOps-app/sandbox/internal/hosts/metrics"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/prometheus/client_golang/prometheus"
 )

@@ -13,6 +13,7 @@ import (
 // `mode` (snapshot vs cold-boot) is intentionally not exposed — it's an
 // operational detail of the boot path, not part of the user contract.
 type CreateResp struct {
+	SnapshotID          *string           `json:"snapshot_id,omitempty"`
 	ID                  string            `json:"id"`
 	Status              string            `json:"status"`
 	Name                *string           `json:"name,omitempty"`
@@ -42,25 +43,22 @@ type ExecResp struct {
 	ExecMs float64       `json:"exec_ms"`
 }
 
-// SandboxView is the projection of a sandbox returned by List / Get / GetByIP.
-//
-// Only fields safe to expose to end users live here. Internal operator
-// state — host placement, bucket URIs, locality-cache hints, raw error
-// strings — is deliberately stripped (see NewSandboxView) so the public
-// API can't be probed for topology or storage layout.
 // DestroyResp is the ack returned by DELETE /v1/sandboxes/:id.
 //
 // `id` always carries the sandbox id the caller supplied (NOT an error
 // message — that was the previous misuse of SandboxNotFound). `status`
 // is the row's state at the moment of the response — `destroying` for
-// a fresh delete, `destroyed` when we hit an already-terminal row
+// a fresh delete, or the existing `destroyed`/`failed` terminal state
 // (DELETE is idempotent so this is still 200).
 type DestroyResp struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 }
 
+// SandboxView is the public sandbox projection for list/get responses. It
+// omits host placement, bucket URIs, cache hints, and raw internal error text.
 type SandboxView struct {
+	SnapshotID  *string           `json:"snapshot_id,omitempty"`
 	ID          string            `json:"id"`
 	Name        *string           `json:"name,omitempty"`
 	Status      string            `json:"status"`
@@ -126,7 +124,7 @@ type EgressView struct {
 // ── Host-side by-ip lookup (proxy consumer) ───────────────────────────
 
 // SandboxByIP is the lowercase-JSON projection the proxy decodes from
-// GET /v1/internal/db/sandboxes/by-ip/:ip. Must match createos/internal/proxy
+// GET /v1/internal/db/sandboxes/by-ip/:ip. Must match internal/hostproxy
 // client's expected shape.
 type SandboxByIP struct {
 	ID     string   `json:"id"`
@@ -148,8 +146,8 @@ type Shape struct {
 	// CPUQuotaPct is the cgroup v2 cpu.max quota expressed as a percent
 	// of one CPU. 0 = unlimited (default). 25 = 0.25 vCPU (burstable
 	// shared-CPU shapes), 50 = 0.5 vCPU. Values >100 cap above a single
-	// core but are typically left at 0 since we already expose the
-	// requested vCPU count and don't oversubscribe.
+	// core. vCPU count and scheduler oversubscription are separate from
+	// this per-VM execution quota.
 	CPUQuotaPct int `json:"cpu_quota_pct,omitempty" yaml:"cpu_quota_pct,omitempty"`
 }
 
@@ -193,8 +191,8 @@ type ReadyzResp struct {
 // ── Admin / host registry ─────────────────────────────────────────────
 
 // HostRegisterResp: {"id": ...} — POST /v1/internal/hosts/register.
-// The host's identity is its private signing key; control no longer mints
-// a per-host bearer. SubnetCIDR and UnderlayIP are set when the control
+// Host registration uses its mTLS identity rather than a per-host bearer.
+// SubnetCIDR and UnderlayIP are set when the control
 // plane has assigned a /22 to this host (overlay networking).
 type HostRegisterResp struct {
 	ID         string `json:"id"`
@@ -300,8 +298,8 @@ type RelayPairView struct {
 // RelayStateResp is the full reconcile payload returned on each tick.
 // Three lists drive the relay's local state:
 //   - Sessions      → wg-devices peer table
-//   - DevicePairs   → fc_vmip_pair entries for device↔device traffic
-//   - DeviceVMPairs → fc_vmip_pair entries for device↔VM traffic
+//   - DevicePairs   → relay policy entries for device↔device traffic
+//   - DeviceVMPairs → relay policy entries for device↔VM traffic
 type RelayStateResp struct {
 	Sessions      []RelaySessionView `json:"sessions"`
 	DevicePairs   []RelayPairView    `json:"device_pairs"`

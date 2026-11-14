@@ -13,17 +13,18 @@ import (
 // share ControlFile — sweep is a maintenance job, and adding/removing
 // tuning knobs to control shouldn't crash the janitor via strict YAML.
 type SweepConfig struct {
-	PostgresDSN         string
-	DeadHostEvictAfter  time.Duration
-	Region              string
-	SchedulerURL        string
-	InternalTLSCertPath string
-	InternalTLSKeyPath  string
-	InternalTLSCAPath   string
-	Storage             StorageConfig
-	PlacementPolicies   map[string]PlacementPolicy
-	DryRun              bool
-	StuckTransitionAge  time.Duration
+	DiskCredentialKeyPath string
+	PostgresDSN           string
+	DeadHostEvictAfter    time.Duration
+	Region                string
+	SchedulerURL          string
+	InternalTLSCertPath   string
+	InternalTLSKeyPath    string
+	InternalTLSCAPath     string
+	Storage               StorageConfig
+	PlacementPolicies     map[string]PlacementPolicy
+	DryRun                bool
+	StuckTransitionAge    time.Duration
 }
 
 // SweepFile is the YAML schema for `sweep.yaml`. All operational
@@ -31,6 +32,7 @@ type SweepConfig struct {
 // operators don't accidentally over-share control-plane secrets with a
 // maintenance CronJob.
 type SweepFile struct {
+	DiskCredentialKey  *string                    `yaml:"disk_credential_key"`
 	PostgresDSN        *string                    `yaml:"postgres_dsn"`
 	DeadHostEvictAfter *time.Duration             `yaml:"dead_host_evict_after"`
 	Region             *string                    `yaml:"region"`
@@ -50,6 +52,7 @@ type SweepFile struct {
 func SweepFlags() []cli.Flag {
 	flags := []cli.Flag{
 		&cli.StringFlag{Name: "config", Usage: "path to YAML config file (sweep.yaml)"},
+		&cli.StringFlag{Name: "disk-credential-key", Usage: "path to the existing disk credential key for decrypting sandbox environments", EnvVars: []string{"DISK_CREDENTIAL_KEY"}},
 		&cli.StringFlag{Name: "postgres-dsn", Value: "postgres://createos:createos@localhost:5432/createos?sslmode=disable", EnvVars: []string{"POSTGRES_DSN"}},
 		&cli.DurationFlag{Name: "dead-host-evict-after", Value: 0, Usage: "mark sandboxes destroyed after their host has been dead this long; 0 = disabled", EnvVars: []string{"DEAD_HOST_EVICT_AFTER"}},
 		&cli.StringFlag{Name: "region", EnvVars: []string{"REGION"}},
@@ -71,16 +74,17 @@ func SweepFromContext(c *cli.Context) (SweepConfig, error) {
 		return SweepConfig{}, err
 	}
 	cfg := SweepConfig{
-		PostgresDSN:         pickStr(c, "postgres-dsn", f.PostgresDSN),
-		DeadHostEvictAfter:  pickDur(c, "dead-host-evict-after", f.DeadHostEvictAfter),
-		Region:              pickStr(c, "region", f.Region),
-		SchedulerURL:        pickStr(c, "scheduler-url", f.SchedulerURL),
-		InternalTLSCertPath: pickStr(c, "internal-tls-cert", f.InternalTLSCert),
-		InternalTLSKeyPath:  pickStr(c, "internal-tls-key", f.InternalTLSKey),
-		InternalTLSCAPath:   pickStr(c, "internal-tls-ca", f.InternalTLSCA),
-		DryRun:              pickBool(c, "dry-run", f.DryRun),
-		StuckTransitionAge:  pickDur(c, "stuck-transition-age", f.StuckTransitionAge),
-		PlacementPolicies:   f.PlacementPolicies,
+		DiskCredentialKeyPath: pickStr(c, "disk-credential-key", f.DiskCredentialKey),
+		PostgresDSN:           pickStr(c, "postgres-dsn", f.PostgresDSN),
+		DeadHostEvictAfter:    pickDur(c, "dead-host-evict-after", f.DeadHostEvictAfter),
+		Region:                pickStr(c, "region", f.Region),
+		SchedulerURL:          pickStr(c, "scheduler-url", f.SchedulerURL),
+		InternalTLSCertPath:   pickStr(c, "internal-tls-cert", f.InternalTLSCert),
+		InternalTLSKeyPath:    pickStr(c, "internal-tls-key", f.InternalTLSKey),
+		InternalTLSCAPath:     pickStr(c, "internal-tls-ca", f.InternalTLSCA),
+		DryRun:                pickBool(c, "dry-run", f.DryRun),
+		StuckTransitionAge:    pickDur(c, "stuck-transition-age", f.StuckTransitionAge),
+		PlacementPolicies:     f.PlacementPolicies,
 	}
 	cfg.Storage = resolveStorage(c, f.Storage)
 	return cfg, nil

@@ -57,6 +57,10 @@ type overlayMaps struct {
 	vmipPair   *ebpf.Map
 	knownVMIPs *ebpf.Map
 	ifaceToIP  *ebpf.Map
+
+	// Locally borrowed slots include creates, restores and template boots
+	// that are not yet in Manager.Sandboxes. Protected by reconcileMu.
+	boundIfaces map[uint32]uint32
 }
 
 var globalOverlayMaps = &overlayMaps{}
@@ -333,9 +337,14 @@ func iterU32U32(m *ebpf.Map) map[uint32]uint32 {
 // iterIfacePairSet snapshots fc_iface_pair. Key layout: native ifindex
 // followed by network-byte-order dst_ip.
 func iterIfacePairSet(m *ebpf.Map) map[pairKey]struct{} {
+	out, _ := readIfacePairs(m)
+	return out
+}
+
+func readIfacePairs(m *ebpf.Map) (map[pairKey]struct{}, error) {
 	out := map[pairKey]struct{}{}
 	if m == nil {
-		return out
+		return out, nil
 	}
 	iter := m.Iterate()
 	var k [8]byte
@@ -346,15 +355,20 @@ func iterIfacePairSet(m *ebpf.Map) map[pairKey]struct{} {
 			B: binary.BigEndian.Uint32(k[4:8]),
 		}] = struct{}{}
 	}
-	return out
+	return out, iter.Err()
 }
 
 // iterVMIPPairSet snapshots fc_vmip_pair. Both halves are
 // network-byte-order IPs.
 func iterVMIPPairSet(m *ebpf.Map) map[pairKey]struct{} {
+	out, _ := readVMIPPairs(m)
+	return out
+}
+
+func readVMIPPairs(m *ebpf.Map) (map[pairKey]struct{}, error) {
 	out := map[pairKey]struct{}{}
 	if m == nil {
-		return out
+		return out, nil
 	}
 	iter := m.Iterate()
 	var k [8]byte
@@ -365,7 +379,7 @@ func iterVMIPPairSet(m *ebpf.Map) map[pairKey]struct{} {
 			B: binary.BigEndian.Uint32(k[4:8]),
 		}] = struct{}{}
 	}
-	return out
+	return out, iter.Err()
 }
 
 // DeleteVMIPVnis removes every policy entry that refers to a VM IP.
@@ -388,8 +402,23 @@ func DeleteVMIPVnis(ipStr string) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	return o.deleteVMIPLocked(ipNet)
+}
+
+// Caller holds reconcileMu and mu.
+func (o *overlayMaps) deleteVMIPLocked(ipNet uint32) error {
+	for ifindex, ip := range o.boundIfaces {
+		if ip == ipNet {
+			delete(o.boundIfaces, ifindex)
+		}
+	}
+
+	pairs, scanErr := readVMIPPairs(o.vmipPair)
 	var errs []error
-	for k := range iterVMIPPairSet(o.vmipPair) {
+	if scanErr != nil {
+		errs = append(errs, fmt.Errorf("read VM IP permissions: %w", scanErr))
+	}
+	for k := range pairs {
 		if k.A != ipNet && k.B != ipNet {
 			continue
 		}
@@ -399,7 +428,7 @@ func DeleteVMIPVnis(ipStr string) error {
 		}
 	}
 	if err := DeleteKnownVMIP(ipNet); err != nil {
-		errs = append(errs, fmt.Errorf("delete known VM IP %s: %w", ipStr, err))
+		errs = append(errs, fmt.Errorf("delete known VM IP %s: %w", ipString(ipNet), err))
 	}
 	return errors.Join(errs...)
 }
@@ -418,8 +447,19 @@ func DeleteIfaceVnis(ifindex uint32) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	return o.deleteIfaceLocked(ifindex)
+}
+
+// Caller holds reconcileMu and mu.
+func (o *overlayMaps) deleteIfaceLocked(ifindex uint32) error {
+	delete(o.boundIfaces, ifindex)
+
+	pairs, scanErr := readIfacePairs(o.ifacePair)
 	var errs []error
-	for k := range iterIfacePairSet(o.ifacePair) {
+	if scanErr != nil {
+		errs = append(errs, fmt.Errorf("read interface permissions: %w", scanErr))
+	}
+	for k := range pairs {
 		if k.A != ifindex {
 			continue
 		}
@@ -437,8 +477,8 @@ func DeleteIfaceVnis(ifindex uint32) error {
 // BindVMIPToIface installs the per-VM policy identity that must exist before
 // a borrowed slot starts carrying guest traffic. Return removes this binding
 // before cross-tenant reuse; waiting for the periodic reconciler to restore it
-// leaves a several-second window where the new VM is running but its packets
-// fail the anti-spoof check.
+// leaves a window where packets have no trustworthy tenant identity. Keep the
+// binding through reconciliation until slot cleanup, even before registration.
 func BindVMIPToIface(hostVeth, ipStr string) error {
 	ipNet, err := ipKey(ipStr)
 	if err != nil {
@@ -459,6 +499,12 @@ func BindVMIPToIface(hostVeth, ipStr string) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	// Clean again at handoff, not only on Return. Hold the reconciliation lock
+	// across cleanup and publication so no old permissions can slip between them.
+	if err := errors.Join(o.deleteVMIPLocked(ipNet), o.deleteIfaceLocked(ifindex)); err != nil {
+		return fmt.Errorf("clean policy before binding veth=%s: %w", hostVeth, err)
+	}
+
 	if err := SetKnownVMIP(ipNet); err != nil {
 		return fmt.Errorf("set known VM IP %s: %w", ipStr, err)
 	}
@@ -467,5 +513,9 @@ func BindVMIPToIface(hostVeth, ipStr string) error {
 		return fmt.Errorf("set iface-to-IP veth=%s ifindex=%d ip=%s: %w",
 			hostVeth, ifindex, ipStr, err)
 	}
+	if o.boundIfaces == nil {
+		o.boundIfaces = make(map[uint32]uint32)
+	}
+	o.boundIfaces[ifindex] = ipNet
 	return nil
 }

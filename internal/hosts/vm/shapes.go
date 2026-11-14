@@ -3,7 +3,7 @@ package vm
 import (
 	"fmt"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // This file is the actual implementation of the host-side shape catalog

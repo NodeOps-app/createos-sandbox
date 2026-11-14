@@ -307,5 +307,11 @@ RUN NODE_DIR=$(asdf where nodejs) && \
     ln -sfn "$PYTHON_DIR/bin/python"  /usr/local/bin/python && \
     ln -sfn "$PYTHON_DIR/bin/python3" /usr/local/bin/python3
 
+# Record the installed runtime's file pages, not a running user process.
+# This optional image manifest is consumed before the VM template snapshot.
+COPY warmup.py /opt/createos/warmup.py
+RUN /usr/bin/python3 /opt/createos/warmup.py \
+    --output /etc/createos/warmup.json /usr/local/bin/node --version
+
 WORKDIR /workspace
 EXPOSE 22 2375 4096

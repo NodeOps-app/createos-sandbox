@@ -22,7 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 // CertKind is the actor class a cert was issued for. Used as the

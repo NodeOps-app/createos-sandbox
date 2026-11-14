@@ -42,6 +42,9 @@ type PooledNet struct {
 	// by rehydrate — those came from a prior serve's pool and don't fit
 	// our current pool's lifecycle, so Return tears them down instead.
 	permanent bool
+
+	processMu sync.Mutex
+	processes []*slotProcess
 }
 
 // NetPool holds a buffered channel of pre-built networks. It uses an
@@ -78,6 +81,7 @@ type NetPool struct {
 }
 
 type quarantinedSlot struct {
+	net       *PooledNet // retains process handles until exit is confirmed
 	pair      IPPair
 	sandboxID string // non-empty when sandbox-specific iptables teardown failed
 }
@@ -545,6 +549,18 @@ func (p *NetPool) GetWithDepth() (*PooledNet, int) {
 // dips below the configured minimum, so the pool self-expands on first
 // burst past the warm size.
 func (p *NetPool) Return(pn *PooledNet) {
+	if err := pn.waitProcessExit(3 * time.Second); err != nil {
+		log.Warnf("[netpool] process still owns slot=%s: %v; quarantining", pn.ContainerID, err)
+		_ = cleanupSlotPolicy(pn.ContainerID, pn.IP.IP.String())
+		p.quarantine(pn, "")
+		if pn.permanent {
+			p.requestReplacement()
+		}
+		return
+	}
+	pn.processMu.Lock()
+	pn.processes = nil // no previous borrower command may survive slot handoff
+	pn.processMu.Unlock()
 	if !pn.permanent {
 		// Rehydrated slot — doesn't belong in our pool's rotation.
 		p.Discard(pn)
@@ -680,7 +696,7 @@ func cleanupSlotPolicy(containerID, ip string) error {
 func (p *NetPool) quarantine(pn *PooledNet, sandboxID string) {
 	p.mu.Lock()
 	if pn.ipam != nil && pn.pair.VMCIDR != "" {
-		p.quarantined[pn.ContainerID] = quarantinedSlot{pair: pn.pair, sandboxID: sandboxID}
+		p.quarantined[pn.ContainerID] = quarantinedSlot{pair: pn.pair, sandboxID: sandboxID, net: pn}
 	}
 	delete(p.owned, pn.ContainerID)
 	p.mu.Unlock()
@@ -695,6 +711,11 @@ func (p *NetPool) cleanup(pn *PooledNet) {
 }
 
 func (p *NetPool) cleanupAfterPolicy(pn *PooledNet) {
+	if err := pn.waitProcessExit(3 * time.Second); err != nil {
+		log.Warnf("[netpool] cannot tear down live slot=%s: %v; quarantining", pn.ContainerID, err)
+		p.quarantine(pn, "")
+		return
+	}
 	_ = claimPersistedNetSlot(pn.ContainerID)
 	hostVeth := vethNameFor(pn.ContainerID)
 	DetachBPFMeterFromVeth(hostVeth)
@@ -714,7 +735,7 @@ func (p *NetPool) cleanupAfterPolicy(pn *PooledNet) {
 	}
 	p.mu.Lock()
 	if teardownErr != nil && pn.ipam != nil && pn.pair.VMCIDR != "" {
-		p.quarantined[pn.ContainerID] = quarantinedSlot{pair: pn.pair}
+		p.quarantined[pn.ContainerID] = quarantinedSlot{pair: pn.pair, net: pn}
 	}
 	delete(p.owned, pn.ContainerID)
 	p.mu.Unlock()
@@ -885,6 +906,12 @@ func (p *NetPool) ReapOrphans(liveContainerIDs []string) int {
 			continue
 		}
 		if quarantined {
+			if quarantine.net != nil {
+				if err := quarantine.net.waitProcessExit(0); err != nil {
+					p.mu.Unlock()
+					continue
+				}
+			}
 			if quarantine.sandboxID != "" {
 				if err := removeSandboxIPTables(quarantine.sandboxID, vethNameFor(ns)); err != nil {
 					log.Warnf("[netpool] reap quarantined slot=%s sandbox=%s iptables cleanup: %v; retained for retry",

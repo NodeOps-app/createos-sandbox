@@ -7,9 +7,10 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/httpx/types"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx/types"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 type userMetricsResp struct {
@@ -189,14 +190,14 @@ func parseMetricsWindow(c *fiber.Ctx, defaultLookback time.Duration) (time.Time,
 	now := time.Now().UTC()
 	to := now
 	from := now.Add(-defaultLookback)
-	if v := c.Query("to"); v != "" {
+	if v := c.Query(middlewares.QueryTo); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("invalid 'to' (want RFC3339)")
 		}
 		to = t.UTC()
 	}
-	if v := c.Query("from"); v != "" {
+	if v := c.Query(middlewares.QueryFrom); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("invalid 'from' (want RFC3339)")

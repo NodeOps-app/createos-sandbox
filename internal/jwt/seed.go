@@ -1,13 +1,6 @@
-// Package jwt implements minimal EdDSA-only JSON Web Tokens for createos's
-// internal RPC auth. Stdlib only (crypto/ed25519, encoding/json, encoding/base64).
-//
-// We don't pull a generic JWT library because createos only needs:
-//   - one alg ("EdDSA")
-//   - one claim shape (Claims below)
-//   - kid-based key lookup at verify time
-//
-// The full RFC 7519 surface (alg negotiation, RSA, HMAC, JWE, etc.) is dead
-// weight. The trimmed implementation is ~150 LOC across this package.
+// Package jwt implements Ed25519-signed JWTs with a fixed claims shape and
+// issuer-key lookup. It provides signing, validation, and key-file helpers;
+// callers choose the accepted signers and enforce resource authorization.
 package jwt
 
 import (
@@ -21,13 +14,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// LoadOrGenerateSeed reads a 32-byte ed25519 seed from path, generating a
-// fresh keypair and persisting the seed at path if the file doesn't exist.
-// Same wire format as the gateway's host-key file (internal/gateway/gateway.go),
-// so operators can mix-and-match if they ever want to.
-//
-// File mode is 0600 (root-only). Caller is responsible for ensuring the
-// parent directory exists with appropriate permissions.
+// LoadOrGenerateSeed loads a raw 32-byte Ed25519 seed, or generates and writes
+// one when the file is absent. New files use mode 0600; existing files receive
+// a best-effort mode correction. The caller owns parent-directory permissions
+// and must serialize initialization if multiple processes share the path.
 func LoadOrGenerateSeed(path string) (ed25519.PrivateKey, error) {
 	seed, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -48,18 +38,15 @@ func LoadOrGenerateSeed(path string) (ed25519.PrivateKey, error) {
 		return nil, fmt.Errorf("seed file %q must contain a %d-byte ed25519 seed (got %d)",
 			path, ed25519.SeedSize, len(seed))
 	}
-	// Defense against drift: if an operator (or a copy/restore) widened the
-	// perms, log loudly and re-tighten to 0600. The private key only needs
-	// to be root-readable; anything wider is a misconfiguration.
+	// Attempt to restore owner-only read/write permissions on existing files.
+	// Successful corrections and read-only filesystem failures are silent.
 	enforceKeyFilePerms(path)
 	return ed25519.NewKeyFromSeed(seed), nil
 }
 
-// enforceKeyFilePerms verifies the file is mode 0600 and corrects it if not.
-// Best-effort: in k8s the key is mounted from a Secret on a read-only volume
-// at a mode the operator chose (typically 0400 or 0444) — chmod fails with
-// EROFS, which is expected, not a problem. Only warn when the file IS on a
-// writable filesystem and is wider than 0600.
+// enforceKeyFilePerms attempts chmod 0600 whenever the current mode differs.
+// Stat failures and EROFS are ignored; other chmod failures are logged. It
+// neither changes ownership nor rejects loading a key whose mode cannot change.
 func enforceKeyFilePerms(path string) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -80,8 +67,7 @@ func enforceKeyFilePerms(path string) {
 	}
 }
 
-// LoadPublicKey reads a raw 32-byte ed25519 public key from path. Used by
-// host config to load control/ingress/gateway pubkeys on startup.
+// LoadPublicKey reads a raw 32-byte Ed25519 public key from path.
 func LoadPublicKey(path string) (ed25519.PublicKey, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

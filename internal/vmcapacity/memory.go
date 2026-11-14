@@ -36,8 +36,8 @@ func OverheadMiB(shape string, guestMiB int) int {
 	return overhead
 }
 
-// ReservedMemoryMiB is the physical-host capacity consumed by a VM. It is
-// intentionally distinct from the guest memory advertised and billed.
+// ReservedMemoryMiB is the host-memory reservation budget for a VM, not a
+// measurement of its resident memory. It includes headroom above guest memory.
 func ReservedMemoryMiB(shape string, guestMiB int) int {
 	if guestMiB <= 0 {
 		return 0

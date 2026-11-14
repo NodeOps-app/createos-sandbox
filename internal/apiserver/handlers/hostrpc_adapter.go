@@ -14,11 +14,12 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 
-	"github.com/NodeOps-app/sandbox/internal/hostrpc"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/internal/utils"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostrpc"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // Buffered host operations should return compact JSON. Computer responses can
@@ -79,17 +80,21 @@ func ForwardFileUploadToAs(c *fiber.Ctx, host models.Host, path string, httpClie
 		return httpx.Fail(c, fiber.StatusRequestEntityTooLarge, "file exceeds 10 GiB limit")
 	}
 
+	transferCtx, finish := requestctx.WithFileTransfer(c.UserContext(), c.Context().Conn())
+	defer finish()
 	body := c.Context().RequestBodyStream()
 	if body == nil {
 		body = bytes.NewReader(c.Body())
 	}
 	body = io.LimitReader(body, proto.MaxFileUploadBytes+1)
-	resp, err := hostrpc.Forward(c.UserContext(), httpClient, host, hostrpc.ForwardRequest{
+	uploadCtx, bodyReader, stopUpload := requestctx.WithFileUpload(transferCtx, body, c.Context().Conn())
+	defer stopUpload()
+	resp, err := hostrpc.Forward(uploadCtx, httpClient, host, hostrpc.ForwardRequest{
 		Method:        strings.Clone(c.Method()),
 		Path:          path,
 		Query:         string(c.Request().URI().QueryString()),
 		Header:        forwardHeaders(c),
-		Body:          body,
+		Body:          bodyReader,
 		ContentLength: contentLength,
 		UserID:        userID,
 	})
@@ -116,7 +121,7 @@ func ForwardFileDownloadTo(c *fiber.Ctx, host models.Host, path string, httpClie
 }
 
 func ForwardFileDownloadToAs(c *fiber.Ctx, host models.Host, path string, httpClient *http.Client, userID string) error {
-	streamCtx, cancel := context.WithCancel(context.WithoutCancel(c.UserContext()))
+	streamCtx, cancel := requestctx.WithFileTransfer(context.WithoutCancel(c.UserContext()), c.Context().Conn())
 	resp, err := hostrpc.Forward(streamCtx, httpClient, host, hostrpc.ForwardRequest{
 		Method:         http.MethodGet,
 		Path:           path,
@@ -132,7 +137,7 @@ func ForwardFileDownloadToAs(c *fiber.Ctx, host models.Host, path string, httpCl
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		defer resp.Body.Close()
-		cancel()
+		defer cancel()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		c.Status(resp.StatusCode)
 		c.Set(fiber.HeaderContentType, resp.Header.Get(fiber.HeaderContentType))
@@ -299,7 +304,7 @@ func ForwardStreamToAs(c *fiber.Ctx, host models.Host, path string, httpClient *
 	// stream writer's exit instead, so disconnects on the client side
 	// propagate up to the host. cancel is invoked by the deferred cleanup
 	// inside SetBodyStreamWriter below.
-	streamCtx, streamCancel := context.WithCancel(context.WithoutCancel(c.UserContext()))
+	streamCtx, streamCancel := requestctx.WithDisconnect(context.WithoutCancel(c.UserContext()), c.Context().Conn())
 	// The shared control-to-host client has a one-hour safety timeout for
 	// ordinary RPCs. Streaming exec and managed-process connections may live
 	// for the sandbox's entire lifetime, so reuse its transport but let the

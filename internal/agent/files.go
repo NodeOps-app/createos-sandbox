@@ -15,7 +15,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
 // SYS_OPENAT2 is 437 on every Linux arch we ship for (amd64, arm64) — stable

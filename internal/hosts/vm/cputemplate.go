@@ -13,24 +13,17 @@ import (
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 )
 
-// CPU template — cross-vendor (Intel ↔ AMD) feature masking applied per-VM
-// via firecracker's PUT /cpu-config endpoint. Required because firecracker
-// bakes source-host CPUID into vmstate at snapshot create; without a
-// template, restoring a snapshot on a different vendor SIGILLs the guest
-// the moment it executes a vendor-divergent instruction.
+// CPU templates mask guest CPU features through Firecracker's PUT /cpu-config
+// endpoint before cold boot or prewarm capture. Masking can reduce differences
+// between hosts, but does not guarantee snapshot portability: CPU vendor,
+// KVM register state, TSC compatibility, and the Firecracker runtime still matter.
+// Restoring an existing snapshot retains its captured CPU configuration.
 //
-// The firecracker-go-sdk v1.0.0 only exposes the deprecated static
-// `cpu_template: C3|T2` machine-config knob (Intel-only). The new
-// per-VM custom template endpoint added in firecracker v1.4+ is not in
-// the SDK type surface, so we PUT the JSON over the API socket
-// ourselves — same pattern as uffd.go's snapshot/load override.
-//
-// Status today: registered as an init handler when CPUTemplatePath is
-// non-empty in ManagerConfig. The yaml field is `cpu_template_path`.
-// Operators ship the JSON to /etc/createos/cpu-template.json (the install
-// script copies it there). Existing prewarm snapshots that pre-date the
-// template are NOT cross-vendor portable — operators must wipe
-// snapshot_dir and let prewarm rebuild after enabling the template.
+// The configured cpu_template_path is loaded once at startup. We send its JSON
+// directly over the API socket because the SDK integration uses the custom
+// CPU-config endpoint rather than the static machine-config template field.
+// After changing a template, regenerate affected prewarm snapshots explicitly;
+// preserve user pause/full-snapshot bundles and their compatible runtimes.
 
 // cpuTemplatePathMu guards cpuTemplateBody against a startup
 // SetCPUTemplatePath racing the first cold-create's read.

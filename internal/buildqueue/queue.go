@@ -1,8 +1,8 @@
 // Package buildqueue brokers template build jobs from the user-facing
 // API to the builder service.
 //
-// Pluggable so the v1 Postgres backend can be swapped for Redis / NATS /
-// etc. without touching the builder. See DESIGN/templates.md.
+// The production backend uses Postgres; memqueue provides a process-local
+// implementation for tests.
 package buildqueue
 
 import (
@@ -25,7 +25,7 @@ type Job struct {
 type Status int
 
 const (
-	StatusReady  Status = iota + 1 // build succeeded; ext4 in R2
+	StatusReady  Status = iota + 1 // build succeeded; ext4 in object storage
 	StatusFailed                   // build failed; diagnostic logs live in ClickHouse
 )
 
@@ -47,11 +47,11 @@ var (
 	ErrNotClaimed    = errors.New("buildqueue: job not currently claimed")
 )
 
-// Queue is the broker interface. All methods are safe for concurrent
-// use across multiple builder processes; Claim is exclusive (a job is
-// delivered to at most one live consumer).
+// Queue is the broker interface. Implementations serialize claims against
+// their backing state: Postgres coordinates builder processes, while memqueue
+// coordinates only callers sharing the same in-memory queue.
 type Queue interface {
-	// Enqueue submits a new job. Idempotent on j.TplID.
+	// Enqueue submits a new job. Duplicate-ID error handling is backend-specific.
 	Enqueue(ctx context.Context, j Job) error
 
 	// Claim atomically reserves one job whose UserID is NOT in
@@ -61,16 +61,13 @@ type Queue interface {
 	Claim(ctx context.Context, blockedUsers []string) (*Job, error)
 
 	// Complete marks a claimed job as terminally done (success or
-	// failure). Idempotent on (tplID, status='building'); if the row
-	// has already moved on, returns ErrNotClaimed.
+	// failure). The Postgres backend treats a missed building-state CAS as
+	// success; memqueue can return ErrNotClaimed for missing/unclaimed jobs.
 	Complete(ctx context.Context, tplID string, o Outcome) error
 
-	// Reap is the janitor sweep. Any row stuck in `building` past
-	// maxAge is marked terminal-failed — never retried. Failure means
-	// either the dispatcher crashed mid-build or the build sandbox
-	// itself failed to PATCH back; both look identical from the DB
-	// and re-running on a stale Dockerfile rarely helps. Returns
-	// the list of ids that were just failed.
+	// Reap marks claims older than maxAge terminal-failed without re-enqueueing
+	// them and returns their IDs. Age alone does not establish whether the
+	// worker crashed, stalled, or simply exceeded its allowed duration.
 	Reap(ctx context.Context, maxAge time.Duration) (failed []string, err error)
 
 	// Terminal reports whether a template no longer has a live build. Missing

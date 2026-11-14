@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/config"
 )
 
 func TestBucketNameForHour(t *testing.T) {

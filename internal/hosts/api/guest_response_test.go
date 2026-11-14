@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -23,6 +24,11 @@ func (responseTestService) Get(context.Context, string, string) (*SandboxView, e
 }
 func (responseTestService) SecretToken(context.Context, string) (string, error) {
 	return "test-token", nil
+}
+
+func (responseTestService) OpenFileTransfer(ctx context.Context, _, _ string) (*FileTransferTarget, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	return &FileTransferTarget{IP: "127.0.0.2", Token: "test-token", Context: ctx, Cancel: cancel}, nil
 }
 
 // Exercise the real handlers against a guest that sends normal or oversized
@@ -137,5 +143,210 @@ func TestReadGuestResponseLimit(t *testing.T) {
 	}
 	if r.bytesRead != maxGuestResponseBytes+1 {
 		t.Fatalf("read %d bytes from endless response", r.bytesRead)
+	}
+}
+
+func TestFileClientRejectsRedirect(t *testing.T) {
+	target, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer target.Close()
+	guest, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer guest.Close()
+	reached := make(chan bool, 1)
+	targetDone := make(chan struct{})
+	go func() {
+		defer close(targetDone)
+		c, e := target.Accept()
+		if e != nil {
+			return
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		r := bufio.NewReader(c)
+		a, _ := r.ReadString('\n')
+		q, e := http.ReadRequest(r)
+		reached <- e == nil && a == "AUTH review-only-token\n" && q.URL.Path == "/redirect-target"
+		fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+	}()
+	go func() {
+		c, e := guest.Accept()
+		if e != nil {
+			return
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		r := bufio.NewReader(c)
+		r.ReadString('\n')
+		q, e := http.ReadRequest(r)
+		if e != nil {
+			return
+		}
+		io.Copy(io.Discard, q.Body)
+		q.Body.Close()
+		fmt.Fprintf(c, "HTTP/1.1 302 Found\r\nLocation: http://%s/redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target.Addr())
+	}()
+	client := newFileClient("review-only-token")
+	client.Timeout = 3 * time.Second
+	q, _ := http.NewRequest("PUT", "http://"+guest.Addr().String()+"/files/tmp/test", strings.NewReader("x"))
+	resp, e := client.Do(q)
+	if e == nil {
+		resp.Body.Close()
+		t.Fatal("guest redirect accepted")
+	}
+	target.Close()
+	<-targetDone
+	select {
+	case <-reached:
+		t.Fatal("redirect destination received sandbox credentials")
+	default:
+	}
+}
+
+type fileLifetimeTestService struct {
+	responseTestService
+	lifetime context.Context
+}
+
+func (s fileLifetimeTestService) OpenFileTransfer(parent context.Context, _, _ string) (*FileTransferTarget, error) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.lifetime, cancel)
+	return &FileTransferTarget{IP: "127.0.0.2", Token: "test-token", Context: ctx, Cancel: func() { stop(); cancel() }}, nil
+}
+
+// Real TCP is required: Fiber's in-memory app.Test does not observe closure.
+// Exercise cancellation both before headers and while reading the guest body.
+func TestFileTransferCancellation(t *testing.T) {
+	for _, method := range []string{"PUT", "GET"} {
+		for _, phase := range []string{"headers", "response-body", "upload-body"} {
+			if method == "GET" && phase == "upload-body" {
+				continue
+			}
+			for _, cause := range []string{"disconnect", "teardown", "upstream-close"} {
+				if cause == "upstream-close" && phase != "upload-body" {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/%s/%s", method, phase, cause), func(t *testing.T) {
+					guest, e := net.Listen("tcp", "127.0.0.2:1025")
+					if e != nil {
+						t.Fatal(e)
+					}
+					defer guest.Close()
+					accepted := make(chan net.Conn, 1)
+					go func() {
+						c, e := guest.Accept()
+						if e != nil {
+							return
+						}
+						c.SetDeadline(time.Now().Add(5 * time.Second))
+						r := bufio.NewReader(c)
+						r.ReadString('\n')
+						q, e := http.ReadRequest(r)
+						if e != nil {
+							c.Close()
+							return
+						}
+						if phase != "upload-body" {
+							io.Copy(io.Discard, q.Body)
+							q.Body.Close()
+						} else {
+							io.CopyN(io.Discard, q.Body, 300*1024)
+						}
+						if phase == "response-body" {
+							fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nx")
+						}
+						accepted <- c
+					}()
+					lifetime, stopLifetime := context.WithCancel(context.Background())
+					defer stopLifetime()
+					s := &Server{Svc: fileLifetimeTestService{responseTestService{}, lifetime}}
+					app := fiber.New(fiber.Config{DisableStartupMessage: true, StreamRequestBody: true, BodyLimit: 256 * 1024})
+					if method == "PUT" {
+						app.Put("/v1/sandboxes/:id/files", s.handleFileUpload)
+					} else {
+						app.Get("/v1/sandboxes/:id/files", s.handleFileDownload)
+					}
+					l, e := net.Listen("tcp", "127.0.0.1:0")
+					if e != nil {
+						t.Fatal(e)
+					}
+					defer l.Close()
+					go app.Listener(l)
+					defer app.ShutdownWithTimeout(time.Second)
+					client, e := net.Dial("tcp", l.Addr().String())
+					if e != nil {
+						t.Fatal(e)
+					}
+					defer client.Close()
+					body, length := "x", 1
+					if phase == "upload-body" {
+						body, length = strings.Repeat("x", 300*1024), 1024*1024
+					}
+					fmt.Fprintf(client, "%s /v1/sandboxes/test/files?path=/tmp/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n%s", method, length, body)
+					var upstream net.Conn
+					select {
+					case upstream = <-accepted:
+					case <-time.After(3 * time.Second):
+						t.Fatal("guest not reached")
+					}
+					defer upstream.Close()
+					if cause == "disconnect" {
+						client.Close()
+					} else if cause == "upstream-close" {
+						upstream.Close()
+					} else {
+						stopLifetime()
+					}
+					upstream.SetReadDeadline(time.Now().Add(time.Second))
+					_, e = io.Copy(io.Discard, upstream)
+					if ne, ok := e.(net.Error); ok && ne.Timeout() {
+						t.Fatal("guest connection not cancelled")
+					}
+					deadline := time.Now().Add(time.Second)
+					for {
+						s.fileMu.Lock()
+						n := s.fileCount
+						s.fileMu.Unlock()
+						if n == 0 {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("transfer slot leaked")
+						}
+						time.Sleep(time.Millisecond)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestFileTransferAdmission(t *testing.T) {
+	s := &Server{}
+	var releases []func()
+	for i := 0; i < 64; i++ {
+		release, ok := s.acquireFileTransfer(strconv.Itoa(i / 8))
+		if !ok {
+			t.Fatalf("transfer %d rejected", i)
+		}
+		releases = append(releases, release)
+	}
+	if _, ok := s.acquireFileTransfer("another"); ok {
+		t.Fatal("host limit not enforced")
+	}
+	releases[63]()
+	releases = releases[:63]
+	if _, ok := s.acquireFileTransfer("0"); ok {
+		t.Fatal("sandbox limit not enforced")
+	}
+	for _, release := range releases {
+		release()
+	}
+	if s.fileCount != 0 || len(s.fileTransfers) != 0 {
+		t.Fatal("transfer bookkeeping leaked")
 	}
 }

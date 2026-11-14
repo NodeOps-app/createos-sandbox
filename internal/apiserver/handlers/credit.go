@@ -8,7 +8,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
 )
 
 // checkCredit gates user-initiated cost-incurring actions (create

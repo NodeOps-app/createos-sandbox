@@ -9,8 +9,7 @@ import "encoding/json"
 // Fields are intentionally JSON-tagged with snake_case to match how the
 // rest of the MMDS doc is shaped. Credentials are plaintext (control
 // decrypted them before forwarding); the agent writes them under
-// /run/createos/disks/<id>/passwd-s3fs (tmpfs, mode 0600) and never to a
-// persistent path.
+// /run/createos/disks/<id>--<mount-path-hash>/passwd-s3fs (mode 0600).
 type MMDSDisk struct {
 	ID          string           `json:"id"`          // disk_<ulid>
 	Kind        string           `json:"kind"`        // "s3" today
@@ -32,23 +31,23 @@ type MMDSDiskS3Config struct {
 	UsePathStyle bool   `json:"use_path_style,omitempty"`
 }
 
-// MMDSDiskS3Creds carries the bucket access pair plaintext (decrypted
-// by control, in-flight only). Never persisted by the agent.
+// MMDSDiskS3Creds carries the bucket access pair in plaintext after control
+// decryption. The agent writes an s3fs credential file in its runtime directory.
 type MMDSDiskS3Creds struct {
 	AccessKey string `json:"access_key"`
 	SecretKey string `json:"secret_key"`
 }
 
-// DiskStatusReport is what the agent POSTs back to the host's
-// per-sandbox status endpoint after every mount attempt. Host then
-// PATCHes sandbox_disks rows via control's internal DB proxy.
+// DiskStatusReport describes an individual disk mount result. The current
+// status path polls the guest's disk-status endpoint; this type does not imply
+// that the agent initiates a callback to the host.
 type DiskStatusReport struct {
 	DiskID string `json:"disk_id"`
 	Status string `json:"status"`          // "mounted" | "failed"
 	Error  string `json:"error,omitempty"` // truncated to ~1 KiB upstream
 }
 
-// FromRawConfig parses a raw JSON config blob into the S3-shaped
+// DecodeS3Config parses a raw JSON config blob into the S3-shaped
 // MMDSDiskS3Config. Helper for host-side code that holds the disk
 // config as json.RawMessage (control's resolve path) and needs the
 // strongly-typed form to put into the MMDS payload.

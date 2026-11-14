@@ -13,14 +13,14 @@ import (
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
-// Setup applies LOG_FORMAT to logrus and slog. "json" emits one JSON object
-// per line; anything else keeps the existing text output so current log
-// queries and alerts continue to match. The correlation hook is installed in
-// both modes.
+// Setup applies the supplied format at process startup. "json" installs JSON
+// formatters for logrus and slog; other values leave existing formatters intact.
+// The logrus correlation hook is installed in both modes; the slog context
+// handler is installed only in JSON mode.
 func Setup(format, processComponent string) {
 	jsonMode = strings.EqualFold(strings.TrimSpace(format), "json")
 	component = strings.TrimSpace(processComponent)

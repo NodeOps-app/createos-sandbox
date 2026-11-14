@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 // Shape is one row of the shapes catalog. Mirrors proto.Shape but

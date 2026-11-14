@@ -15,11 +15,12 @@ import (
 // skews and slow networks don't kill legitimate calls.
 const DefaultExpiry = 60 * time.Second
 
-// SkewLeeway is how far in the past nbf is set (and how far in the future
-// exp is allowed to be on the verify side beyond DefaultExpiry).
+// SkewLeeway backdates minted nbf and allows verification within five seconds
+// after exp or before nbf. It does not cap the lifetime of externally built claims.
 const SkewLeeway = 5 * time.Second
 
-// Signer mints JWTs for one actor. Stateless and goroutine-safe.
+// Signer mints JWTs for one actor. Safe for concurrent use provided callers
+// do not mutate the private-key slice supplied to NewSigner.
 type Signer struct {
 	priv ed25519.PrivateKey
 	kid  string // "<role>:<id>", e.g. "host:fc-vm-1"
@@ -31,8 +32,7 @@ func NewSigner(priv ed25519.PrivateKey, kid string) *Signer {
 	return &Signer{priv: priv, kid: kid}
 }
 
-// PublicKey returns the signer's public key — useful for the host's
-// /hosts/register call which sends its pubkey to control.
+// PublicKey returns the signer's Ed25519 public key.
 func (s *Signer) PublicKey() ed25519.PublicKey {
 	return s.priv.Public().(ed25519.PublicKey)
 }
@@ -56,10 +56,8 @@ func (s *Signer) Sign(aud, sub string) (string, error) {
 	return s.sign(claims)
 }
 
-// SignFor mints a JWT identical to Sign (iss=kid, audience, auto-stamped
-// iat/nbf/exp/jti) plus an end-user id in the uid claim. Used on the
-// control→host forward path so the host can trust the user identity
-// without re-validating the user's API key.
+// SignFor mints identity, audience, validity, and jti claims plus uid.
+// It signs the supplied user ID without validating that identity.
 func (s *Signer) SignFor(aud, uid string) (string, error) {
 	now := time.Now().UTC()
 	claims := Claims{
@@ -74,10 +72,8 @@ func (s *Signer) SignFor(aud, uid string) (string, error) {
 	return s.sign(claims)
 }
 
-// SignProxy mints a host-issued proxy token: iss=kid (the host's own
-// identity), the given audience, and Role="proxy" so control can verify
-// it via the host-pubkey path yet still bar it from host write routes.
-// iat/nbf/exp/jti are stamped automatically, identical to Sign.
+// SignProxy mints a token with Role="proxy" and the supplied audience.
+// The verifier does not enforce role permissions; callers must do so.
 func (s *Signer) SignProxy(aud string) (string, error) {
 	now := time.Now().UTC()
 	claims := Claims{

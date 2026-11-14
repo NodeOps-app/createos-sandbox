@@ -1,18 +1,14 @@
 package ingress
 
-import (
-	"sync"
-	"sync/atomic"
-)
+import "sync"
 
-// concurrencyCap enforces a per-sandbox concurrent-tunnel limit. Plain
-// RWMutex+map so we can clean up empty entries lazily; sync.Map is
-// banned project-wide (HashTrieMap panic).
+// concurrencyCap tracks per-sandbox concurrent tunnels using a map of
+// counters. Acquire and Release are paired for each admitted tunnel.
 type concurrencyCap struct {
 	max int64
 
-	mu       sync.RWMutex
-	counters map[string]*atomic.Int64
+	mu       sync.Mutex
+	counters map[string]int64
 }
 
 func newConcurrencyCap(max int) *concurrencyCap {
@@ -21,46 +17,30 @@ func newConcurrencyCap(max int) *concurrencyCap {
 	}
 	return &concurrencyCap{
 		max:      int64(max),
-		counters: make(map[string]*atomic.Int64),
+		counters: make(map[string]int64),
 	}
 }
 
 // Acquire returns true on success, false if the sandbox is at its cap.
 // On success, the caller MUST call Release(id) when the tunnel closes.
 func (c *concurrencyCap) Acquire(id string) bool {
-	c.mu.RLock()
-	cnt, ok := c.counters[id]
-	c.mu.RUnlock()
-	if !ok {
-		c.mu.Lock()
-		if cnt, ok = c.counters[id]; !ok {
-			cnt = new(atomic.Int64)
-			c.counters[id] = cnt
-		}
-		c.mu.Unlock()
-	}
-	if cnt.Add(1) > c.max {
-		cnt.Add(-1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counters[id] >= c.max {
 		return false
 	}
+	c.counters[id]++
 	return true
 }
 
-// Release drops one in-flight tunnel for the sandbox. Lazily reclaims
-// the map entry when the counter hits zero so id-churn doesn't leak.
+// Release drops one in-flight tunnel and reclaims an idle counter. Admission
+// and removal share the lock so no caller can increment a detached counter.
 func (c *concurrencyCap) Release(id string) {
-	c.mu.RLock()
-	cnt, ok := c.counters[id]
-	c.mu.RUnlock()
-	if !ok {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counters[id] <= 1 {
+		delete(c.counters, id)
 		return
 	}
-	if cnt.Add(-1) == 0 {
-		c.mu.Lock()
-		// Re-check under write lock — another caller may have raced past 0.
-		if cnt.Load() == 0 {
-			delete(c.counters, id)
-		}
-		c.mu.Unlock()
-	}
+	c.counters[id]--
 }

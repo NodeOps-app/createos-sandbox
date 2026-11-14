@@ -7,13 +7,14 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// Worker drains the billing_events outbox and delivers each event via
-// the Webhook. Multiple control-plane replicas can each run a Worker
-// concurrently — the SQL claim uses FOR UPDATE SKIP LOCKED so each row
-// goes to exactly one worker. No leader election needed.
+// Worker delivers billing events while holding row locks claimed with
+// FOR UPDATE SKIP LOCKED. Workers sharing one database avoid concurrent claims,
+// but a delivery followed by transaction failure can be retried: receivers
+// must deduplicate by event ID. The locks do not coordinate separate replicas
+// of a bidirectionally replicated database.
 type Worker struct {
 	Repo     *models.Repo
 	Webhook  *Webhook
@@ -68,8 +69,8 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 
 	for _, ev := range events {
-		// Per-event context with a 15s budget — the webhook itself has
-		// a 10s timeout; this leaves 5s for outbox bookkeeping.
+		// Bound this delivery to 15s; the default webhook client also has a
+		// 10s timeout. Outbox bookkeeping below uses the parent context.
 		evCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		err := w.Webhook.Deliver(evCtx, ev.ID, ev.EventType, ev.Payload)
 		cancel()

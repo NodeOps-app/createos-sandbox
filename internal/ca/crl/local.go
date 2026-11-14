@@ -12,10 +12,10 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
-// localCRL is control's own revocation cache, populated by polling the
+// Local is control's own revocation cache, populated by polling the
 // `issued_certs` ledger directly via models.ListRevokedSerialsLedger.
 // Avoids the chicken-and-egg of HTTP-fetching its own CRL endpoint.
 // VerifyPeerCertificate is suitable for tls.Config.VerifyPeerCertificate
@@ -92,7 +92,17 @@ func (c *Local) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.Certificate
 	return nil
 }
 
-// normalizeSerial is shared with fetcher.go; defined once in local.go.
+// normalizeSerial matches the numeric hex used by the issued-certificate ledger.
+// TLS byte encoding pads odd-width serials (abc becomes 0abc); normalize both
+// stored revocations and certificate lookups so that padding cannot evade a match.
 func normalizeSerial(s string) string {
-	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(s), "0x"))
+	s = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(s)), "0x")
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimLeft(s, "0")
+	if s == "" {
+		return "0"
+	}
+	return s
 }

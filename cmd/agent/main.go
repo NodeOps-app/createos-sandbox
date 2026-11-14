@@ -2,6 +2,6 @@
 
 package main
 
-import "github.com/NodeOps-app/sandbox/internal/agent"
+import "github.com/NodeOps-app/createos-sandbox/internal/agent"
 
 func main() { agent.Run() }

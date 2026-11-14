@@ -3,6 +3,8 @@
 // type safety without pulling in the scheduler's Fiber server or framework.
 package api
 
+import "github.com/NodeOps-app/createos-sandbox/internal/proto"
+
 // HealthzResponse is the body of GET /healthz — process liveness.
 type HealthzResponse struct {
 	Up bool `json:"up"`
@@ -13,7 +15,7 @@ type HealthzResponse struct {
 // State is one of:
 //   - "follower"   — not the active leader
 //   - "hydrating"  — leader, loading hosts + capacity from DB
-//   - "warming"    — leader, hydration done, waiting for one heartbeat cycle
+//   - "warming"    — leader, initial hydration attempted, waiting for the warm-up timer
 //   - "leader_active" — leader, accepting Schedule traffic
 //   - "lost_lock"  — was leader, lock released, next acquire pending
 type ReadyzResponse struct {
@@ -26,13 +28,14 @@ type ReadyzResponse struct {
 }
 
 // ScheduleRequest is the body of POST /v1/schedule. SandboxID is the
-// caller-generated id that has already been INSERTed (status=creating,
-// host=NULL); the scheduler keys its in-mem reservation on it.
+// durable id of the sandbox being created or resumed; the scheduler keys
+// its in-memory reservation on it.
 type ScheduleRequest struct {
-	SandboxID string `json:"sandbox_id"`
-	Shape     string `json:"shape"`
-	Rootfs    string `json:"rootfs,omitempty"`
-	MemMiB    int    `json:"mem_mib"`
+	SnapshotID string `json:"snapshot_id,omitempty"`
+	SandboxID  string `json:"sandbox_id"`
+	Shape      string `json:"shape"`
+	Rootfs     string `json:"rootfs,omitempty"`
+	MemMiB     int    `json:"mem_mib"`
 	// VCPU + DiskMiB drive multi-dimensional admission. Empty/zero =
 	// "skip this dimension" (kept for backwards compat with callers
 	// that haven't been updated yet).
@@ -53,10 +56,9 @@ type ScheduleRequest struct {
 	// bundle. Scheduler excludes them from the candidate pool.
 	ExcludeHosts []string `json:"exclude_hosts,omitempty"`
 
-	// Resume-only: CPU vendor of the host that took the snapshot.
-	// Scheduler pins resume to a same-vendor host (firecracker bakes
-	// source CPUID into vmstate; cross-vendor restore SIGILLs the guest).
-	// "" on cold-create.
+	// Source snapshot CPU vendor for resume or full-snapshot restore.
+	// A same-vendor destination is required when set, but other restore
+	// compatibility constraints still apply. Empty on cold creates.
 	SourceCPUVendor string `json:"source_cpu_vendor,omitempty"`
 }
 
@@ -65,9 +67,10 @@ type ScheduleRequest struct {
 // without a second `repo.GetHost` lookup. No token — the request's
 // SandboxID serves that purpose.
 type ScheduleResponse struct {
-	HostID   string `json:"host_id"`
-	HostAddr string `json:"host_addr"`
-	Epoch    int64  `json:"epoch"`
+	SnapshotCache *proto.SnapshotCachePolicy `json:"snapshot_cache,omitempty"`
+	HostID        string                     `json:"host_id"`
+	HostAddr      string                     `json:"host_addr"`
+	Epoch         int64                      `json:"epoch"`
 }
 
 const ReasonNoCapacity = "no_capacity"
@@ -101,10 +104,10 @@ type HostCapacity struct {
 	IPs  DimensionUsage `json:"ips"` // max_vms-based; effectively 1.0× cap (kernel-limited)
 }
 
-// DimensionUsage reports committed vs. effective-limit for one
-// dimension. Limit = physical × overcommit_factor. Util is committed
-// / limit in [0,1]. OverX10 is the factor in tenths (20 = 2.0×) — 0
-// means the scheduler default applies.
+// DimensionUsage reports committed resources against the effective limit.
+// CPU/memory/IP limits use physical capacity times the factor; disk also
+// subtracts operational headroom. Util is committed/limit and can exceed 1.
+// OverX10 contains the resolved factor in tenths (20 = 2x).
 type DimensionUsage struct {
 	Committed int64   `json:"committed"`
 	Physical  int64   `json:"physical"`

@@ -362,8 +362,8 @@ var (
 )
 
 // GetRandomName generates a random name from the list of adjectives and surnames in this package
-// formatted as "adjective_surname". For example 'focused_turing'. If retry is non-zero, a random
-// integer between 0 and 10 will be added to the end of the name, e.g `focused_turing3`
+// formatted as "adjective_surname". For example 'focused_turing'. If retry is positive, a random
+// digit from 0 through 9 is appended, e.g. `focused_turing3`. Uniqueness is not guaranteed.
 func GetRandomName(retry int) string {
 begin:
 	name := left[rand.Intn(len(left))] + "_" + right[rand.Intn(len(right))] //nolint:gosec // G404: Use of weak random number generator (math/rand instead of crypto/rand)

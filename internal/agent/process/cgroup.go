@@ -188,7 +188,8 @@ func (c *processCgroup) waitUntilEmpty(
 ) (bool, error) {
 	// Observers must not hold removeMu while waiting: DELETE needs to wait
 	// concurrently before escalating to cgroup.kill. An unlinked cgroup.events
-	// returns ENXIO; removal is only allowed after the tree becomes empty.
+	// can return ENXIO or ENODEV; removal is only allowed after the tree
+	// becomes empty.
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -246,7 +247,7 @@ func (c *processCgroup) waitUntilEmpty(
 
 	readPopulated := func() (bool, error) {
 		if _, err := eventsFile.Seek(0, 0); err != nil {
-			if errors.Is(err, syscall.ENXIO) {
+			if errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.ENODEV) {
 				return false, nil // the empty cgroup was removed
 			}
 			return false, err
@@ -254,7 +255,7 @@ func (c *processCgroup) waitUntilEmpty(
 		buffer := make([]byte, 256)
 		n, err := eventsFile.Read(buffer)
 		if err != nil {
-			if errors.Is(err, syscall.ENXIO) {
+			if errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.ENODEV) {
 				return false, nil // the empty cgroup was removed
 			}
 			return false, err

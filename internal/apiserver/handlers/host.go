@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/oklog/ulid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/apiserver/middlewares"
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/apiserver/middlewares"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 type bootstrapResp struct {
@@ -325,7 +326,7 @@ func (h *Handler) HandleHostHeartbeat(c *fiber.Ctx) error {
 	if status != models.HostStatusActive && status != models.HostStatusDraining {
 		return httpx.Fail(c, fiber.StatusBadRequest, "must be active|draining")
 	}
-	if err := h.repo.HeartbeatHost(c.UserContext(), req.ID, req.InUseMib, req.VMCount, status, req.DiskUsedMib, time.Now().UTC()); err != nil {
+	if err := h.repo.HeartbeatHost(c.UserContext(), req.ID, req.InUseMib, req.VMCount, status, req.DiskUsedMib, time.Now().UTC(), snapshotCacheHints(req.CachedSnapshots, time.Now().UTC())); err != nil {
 		log.WithContext(c.UserContext()).Errorf("[handler] internal error: %v", err)
 
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
@@ -353,4 +354,28 @@ func (h *Handler) HandleListHosts(c *fiber.Ctx) error {
 		return httpx.Error(c, fiber.StatusInternalServerError, "internal error")
 	}
 	return httpx.Success(c, hosts)
+}
+
+// Bound host-reported metadata and its lifetime. These hints never authorize a
+// restore; the existing mTLS self-host middleware binds this report to req.ID.
+func snapshotCacheHints(hints []proto.CachedSnapshot, now time.Time) []proto.CachedSnapshot {
+	out := make([]proto.CachedSnapshot, 0, min(len(hints), proto.MaxCachedSnapshotHints))
+	seen := make(map[string]bool)
+	for _, hint := range hints {
+		if len(out) == proto.MaxCachedSnapshotHints {
+			break
+		}
+		if len(hint.ID) != 31 || !strings.HasPrefix(hint.ID, "snap_") || seen[hint.ID] || !hint.ExpiresAt.After(now) {
+			continue
+		}
+		if _, err := ulid.ParseStrict(hint.ID[5:]); err != nil {
+			continue
+		}
+		if maxExpiry := now.Add(10 * time.Minute); hint.ExpiresAt.After(maxExpiry) {
+			hint.ExpiresAt = maxExpiry
+		}
+		seen[hint.ID] = true
+		out = append(out, hint)
+	}
+	return out
 }

@@ -9,6 +9,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const (
+	maxSandboxChannels = 64
+	maxGatewayChannels = 1024
+)
+
 // directTCPIPPayload mirrors the wire format of RFC 4254 §7.2 for
 // direct-tcpip channel requests.
 type directTCPIPPayload struct {
@@ -25,7 +30,15 @@ func (g *Gateway) handleChannels(conn *ssh.ServerConn, chans <-chan ssh.NewChann
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "direct-tcpip":
-			go g.handleDirectTCPIP(conn, nc)
+			release, ok := g.acquireChannel(extSandboxID(conn))
+			if !ok {
+				_ = nc.Reject(ssh.ResourceShortage, "channel capacity busy")
+				continue
+			}
+			go func(nc ssh.NewChannel) {
+				defer release()
+				g.handleDirectTCPIP(conn, nc)
+			}(nc)
 		default:
 			log.Infof("[gateway] channel-reject sandbox=%s type=%s reason=prohibited",
 				extSandboxID(conn), nc.ChannelType())
@@ -112,4 +125,29 @@ func extSandboxID(conn *ssh.ServerConn) string {
 		return ""
 	}
 	return conn.Permissions.Extensions["sandbox_id"]
+}
+
+// Counts are shared across SSH sessions, so reconnecting cannot bypass the
+// sandbox limit. Reject before starting a goroutine or opening a host tunnel.
+func (g *Gateway) acquireChannel(id string) (func(), bool) {
+	g.channelMu.Lock()
+	defer g.channelMu.Unlock()
+	if id == "" || g.channelCount >= maxGatewayChannels || g.channels[id] >= maxSandboxChannels {
+		return nil, false
+	}
+	if g.channels == nil {
+		g.channels = make(map[string]int)
+	}
+	id = strings.Clone(id)
+	g.channels[id]++
+	g.channelCount++
+	return func() {
+		g.channelMu.Lock()
+		defer g.channelMu.Unlock()
+		g.channels[id]--
+		g.channelCount--
+		if g.channels[id] == 0 {
+			delete(g.channels, id)
+		}
+	}, true
 }

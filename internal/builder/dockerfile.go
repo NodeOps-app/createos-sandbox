@@ -7,8 +7,8 @@ import (
 	"strings"
 )
 
-// AllowedBases is the canonical set of bases users may extend. Templates
-// whose FROM doesn't appear in this list are rejected at submit time.
+// AllowedBases is the fallback base-image allowlist when no configured list
+// is supplied to ValidateDockerfile.
 var AllowedBases = []string{
 	"nodeops/sandbox:debian",
 	"nodeops/sandbox:alpine",
@@ -20,7 +20,7 @@ var AllowedBases = []string{
 // legitimate single-stage builds without exposing the surface that ONBUILD
 // (time bomb), SHELL (interpreter swap), CMD/ENTRYPOINT (persistent boot
 // hooks that we don't even use), HEALTHCHECK/STOPSIGNAL (Docker-only) etc.
-// open up. Bare-metal sandbox boots fc-agent as PID 1, so CMD/ENTRYPOINT
+// open up. The guest boots the agent as PID 1, so CMD/ENTRYPOINT
 // from a template are dead weight even if "harmless"; reject for clarity.
 var allowedInstructions = map[string]struct{}{
 	"FROM":    {}, // base image — separately constrained to AllowedBases

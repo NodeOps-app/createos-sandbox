@@ -76,7 +76,7 @@ func wantsHTML(r *http.Request) bool {
 }
 
 // waker fires wake-on-request resumes at control, coalescing bursts so N
-// concurrent hits on a paused URL trigger exactly one resume per debounce
+// concurrent hits on a paused URL trigger at most one request per debounce
 // window (control's resume CAS is the backstop; this just spares control
 // the redundant calls).
 type waker struct {
@@ -117,7 +117,8 @@ func (wk *waker) trigger(id, region string) {
 		return
 	}
 	wk.last[id] = now
-	// Opportunistic GC so the map can't grow unbounded on a busy ingress.
+	// Remove expired debounce entries opportunistically. Entries from the
+	// current window may still exceed this threshold; it is not a hard cap.
 	if len(wk.last) > 4096 {
 		for k, t := range wk.last {
 			if now.Sub(t) > wk.interval {

@@ -24,6 +24,7 @@ type ControlConfig struct {
 	PlacementPolicies         map[string]PlacementPolicy
 	EnabledCrossRegionUsers   []string // empty enables capacity fallback for all users
 
+	MetricsToken        string // read-only dashboard access; distinct from AdminToken
 	AdminToken          string // protects host cordon/uncordon/drain and control pprof
 	BootstrapToken      string // shared secret on /v1/internal/hosts/register for compute hosts; required at startup
 	RelayBootstrapToken string // separate shared secret for role=relay registrations; empty disables relay onboarding
@@ -85,8 +86,8 @@ type ControlConfig struct {
 	// RelayCrossRegionFallback lets device-session-create pick a relay
 	// from ANY region when the caller's region has no active relay.
 	// ON by default because not every active region runs its own relay
-	// (e.g. region A serves user traffic but the relay lives in region B;
-	// region A devices ride region B's relay). Flip off to fail-closed with 503
+	// (e.g. US control serves user traffic but the relay lives in EU;
+	// US devices ride the EU relay). Flip off to fail-closed with 503
 	// when in-region has none — appropriate once every active region
 	// has its own local relay stable.
 	RelayCrossRegionFallback bool
@@ -401,6 +402,7 @@ func ControlFlags() []cli.Flag {
 		&cli.StringFlag{Name: "postgres-dsn", Value: "postgres://createos:createos@localhost:5432/createos?sslmode=disable", EnvVars: []string{"POSTGRES_DSN"}},
 		&cli.BoolFlag{Name: "panic-mode", Value: false, Usage: "emergency kill switch: return 503 from user-facing API routes while keeping health, host administration, and internal routes available", EnvVars: []string{"PANIC_MODE"}},
 		&cli.BoolFlag{Name: "device-registration-enabled", Value: true, Usage: "allow new device registrations through POST /v1/devices", EnvVars: []string{"DEVICE_REGISTRATION_ENABLED"}},
+		&cli.StringFlag{Name: "metrics-token", Usage: "read-only dashboard metrics token; empty disables metrics", EnvVars: []string{"METRICS_TOKEN"}},
 		&cli.StringFlag{Name: "admin-token", Value: "", Usage: "shared secret protecting host cordon, uncordon, drain, and control pprof; empty disables them", EnvVars: []string{"ADMIN_TOKEN"}},
 		&cli.StringFlag{Name: "prom-sd-token-file", Value: "", Usage: "path to a file holding the static bearer token Prometheus uses for /v1/internal/sd/hosts; empty disables the endpoint", EnvVars: []string{"PROM_SD_TOKEN_FILE"}},
 		&cli.StringFlag{Name: "bootstrap-token", Value: "", Usage: "compute bootstrap secret (prefer --bootstrap-token-file; flag leaks via /proc/<pid>/cmdline)", EnvVars: []string{"BOOTSTRAP_TOKEN"}},
@@ -482,6 +484,13 @@ func ControlFromContext(c *cli.Context) (ControlConfig, error) {
 	cfg.AdminToken = c.String("admin-token")
 	if f.Auth != nil && f.Auth.AdminToken != nil && !c.IsSet("admin-token") {
 		cfg.AdminToken = *f.Auth.AdminToken
+	}
+	cfg.MetricsToken = c.String("metrics-token")
+	if f.Auth != nil && f.Auth.MetricsToken != nil && !c.IsSet("metrics-token") {
+		cfg.MetricsToken = *f.Auth.MetricsToken
+	}
+	if cfg.MetricsToken != "" && cfg.MetricsToken == cfg.AdminToken {
+		return ControlConfig{}, fmt.Errorf("metrics_token must differ from admin_token")
 	}
 	cfg.PromSDTokenFile = pickStr(c, "prom-sd-token-file", f.PromSDTokenFile)
 	cfg.RelayBootstrapToken = c.String("relay-bootstrap-token")

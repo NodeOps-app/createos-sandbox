@@ -75,7 +75,8 @@ func (f *Fetcher) Run(ctx context.Context) {
 
 // Refresh synchronously replaces the cached revocation set from control.
 // Callers that must fail closed during startup can require this to succeed
-// before accepting traffic; Run keeps the cache fresh afterward.
+// before accepting traffic. Run retries afterward; failed refreshes retain
+// the previous set, and verification does not enforce a cache-age deadline.
 func (f *Fetcher) Refresh(ctx context.Context) error {
 	return f.refresh(ctx)
 }
@@ -128,7 +129,7 @@ func (f *Fetcher) refresh(ctx context.Context) error {
 	}
 	fresh := make(map[string]struct{}, len(body.Revoked))
 	for _, e := range body.Revoked {
-		s := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(e.Serial), "0x"))
+		s := normalizeSerial(e.Serial)
 		if s == "" {
 			continue
 		}
@@ -148,7 +149,7 @@ func (f *Fetcher) refresh(ctx context.Context) error {
 
 // IsRevoked returns true if serialHex (lowercase hex, no 0x prefix) is in the CRL.
 func (f *Fetcher) IsRevoked(serialHex string) bool {
-	s := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(serialHex), "0x"))
+	s := normalizeSerial(serialHex)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	_, ok := f.revoked[s]

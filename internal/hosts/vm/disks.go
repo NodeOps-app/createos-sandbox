@@ -11,8 +11,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
-	"github.com/NodeOps-app/sandbox/models"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/models"
 )
 
 // agentDiskStatusPort is the agent's HTTP file-server port; /disks/status
@@ -153,8 +153,8 @@ func (m *Manager) settleDiskStatus(sandboxID string) {
 }
 
 // SetDisks replaces the in-memory disks slice for a live sandbox. Called
-// when control re-pushes via the host-scoped resolve endpoint (rehydrate
-// path, future disk attach/detach). Safe under read pressure.
+// during rehydrate after fetching the host-scoped resolved disk bundle.
+// The manager mutex protects replacement against concurrent readers.
 func (m *Manager) SetDisks(id string, disks []proto.MMDSDisk) {
 	m.Mu.Lock()
 	defer m.Mu.Unlock()

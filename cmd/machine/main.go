@@ -8,10 +8,10 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/NodeOps-app/sandbox/config"
-	"github.com/NodeOps-app/sandbox/internal/hostproxy"
-	"github.com/NodeOps-app/sandbox/internal/hosts"
-	"github.com/NodeOps-app/sandbox/internal/logging"
+	"github.com/NodeOps-app/createos-sandbox/config"
+	"github.com/NodeOps-app/createos-sandbox/internal/hostproxy"
+	"github.com/NodeOps-app/createos-sandbox/internal/hosts"
+	"github.com/NodeOps-app/createos-sandbox/internal/logging"
 )
 
 func main() {

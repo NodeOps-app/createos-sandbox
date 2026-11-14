@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/database"
+	"github.com/NodeOps-app/createos-sandbox/database"
 )
 
 // Repo is the Postgres-backed repository implementation. It delegates
@@ -66,6 +67,10 @@ func (r *Repo) CompleteSandboxCreate(ctx context.Context, rec Sandbox, hostID st
 
 func (r *Repo) MarkDestroyed(ctx context.Context, id string, at time.Time, note *string, emitter BillingEmitter) error {
 	return MarkSandboxDestroyed(ctx, r.DB, id, at, note, emitter)
+}
+
+func (r *Repo) MarkDestroyedOnDeadHost(ctx context.Context, id, hostID, region string, cutoff, at time.Time, note *string, emitter BillingEmitter) (bool, error) {
+	return MarkSandboxDestroyedOnDeadHost(ctx, r.DB, id, hostID, region, cutoff, at, note, emitter)
 }
 
 func (r *Repo) MarkDestroyingFromTerminalCAS(ctx context.Context, id string) (bool, error) {
@@ -378,8 +383,8 @@ func (r *Repo) RegisterRegion(ctx context.Context, name string) (int, error) {
 	return RegisterRegion(ctx, r.DB, name)
 }
 
-func (r *Repo) HeartbeatHost(ctx context.Context, id string, inUseMib, vmCount int, status string, diskUsedMib int64, at time.Time) error {
-	return HeartbeatHost(ctx, r.DB, id, inUseMib, vmCount, status, diskUsedMib, at)
+func (r *Repo) HeartbeatHost(ctx context.Context, id string, inUseMib, vmCount int, status string, diskUsedMib int64, at time.Time, cached ...[]proto.CachedSnapshot) error {
+	return HeartbeatHost(ctx, r.DB, id, inUseMib, vmCount, status, diskUsedMib, at, cached...)
 }
 
 func (r *Repo) ListHosts(ctx context.Context) ([]Host, error) {
@@ -406,8 +411,8 @@ func (r *Repo) FailOrphanCreating(ctx context.Context, cutoff time.Time, region 
 	return FailOrphanCreating(ctx, r.DB, cutoff, region, emitter)
 }
 
-func (r *Repo) MarkAgedRunningDestroyed(ctx context.Context, cutoff, destroyedAt time.Time, note, region string, emitter BillingEmitter) ([]AgedRunningRow, error) {
-	return MarkAgedRunningDestroyed(ctx, r.DB, cutoff, destroyedAt, note, region, emitter)
+func (r *Repo) MarkAgedRunningDestroyed(ctx context.Context, cutoff, destroyedAt time.Time, note, region string, userCutoffs map[string]time.Time, emitter BillingEmitter) ([]AgedRunningRow, error) {
+	return MarkAgedRunningDestroyed(ctx, r.DB, cutoff, destroyedAt, note, region, userCutoffs, emitter)
 }
 
 func (r *Repo) GetHost(ctx context.Context, id string) (*Host, error) {
@@ -432,6 +437,36 @@ func (r *Repo) ListRunningSandboxesOnHost(ctx context.Context, hostID string) ([
 
 func (r *Repo) MarkStaleHosts(ctx context.Context, cutoff time.Time, region string) (int, error) {
 	return MarkStaleHosts(ctx, r.DB, cutoff, region)
+}
+
+// ── snapshots ──────────────────────────────────────────────────────────
+
+func (r *Repo) InsertSnapshot(ctx context.Context, s Snapshot) error {
+	return InsertSnapshot(ctx, r.DB, s)
+}
+
+func (r *Repo) GetSnapshot(ctx context.Context, id, userID string) (*Snapshot, error) {
+	return GetSnapshot(ctx, r.DB, id, userID)
+}
+
+func (r *Repo) ListUserSnapshots(ctx context.Context, userID string, limit, offset int) ([]Snapshot, error) {
+	return ListUserSnapshots(ctx, r.DB, userID, limit, offset)
+}
+
+func (r *Repo) CountUserSnapshots(ctx context.Context, userID string) (int, error) {
+	return CountUserSnapshots(ctx, r.DB, userID)
+}
+
+func (r *Repo) MarkSnapshotReady(ctx context.Context, id, userID, region, hostID, uri string, manifest json.RawMessage, sizeBytes int64) (string, error) {
+	return MarkSnapshotReady(ctx, r.DB, id, userID, region, hostID, uri, manifest, sizeBytes)
+}
+
+func (r *Repo) MarkSnapshotFailed(ctx context.Context, id, userID, region, hostID, errorCode string) (string, error) {
+	return MarkSnapshotFailed(ctx, r.DB, id, userID, region, hostID, errorCode)
+}
+
+func (r *Repo) SoftDeleteSnapshot(ctx context.Context, id, userID, region string) (string, error) {
+	return SoftDeleteSnapshot(ctx, r.DB, id, userID, region)
 }
 
 // ── templates ──────────────────────────────────────────────────────────
@@ -688,11 +723,8 @@ func (r *Repo) ListEnabledShapes(ctx context.Context) ([]Shape, error) {
 
 // ── devices (user-device WireGuard VPN) ───────────────────────────────
 
-func (r *Repo) AssignDeviceIP(ctx context.Context, region string) (string, error) {
-	return AssignDeviceIP(ctx, r.DB, region)
-}
-func (r *Repo) CreateDevice(ctx context.Context, rec Device) (*Device, error) {
-	return CreateDevice(ctx, r.DB, rec)
+func (r *Repo) CreateDevice(ctx context.Context, rec Device, region string) (*Device, error) {
+	return CreateDevice(ctx, r.DB, rec, region)
 }
 func (r *Repo) GetDevice(ctx context.Context, id string) (*Device, error) {
 	return GetDevice(ctx, r.DB, id)
@@ -756,4 +788,40 @@ func (r *Repo) ListDevicePairsForRelay(ctx context.Context, relayHostID string) 
 }
 func (r *Repo) ListDeviceVMPairsForRelay(ctx context.Context, relayHostID string) ([]DevicePair, error) {
 	return ListDeviceVMPairsForRelay(ctx, r.DB, relayHostID)
+}
+
+// ListHostSnapshotCaches returns advisory metadata separately from host row
+// projections, keeping snapshot IDs off public host listings.
+func (r *Repo) ListHostSnapshotCaches(ctx context.Context) (map[string][]proto.CachedSnapshot, error) {
+	q, err := query(r.DB, "listHostSnapshotCaches")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.DB.Con.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string][]proto.CachedSnapshot)
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		var hints []proto.CachedSnapshot
+		if err := json.Unmarshal(raw, &hints); err != nil {
+			return nil, err
+		}
+		out[id] = hints
+	}
+	return out, rows.Err()
+}
+
+func (r *Repo) ListResourceEvents(ctx context.Context, region, resourceType, resourceID string, limit int) ([]Event, error) {
+	return ListResourceEvents(ctx, r.DB, region, resourceType, resourceID, limit)
+}
+
+func (r *Repo) SweepExpiredEvents(ctx context.Context, region string, now time.Time) (int64, error) {
+	return SweepExpiredEvents(ctx, r.DB, region, now)
 }

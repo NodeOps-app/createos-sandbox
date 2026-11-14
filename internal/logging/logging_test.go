@@ -11,8 +11,8 @@ import (
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/NodeOps-app/sandbox/internal/requestctx"
-	"github.com/NodeOps-app/sandbox/internal/utils"
+	"github.com/NodeOps-app/createos-sandbox/internal/requestctx"
+	"github.com/NodeOps-app/createos-sandbox/internal/utils"
 )
 
 func jsonLine(t *testing.T, fn func(l *log.Logger)) map[string]any {

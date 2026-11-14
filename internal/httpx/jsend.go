@@ -1,6 +1,6 @@
 // Package httpx holds shared HTTP primitives — the JSend response
-// envelope helpers (Success/Fail/Error) used by every createos HTTP
-// server (control, scheduler, host, ingress).
+// envelope helpers (Success/Fail/Error), request correlation, and diagnostics
+// shared by Fiber services. Streaming and ingress responses need not use JSend.
 package httpx
 
 import (
@@ -9,10 +9,10 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/NodeOps-app/sandbox/internal/proto"
+	"github.com/NodeOps-app/createos-sandbox/internal/proto"
 )
 
-// Envelope is the JSend response envelope used for every response.
+// Envelope is the JSend response shape used by these helpers.
 // See https://github.com/omniti-labs/jsend for the spec.
 type Envelope struct {
 	Status  string      `json:"status"`            // "success" | "fail" | "error"
@@ -48,7 +48,8 @@ func Fail(c *fiber.Ctx, status int, data interface{}) error {
 // PageSlice slices an in-memory list against (limit, offset) and returns
 // (page, total) for catalog endpoints whose full result already fits in
 // memory (for example /v1/shapes). Out-of-range
-// offsets produce an empty page; total is always len(all).
+// offsets at or beyond total produce an empty page; total is always len(all).
+// Callers must validate nonnegative offset/limit and avoid integer overflow.
 //
 // For DB-backed lists, pass LIMIT/OFFSET to the query and use Paginated
 // directly — don't load everything into memory.
@@ -69,9 +70,8 @@ func PageSlice[T any](all []T, limit, offset int) ([]T, int) {
 //	{"status":"success","data":{"data":[...],"pagination":{...}}}
 //
 // items should already be the page slice (server applied limit + offset).
-// total is the unfiltered row count; if computing it would mean a second
-// DB query that you've decided to skip, pass len(items) — the wire shape
-// stays valid, just lacks a true total.
+// total is supplied by the caller and should count matching items before
+// pagination. The helper does not query or validate that count.
 func Paginated(c *fiber.Ctx, items interface{}, total, limit, offset, count int) error {
 	return Success(c, proto.Page[interface{}]{
 		Data: items,

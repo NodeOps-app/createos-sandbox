@@ -5,32 +5,50 @@ import (
 	"time"
 )
 
-// Every struct in this file is a JSON body the createos HTTP layer
-// parses with fiber.Ctx.BodyParser. Wire formats live here so clients
-// and handlers share a single source of truth.
-//
-// Naming: the prefix is the server whose HTTP handler parses the body —
-// Host* for the host agent's endpoints, Control* for the control plane's.
-// Unprefixed names are the public user-facing API, served identically by
-// both control and host.
+// Shared JSON request bodies for control and host handlers. Parsing and
+// authorization remain the receiving handler's responsibility; some handlers
+// use strict JSON decoding rather than Fiber BodyParser. Internal-only fields
+// in shared types must be rejected at the public boundary.
 
 // ── Public sandbox API ────────────────────────────────────────────────
+
+// SnapshotCreateReq contains only caller-controlled capture options. The source
+// sandbox comes from the route; ownership, placement and sizing come from its row.
+type SnapshotCreateReq struct {
+	Name *string `json:"name,omitempty"` // optional, non-unique display label
+	Type string  `json:"type"`           // "disk" or "full"
+}
 
 // NetworkEntry is one element of CreateReq.Networks.
 type NetworkEntry struct {
 	ID string `json:"id"` // network name or net_<ulid>
 }
 
+// SnapshotCachePolicy is scheduler-owned disk headroom, never caller input.
+// Budget consumes part of the existing safety reserve; FreeFloor preserves the
+// remaining safety reserve and all transient workspace. Values are in MiB.
+type SnapshotCachePolicy struct {
+	BudgetMiB    int64 `json:"budget_mib"`
+	FreeFloorMiB int64 `json:"free_floor_mib"`
+}
+
 // CreateReq is the request body for POST /v1/sandboxes. The sandbox id
 // is NEVER taken from the user — control mints it server-side and passes
 // it to the host via the X-Sandbox-ID header on the forwarded request.
 type CreateReq struct {
-	Shape  string  `json:"shape"`  // required, from the catalog (see GET /v1/shapes)
-	Rootfs *string `json:"rootfs"` // required, from the rootfs catalog (see GET /v1/rootfs)
+	// SnapshotCache is populated only by control from the scheduler decision.
+	SnapshotCache *SnapshotCachePolicy `json:"snapshot_cache,omitempty"`
+
+	// SnapshotID selects an owned, ready reusable snapshot instead of rootfs.
+	// Omitted shape and disk_mib inherit the snapshot's captured configuration.
+	SnapshotID *string `json:"snapshot_id,omitempty"`
+
+	Shape  string  `json:"shape"`  // catalog shape; defaults to captured shape with snapshot_id
+	Rootfs *string `json:"rootfs"` // required without snapshot_id; mutually exclusive with it
 
 	// Name is the user-facing VM name, unique per user among non-terminal
 	// sandboxes. Empty/omitted → control auto-generates a Docker-style
-	// "<adjective>-<animal>" name. The sandbox id stays the only
+	// "<adjective>-<surname>-<suffix>" name. The sandbox id stays the only
 	// addressing handle; name is purely a label/hostname/DNS-name.
 	Name *string `json:"name,omitempty"`
 
@@ -169,11 +187,9 @@ type ControlHostRegisterReq struct {
 	// register; control refuses to add the host if region is missing
 	// or disabled. Stamped to hosts.region.
 	Region string `json:"region"`
-	// CPU identity from /proc/cpuinfo. Telemetry only today (cpu_compat
-	// scheduler plugin is implemented but not in the active pipeline).
-	// When enabled, the scheduler will pin resumes to hosts whose
-	// CPUVendor matches the source host's, so snapshots taken under one
-	// vendor's CPUID don't SIGILL on a different vendor.
+	// CPU identity from /proc/cpuinfo. The default scheduler pipeline uses
+	// CPUVendor to reject mismatched snapshot destinations. Matching vendors
+	// alone do not establish CPU/TSC/KVM restore compatibility.
 	CPUVendor string `json:"cpu_vendor,omitempty"` // GenuineIntel | AuthenticAMD | ...
 	CPUFamily string `json:"cpu_family,omitempty"` // family:model:stepping
 	// WGPublicKey is the host's WireGuard mesh public key (32-byte
@@ -196,20 +212,30 @@ type ControlHostRegisterReq struct {
 
 	// Per-host oversubscription factors for the scheduler's multi-
 	// dimensional admission. Integer 10ths (20 = 2.0×). 0 = use the
-	// scheduler's defaults (cpu=20, mem=10, disk=50). Operators set
+	// scheduler's defaults (cpu=80, mem=10, disk=20). Operators set
 	// these in host config to match the host's hardware tier.
 	CPUOvercommitX10  int `json:"cpu_overcommit_x10,omitempty"`
 	MemOvercommitX10  int `json:"mem_overcommit_x10,omitempty"`
 	DiskOvercommitX10 int `json:"disk_overcommit_x10,omitempty"`
 }
 
+// CachedSnapshot is an expiring locality hint, never proof of ownership or
+// restore compatibility. Report only complete, verified artifact sets.
+type CachedSnapshot struct {
+	ID        string    `json:"id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+const MaxCachedSnapshotHints = 256
+
 // ControlHostHeartbeatReq is the body for POST /v1/internal/hosts/heartbeat.
 type ControlHostHeartbeatReq struct {
-	ID          string `json:"id"`
-	InUseMib    int    `json:"in_use_mib"`
-	VMCount     int    `json:"vm_count"`
-	Status      string `json:"status,omitempty"`
-	DiskUsedMib int64  `json:"disk_used_mib,omitempty"`
+	CachedSnapshots []CachedSnapshot `json:"cached_snapshots"`
+	ID              string           `json:"id"`
+	InUseMib        int              `json:"in_use_mib"`
+	VMCount         int              `json:"vm_count"`
+	Status          string           `json:"status,omitempty"`
+	DiskUsedMib     int64            `json:"disk_used_mib,omitempty"`
 }
 
 // ── Control internal DB proxy — mutation bodies ───────────────────────
@@ -380,4 +406,27 @@ type ControlUpsertHostCachedTemplateReq struct {
 	HostID      string    `json:"host_id"`
 	TplID       string    `json:"tpl_id"`
 	CachedUntil time.Time `json:"cached_until"`
+}
+
+// Snapshot progress actions are shared by control and host workers. Captured
+// records a checkpoint; it is not a new persisted snapshot status.
+const (
+	SnapshotActionCaptured = "captured"
+	SnapshotActionReady    = "ready"
+	SnapshotActionFailed   = "failed"
+)
+
+// Stable failure codes accepted by the snapshot progress endpoint.
+const (
+	SnapshotErrorCaptureFailed     = "capture_failed"
+	SnapshotErrorSourceUnavailable = "source_unavailable"
+	SnapshotErrorUploadTimeout     = "upload_timeout"
+	SnapshotErrorCheckpointMissing = "checkpoint_missing"
+)
+
+// ControlSnapshotProgressReq has no owner, host, region or storage URI input.
+// Control derives these from the mTLS worker and its assigned snapshot row.
+type ControlSnapshotProgressReq struct {
+	Manifest  json.RawMessage `json:"manifest,omitempty"`
+	ErrorCode string          `json:"error_code,omitempty"`
 }

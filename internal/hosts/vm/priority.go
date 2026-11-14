@@ -4,30 +4,22 @@ import (
 	"syscall"
 )
 
-// CFS priority tuning. The host runs createos and N firecracker
-// processes at the same nice level by default. With 100+ idle VMs each
-// polling MMDS at 500 Hz (~17% guest CPU per VM), the host binary and
-// any actively-booting firecracker share equally with the herd —
-// spawn latency degrades from 17ms (idle host) to 100–700ms (host with
-// 100 idle VMs). Nice values are a cheap way to fix this without
-// touching cgroups or per-VM affinity.
-//
-// PRIO_PROCESS = 0; setpriority(PRIO_PROCESS, pid, prio) with pid=0
-// means "self".
+// Linux nice tuning gives host management work a higher scheduling weight.
+// This complements CPU lanes and per-VM cgroup limits; it does not reserve
+// CPUs or guarantee a particular VM startup latency. Linux nice values are
+// per-thread, so SetSelfPriority changes the calling OS thread.
 
 const (
 	prioProcess = 0
 
-	// PriorityHostBinary is applied to the createos process at startup.
-	// At nice=-10 createos's CFS weight is ~9000 vs 1024 for default,
-	// so it pre-empts the per-VM firecracker processes (each polling
-	// MMDS at ~17% CPU) when createos needs to drive a snapshot
-	// restore, install BPF, or push iptables rules.
+	// PriorityHostBinary is the nice value requested during host startup.
+	// Lower nice values give a runnable thread more scheduling weight.
 	PriorityHostBinary = -10
 )
 
-// SetSelfPriority applies PriorityHostBinary to the current process.
-// Best-effort: a missing CAP_SYS_NICE just leaves us at nice=0.
+// SetSelfPriority applies PriorityHostBinary to the calling OS thread.
+// Without permission to raise priority, it returns an error and leaves the
+// existing nice value unchanged; the host logs the error and continues.
 func SetSelfPriority() error {
 	return syscall.Setpriority(prioProcess, 0, PriorityHostBinary)
 }

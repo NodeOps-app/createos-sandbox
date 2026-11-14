@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/NodeOps-app/sandbox/internal/httpx"
-	schedapi "github.com/NodeOps-app/sandbox/internal/scheduler/api"
+	"github.com/NodeOps-app/createos-sandbox/internal/httpx"
+	schedapi "github.com/NodeOps-app/createos-sandbox/internal/scheduler/api"
 )
 
 // Config configures the HTTP client to the scheduler.
@@ -133,8 +133,8 @@ func (c *Client) probe(parent context.Context) {
 		return
 	}
 	httpx.SetRequestIDHeader(ctx, req)
-	// Scheduler runs unauthenticated on its cluster-internal port — see
-	// scheduler/http.go for the rationale.
+	// Listener-level mTLS, when enabled, is handled by the configured HTTP
+	// transport; this client adds no application authentication headers.
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.markFail(err.Error())
@@ -236,7 +236,7 @@ func (c *Client) schedule(ctx context.Context, req schedapi.ScheduleRequest) (*s
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpx.SetRequestIDHeader(ctx, httpReq)
-	// Scheduler runs unauthenticated — see scheduler/http.go.
+	// The configured HTTP transport supplies any required client certificate.
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return nil, true, err
@@ -283,4 +283,4 @@ func (c *Client) schedule(ctx context.Context, req schedapi.ScheduleRequest) (*s
 // Note: there is no Release or UpsertHost on this client, by design.
 // The scheduler does not accept any callbacks or acks from the control
 // plane or hosts — it learns about state changes by polling the
-// sandboxes table every 1s.
+// sandboxes table at its configured hydration interval.
