@@ -54,7 +54,7 @@ try {
 
 | Client | Install | Source |
 | --- | --- | --- |
-| TypeScript SDK | `npm install @nodeops-createos/sandbox` | [fc-sdk](https://github.com/NodeOps-app/fc-sdk) |
+| TypeScript SDK | `npm install @nodeops-createos/sandbox` | [createos-typescript-sdk](https://github.com/NodeOps-app/createos-sandbox-sdk) |
 | Python SDK | `pip install createos-sandbox` | [createos-python-sdk](https://github.com/NodeOps-app/createos-python-sdk) |
 | Go SDK | `go get github.com/NodeOps-app/createos-go-sdk` | [createos-go-sdk](https://github.com/NodeOps-app/createos-go-sdk) |
 | Rust SDK | `cargo add createos` | [createos-rust-sdk](https://github.com/NodeOps-app/createos-rust-sdk) |
@@ -155,7 +155,7 @@ or contact [business@nodeops.xyz](mailto:business@nodeops.xyz).
 
 **More**
 
-- [40+ runnable examples](https://github.com/NodeOps-app/fc-sdk/tree/main/examples): code interpreter, AI code agents, dev-server previews, browsers, MCP servers, S3 disks and more
+- [40+ runnable examples](https://github.com/NodeOps-app/createos-sandbox-sdk/tree/main/examples): code interpreter, AI code agents, dev-server previews, browsers, MCP servers, S3 disks and more
 - [createos-sandbox-ghar](https://github.com/NodeOps-app/createos-sandbox-ghar): throwaway GitHub Actions runners, one sandbox per job
 - [awesome-ai-sandboxes](https://github.com/NodeOps-app/awesome-ai-sandboxes): a list of cloud sandbox providers for AI agents
 - Packages: [npm](https://www.npmjs.com/package/@nodeops-createos/sandbox) · [PyPI](https://pypi.org/project/createos-sandbox/) · [pkg.go.dev](https://pkg.go.dev/github.com/NodeOps-app/createos-go-sdk) · [crates.io](https://crates.io/crates/createos) · [NuGet](https://www.nuget.org/packages/CreateOS.Sandbox)
