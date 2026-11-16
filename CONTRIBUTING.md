@@ -37,7 +37,7 @@ pull requests from anyone else.
 
 If you've found a fix, open an issue and describe the problem and your
 proposed fix. Code snippets in the issue are welcome. A maintainer will pick
-it up from there.
+it up from there. See [MAINTAINERS.md](./MAINTAINERS.md).
 
 ## Filing issues with an AI agent
 
