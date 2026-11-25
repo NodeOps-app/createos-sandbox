@@ -118,7 +118,7 @@ type CreateReq struct {
 
 	// AutoPauseAfterSeconds, when set, enables idle-pause: the sandbox is
 	// automatically paused after this many seconds with no detected activity.
-	// Valid range: 60–86400 (1 min – 24 h). Null/omitted = disabled.
+	// Valid range: 120–86400 (2 min – 24 h). Null/omitted = disabled.
 	AutoPauseAfterSeconds *int `json:"auto_pause_after_seconds,omitempty"`
 }
 

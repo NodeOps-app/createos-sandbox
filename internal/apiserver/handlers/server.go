@@ -754,12 +754,12 @@ func (h *Handler) HandleCreate(c *fiber.Ctx) error {
 	if msg := validateSandboxName(reqName); msg != "" {
 		return httpx.Fail(c, fiber.StatusBadRequest, msg)
 	}
-	// Validate auto_pause_after_seconds bounds: 60–86400 (1 min – 24 h).
+	// Validate auto_pause_after_seconds bounds: 120–86400 (2 min – 24 h).
 	if req.AutoPauseAfterSeconds != nil {
 		v := *req.AutoPauseAfterSeconds
-		if v < 60 || v > 86400 {
+		if v < 120 || v > 86400 {
 			return httpx.Fail(c, fiber.StatusBadRequest,
-				"auto_pause_after_seconds must be between 60 and 86400")
+				"auto_pause_after_seconds must be between 120 and 86400")
 		}
 	}
 	// Per-user sandbox caps. Internal keys (operator-issued) bypass.
@@ -2300,8 +2300,8 @@ func (h *Handler) HandlePatchSandbox(c *fiber.Ctx) error {
 	// one capture-operation lock so rejection cannot leave a partial PATCH.
 	if !req.DisableAutoPause && req.AutoPauseAfterSeconds != nil {
 		v := *req.AutoPauseAfterSeconds
-		if v < 60 || v > 86400 {
-			return httpx.Fail(c, fiber.StatusBadRequest, "auto_pause_after_seconds must be between 60 and 86400")
+		if v < 120 || v > 86400 {
+			return httpx.Fail(c, fiber.StatusBadRequest, "auto_pause_after_seconds must be between 120 and 86400")
 		}
 	}
 	var merged map[string]string
